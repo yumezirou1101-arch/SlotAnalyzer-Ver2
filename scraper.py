@@ -90,7 +90,14 @@ async def goto(page: Page, url: str) -> None:
         timeout=PAGE_TIMEOUT_MS,
     )
 
-    await page.wait_for_timeout(500)
+    # 少し長めに待機
+    await page.wait_for_timeout(3000)
+
+    # ネットワーク通信が落ち着くまで待つ
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except:
+        pass
 
     print(f"[DEBUG] URL = {page.url}")
     print(f"[DEBUG] TITLE = {await page.title()}")
@@ -371,6 +378,8 @@ async def scrape_store_async(
             return all_rows
 
         finally:
+            print("Enterキーを押すとブラウザを閉じます")
+            input()
             await context.close()
 
 
