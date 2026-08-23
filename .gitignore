@@ -25,3 +25,12 @@ test
 
 # Temporary URL list
 urls.txt
+
+# Browser profile / generated capture folders
+edge-cdp-profile/
+minrepo_*_files/
+
+# Temporary analysis text files
+*_source.txt
+*_forward_test.txt
+*_tmp_*.txt
