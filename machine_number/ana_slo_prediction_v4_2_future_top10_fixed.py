@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 import hashlib
@@ -537,7 +537,7 @@ def main() -> None:
     ).copy()
 
     header(
-        "2026-08-22 PREDICTION TOP10"
+        f"{TARGET_DATE.date()} PREDICTION TOP10"
     )
 
     display_columns = [
@@ -707,9 +707,10 @@ def main() -> None:
     )
 
     print(
-        "Keep this prediction unchanged until the 2026-08-22 actual data is collected."
+        f"Keep this prediction unchanged until the {TARGET_DATE.date()} actual data is collected."
     )
 
 
 if __name__ == "__main__":
     main()
+

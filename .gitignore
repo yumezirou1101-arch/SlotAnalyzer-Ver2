@@ -34,3 +34,5 @@ minrepo_*_files/
 *_source.txt
 *_forward_test.txt
 *_tmp_*.txt
+.chrome_remote_profile_9222/
+*_source_files/
