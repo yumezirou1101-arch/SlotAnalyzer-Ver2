@@ -300,32 +300,29 @@ async def ensure_accessible_list_page(
 
 
 async def collect_date_links(page):
-    anchors = page.locator(
+    # Read all anchors in one browser-side DOM evaluation.
+    # This avoids hundreds of Playwright round-trips and prevents a single
+    # stale/problematic locator from hanging on inner_text().
+    anchor_rows = await page.locator(
         "a"
+    ).evaluate_all(
+        """elements => elements.map((element, index) => ({
+            index,
+            text: (element.innerText || element.textContent || "").trim(),
+            href: element.href || element.getAttribute("href") || ""
+        }))"""
     )
-
-    count = await anchors.count()
 
     found = {}
 
-    for i in range(
-        count
-    ):
-        a = anchors.nth(
-            i
-        )
+    for row in anchor_rows:
+        text = str(
+            row.get("text", "")
+        ).strip()
 
-        try:
-            text = (
-                await a.inner_text()
-            ).strip()
-
-            href = await a.get_attribute(
-                "href"
-            )
-
-        except Exception:
-            continue
+        href = str(
+            row.get("href", "")
+        ).strip()
 
         date_iso = parse_visible_date(
             text
@@ -362,26 +359,22 @@ async def find_link_by_date(
         "a"
     )
 
-    count = await anchors.count()
+    anchor_rows = await anchors.evaluate_all(
+        """elements => elements.map((element, index) => ({
+            index,
+            text: (element.innerText || element.textContent || "").trim(),
+            href: element.href || element.getAttribute("href") || ""
+        }))"""
+    )
 
-    for i in range(
-        count
-    ):
-        a = anchors.nth(
-            i
-        )
+    for row in anchor_rows:
+        text = str(
+            row.get("text", "")
+        ).strip()
 
-        try:
-            text = (
-                await a.inner_text()
-            ).strip()
-
-            href = await a.get_attribute(
-                "href"
-            )
-
-        except Exception:
-            continue
+        href = str(
+            row.get("href", "")
+        ).strip()
 
         if not href_looks_daily(
             href
@@ -391,7 +384,9 @@ async def find_link_by_date(
         if parse_visible_date(
             text
         ) == date_iso:
-            return a
+            return anchors.nth(
+                int(row["index"])
+            )
 
     return None
 
@@ -964,11 +959,33 @@ async def main():
 
                     continue
 
-                async with page.expect_navigation(
-                    wait_until="domcontentloaded",
-                    timeout=60000,
+                href = await link.get_attribute(
+                    "href"
+                )
+
+                if not href_looks_daily(
+                    href
                 ):
-                    await link.click()
+                    raise RuntimeError(
+                        f"Invalid daily href for {date_iso}: {href!r}"
+                    )
+
+                print(
+                    f"DOM click href        : {href}"
+                )
+
+                await link.evaluate(
+                    "(element) => element.click()"
+                )
+
+                await page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=60000,
+                )
+
+                print(
+                    f"current URL after click: {page.url}"
+                )
 
                 await page.wait_for_timeout(
                     2800
@@ -1145,6 +1162,42 @@ async def main():
 
         print(
             f"log                   : {log_path}"
+        )
+
+        failure_statuses = {
+            "FAILED",
+            "FAILED_VALIDATION",
+            "ERROR",
+        }
+
+        failed_rows = [
+            row
+            for row in logs
+            if row["status"] in failure_statuses
+        ]
+
+        if failed_rows:
+            print()
+            print(
+                "FINAL RESULT          : FAILED"
+            )
+            print(
+                f"failed dates          : {len(failed_rows)}"
+            )
+
+            for row in failed_rows:
+                print(
+                    f"  {row['date']} | {row['status']} | {row['reason']}"
+                )
+
+            raise RuntimeError(
+                "Ana-Slo fetch failed for one or more selected dates. "
+                "See the fetch log above. Downstream processing must stop."
+            )
+
+        print()
+        print(
+            "FINAL RESULT          : OK"
         )
 
         print()

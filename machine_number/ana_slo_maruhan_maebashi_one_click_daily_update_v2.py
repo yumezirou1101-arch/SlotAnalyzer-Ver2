@@ -48,6 +48,8 @@ import pandas as pd
 # Safety
 # ------
 # - Existing source HTML is skipped unless child fetch rules say otherwise
+# - Freshness guard stops downstream processing when validated actual data
+#   is stale for the prediction target (unless --allow-gap is intentional)
 # - Existing prediction model weights are not recalculated here
 # - 78 lottery filtering is NOT run here
 # - 76 actual-result evaluation is NOT run here
@@ -570,6 +572,123 @@ def require_nonempty_file(
 
 
 
+
+def normalize_date(
+    value,
+) -> pd.Timestamp:
+    return pd.Timestamp(
+        pd.to_datetime(
+            value,
+            errors="raise",
+        )
+    ).normalize()
+
+
+def resolve_prediction_target(
+    requested_target: str | None,
+) -> pd.Timestamp:
+    if requested_target:
+        return normalize_date(
+            requested_target
+        )
+
+    # Normal morning operation predicts "today".
+    # The latest actual/source must therefore normally be yesterday.
+    return pd.Timestamp.now().normalize()
+
+
+def validate_freshness(
+    source_date: pd.Timestamp,
+    daily_csv: Path,
+    prediction_target: pd.Timestamp,
+    allow_gap: bool,
+) -> None:
+    source_date = normalize_date(
+        source_date
+    )
+    prediction_target = normalize_date(
+        prediction_target
+    )
+
+    csv_match = re.fullmatch(
+        r"ana_slo_(\d{8})\.csv",
+        daily_csv.name,
+        re.IGNORECASE,
+    )
+
+    if csv_match is None:
+        raise RuntimeError(
+            "FRESHNESS GUARD FAILED: validated daily CSV filename "
+            f"is not recognized: {daily_csv.name}"
+        )
+
+    csv_date = normalize_date(
+        pd.to_datetime(
+            csv_match.group(1),
+            format="%Y%m%d",
+            errors="raise",
+        )
+    )
+
+    if csv_date != source_date:
+        raise RuntimeError(
+            "FRESHNESS GUARD FAILED: source HTML date and validated "
+            "daily CSV date do not match. "
+            f"source={source_date.date()}, csv={csv_date.date()}"
+        )
+
+    if source_date >= prediction_target:
+        raise RuntimeError(
+            "FRESHNESS GUARD FAILED: source data must be earlier than "
+            "the prediction target. "
+            f"source={source_date.date()}, "
+            f"target={prediction_target.date()}"
+        )
+
+    expected_source_date = (
+        prediction_target
+        - pd.Timedelta(days=1)
+    )
+
+    if (
+        not allow_gap
+        and source_date != expected_source_date
+    ):
+        raise RuntimeError(
+            "FRESHNESS GUARD FAILED: latest validated actual data is "
+            "not fresh enough for the requested prediction date. "
+            f"source={source_date.date()}, "
+            f"expected={expected_source_date.date()}, "
+            f"target={prediction_target.date()}. "
+            "Downstream 69/63/79 processing was stopped. "
+            "Use --allow-gap only when a non-consecutive target date "
+            "is intentional."
+        )
+
+    header(
+        "FRESHNESS GUARD"
+    )
+
+    print(
+        f"source date           : {source_date.date()}"
+    )
+    print(
+        f"daily CSV date        : {csv_date.date()}"
+    )
+    print(
+        f"prediction target     : {prediction_target.date()}"
+    )
+    print(
+        f"expected source date  : {expected_source_date.date()}"
+    )
+    print(
+        f"allow gap             : {allow_gap}"
+    )
+    print(
+        "freshness             : OK"
+    )
+
+
 def discover_latest_69_output() -> Path:
     if not BACKTEST_69_DIR.exists():
         raise FileNotFoundError(
@@ -664,6 +783,10 @@ def main() -> None:
             format="%Y-%m-%d",
             errors="raise",
         )
+
+    prediction_target = resolve_prediction_target(
+        args.target_date
+    )
 
     header(
         "Maruhan Mega City Maebashi Inter "
@@ -824,6 +947,16 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
+    # Freshness guard
+    # --------------------------------------------------------
+    validate_freshness(
+        source_date=source_date,
+        daily_csv=daily_csv,
+        prediction_target=prediction_target,
+        allow_gap=args.allow_gap,
+    )
+
+    # --------------------------------------------------------
     # 3) 69 LIVE PREDICTION BACKTEST
     # --------------------------------------------------------
     elapsed = run_stage(
@@ -902,23 +1035,6 @@ def main() -> None:
     total_elapsed = (
         time.perf_counter()
         - total_started
-    )
-
-    prediction_target = (
-        pd.Timestamp(
-            pd.to_datetime(
-                args.target_date,
-                format="%Y-%m-%d",
-                errors="raise",
-            )
-        ).normalize()
-        if args.target_date
-        else (
-            source_date
-            + pd.Timedelta(
-                days=1
-            )
-        )
     )
 
     integrated_path = (
