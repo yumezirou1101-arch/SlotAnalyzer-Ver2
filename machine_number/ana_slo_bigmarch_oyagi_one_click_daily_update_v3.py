@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import date, timedelta
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.request
+
+import pandas as pd
 
 
 # ============================================================
@@ -22,14 +26,22 @@ import urllib.request
 #       dedicated user-data-dir under SlotAnalyzer
 #   - Wait for CDP to become ready
 #
-# Then:
+# Pipeline:
 #   1) Fetch newest Oyagi Ana-Slo HTML
-#      (fetch V3 auto-opens store list tab if needed)
 #   2) Convert HTML -> daily CSV
-#   3) Run frozen JUGGLER_RECENT7_WIN Top3 forward test
+#   2.5) Freshness guard
+#   3) Frozen JUGGLER_RECENT7_WIN Top3 forward
+#   4) Frozen NON_JUGGLER_WEEKDAY_AVG Top1 forward
+#   5) Juggler future ranking
+#   6) Non-Juggler future ranking
 #
-# This dedicated Chrome profile is separate from the user's
-# normal Chrome profile, reducing profile-lock conflicts.
+# IMPORTANT:
+#   - Frozen development period through 2026-08-26
+#     remains locked.
+#   - No automatic model promotion is performed.
+#   - A child-script failure propagates to this V3 runner.
+#   - Freshness guard prevents a stale daily CSV from being
+#     treated as a successful morning update.
 # ============================================================
 
 
@@ -37,7 +49,18 @@ PROJECT_ROOT = Path(
     r"C:\Users\user\Desktop\Documents\SlotAnalyzer"
 )
 
-MACHINE_DIR = PROJECT_ROOT / "machine_number"
+MACHINE_DIR = (
+    PROJECT_ROOT
+    / "machine_number"
+)
+
+DATA_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "bigmarch_takasaki_oyagi"
+    / "machine_number"
+)
+
 
 SCRIPT_FETCH = (
     MACHINE_DIR
@@ -49,12 +72,35 @@ SCRIPT_CONVERT = (
     / "ana_slo_bigmarch_oyagi_batch_html_to_daily_csv.py"
 )
 
-SCRIPT_FORWARD = (
+SCRIPT_JUGGLER_FORWARD = (
     MACHINE_DIR
     / "ana_slo_bigmarch_oyagi_juggler_recent7_top3_forward.py"
 )
 
+SCRIPT_NONJUGGLER_FORWARD = (
+    MACHINE_DIR
+    / "ana_slo_bigmarch_oyagi_nonjuggler_weekday_top1_forward.py"
+)
+
+SCRIPT_JUGGLER_FUTURE = (
+    MACHINE_DIR
+    / "ana_slo_bigmarch_oyagi_juggler_recent7_future_ranking.py"
+)
+
+SCRIPT_NONJUGGLER_FUTURE = (
+    MACHINE_DIR
+    / "ana_slo_bigmarch_oyagi_nonjuggler_weekday_future_ranking.py"
+)
+
+
+DAILY_FILE_RE = re.compile(
+    r"^ana_slo_bigmarch_oyagi_(\d{8})\.csv$",
+    re.IGNORECASE,
+)
+
+
 CDP_PORT = 9222
+
 CDP_VERSION_URL = (
     f"http://127.0.0.1:{CDP_PORT}/json/version"
 )
@@ -64,39 +110,48 @@ REMOTE_PROFILE_DIR = (
     / ".chrome_remote_profile_9222"
 )
 
+
 CHROME_CANDIDATES = [
-    Path(
-        os.environ.get(
-            "PROGRAMFILES",
-            r"C:\Program Files",
+    (
+        Path(
+            os.environ.get(
+                "PROGRAMFILES",
+                r"C:\Program Files",
+            )
         )
-    )
-    / "Google"
-    / "Chrome"
-    / "Application"
-    / "chrome.exe",
-
-    Path(
-        os.environ.get(
-            "PROGRAMFILES(X86)",
-            r"C:\Program Files (x86)",
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe"
+    ),
+    (
+        Path(
+            os.environ.get(
+                "PROGRAMFILES(X86)",
+                r"C:\Program Files (x86)",
+            )
         )
-    )
-    / "Google"
-    / "Chrome"
-    / "Application"
-    / "chrome.exe",
-
-    Path(
-        os.environ.get(
-            "LOCALAPPDATA",
-            str(Path.home() / "AppData" / "Local"),
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe"
+    ),
+    (
+        Path(
+            os.environ.get(
+                "LOCALAPPDATA",
+                str(
+                    Path.home()
+                    / "AppData"
+                    / "Local"
+                ),
+            )
         )
-    )
-    / "Google"
-    / "Chrome"
-    / "Application"
-    / "chrome.exe",
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe"
+    ),
 ]
 
 
@@ -146,8 +201,18 @@ def parse_args():
         type=int,
         default=15,
         help=(
-            "Seconds to wait for auto-started Chrome CDP. "
-            "Default: 15."
+            "Seconds to wait for auto-started "
+            "Chrome CDP. Default: 15."
+        ),
+    )
+
+    parser.add_argument(
+        "--allow-gap",
+        action="store_true",
+        help=(
+            "Allow latest daily CSV to be older than "
+            "yesterday. Intended only for controlled "
+            "maintenance/testing."
         ),
     )
 
@@ -190,6 +255,7 @@ def try_get_cdp(
 
 
 def find_chrome_exe() -> Path:
+
     for path in CHROME_CANDIDATES:
         if path.exists():
             return path
@@ -234,7 +300,6 @@ def start_remote_debug_chrome(
         "about:blank",
     ]
 
-    # Keep the browser independent of the Python process.
     creationflags = 0
 
     if os.name == "nt":
@@ -258,13 +323,15 @@ def start_remote_debug_chrome(
     )
 
     while time.time() < deadline:
+
         info = try_get_cdp(
             timeout=1.0
         )
 
         if info is not None:
             print(
-                f"Chrome                : {info.get('Browser')}"
+                f"Chrome                : "
+                f"{info.get('Browser')}"
             )
             print(
                 "CDP                   : AUTO-START OK"
@@ -276,8 +343,8 @@ def start_remote_debug_chrome(
         )
 
     raise RuntimeError(
-        f"Chrome was started, but CDP did not become ready "
-        f"within {wait_sec} seconds."
+        "Chrome was started, but CDP did not "
+        f"become ready within {wait_sec} seconds."
     )
 
 
@@ -289,7 +356,8 @@ def ensure_cdp(
 
     if info is not None:
         print(
-            f"Chrome                : {info.get('Browser')}"
+            f"Chrome                : "
+            f"{info.get('Browser')}"
         )
         print(
             "CDP                   : ALREADY RUNNING"
@@ -382,6 +450,242 @@ def run_stage(
     return elapsed
 
 
+def discover_daily_csv_files():
+    found = []
+
+    for path in DATA_DIR.glob(
+        "ana_slo_bigmarch_oyagi_*.csv"
+    ):
+        match = DAILY_FILE_RE.fullmatch(
+            path.name
+        )
+
+        if not match:
+            continue
+
+        file_date = pd.to_datetime(
+            match.group(1),
+            format="%Y%m%d",
+            errors="raise",
+        ).normalize()
+
+        found.append(
+            (
+                file_date,
+                path,
+            )
+        )
+
+    if not found:
+        raise RuntimeError(
+            "No Big March Oyagi daily CSV files "
+            "were found."
+        )
+
+    return sorted(
+        found,
+        key=lambda x: x[0],
+    )
+
+
+def freshness_guard(
+    min_machines: int,
+    allow_gap: bool,
+) -> dict:
+
+    header(
+        "FRESHNESS GUARD"
+    )
+
+    daily_files = (
+        discover_daily_csv_files()
+    )
+
+    latest_file_date, latest_path = (
+        daily_files[-1]
+    )
+
+    raw = pd.read_csv(
+        latest_path,
+        encoding="utf-8-sig",
+    )
+
+    required = {
+        "date",
+        "machine_name",
+        "machine_no",
+        "G",
+        "diff",
+    }
+
+    missing = sorted(
+        required - set(raw.columns)
+    )
+
+    if missing:
+        raise RuntimeError(
+            f"{latest_path.name}: missing required "
+            f"columns: {missing}"
+        )
+
+    raw["date"] = pd.to_datetime(
+        raw["date"],
+        errors="raise",
+    ).dt.normalize()
+
+    raw["machine_no"] = pd.to_numeric(
+        raw["machine_no"],
+        errors="raise",
+    ).astype(int)
+
+    internal_dates = (
+        raw["date"]
+        .drop_duplicates()
+        .tolist()
+    )
+
+    if len(internal_dates) != 1:
+        raise RuntimeError(
+            f"{latest_path.name}: multiple internal "
+            "dates exist."
+        )
+
+    internal_date = (
+        internal_dates[0]
+    )
+
+    if internal_date != latest_file_date:
+        raise RuntimeError(
+            f"{latest_path.name}: filename date "
+            f"{latest_file_date.date()} does not match "
+            f"internal date {internal_date.date()}."
+        )
+
+    rows = len(raw)
+
+    unique_machines = int(
+        raw["machine_no"].nunique()
+    )
+
+    duplicates = int(
+        raw["machine_no"]
+        .duplicated(
+            keep=False
+        )
+        .sum()
+    )
+
+    if rows < min_machines:
+        raise RuntimeError(
+            f"{latest_path.name}: machine rows below "
+            f"minimum. rows={rows}, "
+            f"minimum={min_machines}"
+        )
+
+    if unique_machines != rows:
+        raise RuntimeError(
+            f"{latest_path.name}: machine_no is not "
+            f"unique. rows={rows}, "
+            f"unique={unique_machines}"
+        )
+
+    if duplicates != 0:
+        raise RuntimeError(
+            f"{latest_path.name}: duplicate "
+            f"machine_no rows exist. "
+            f"duplicates={duplicates}"
+        )
+
+    today = pd.Timestamp(
+        date.today()
+    ).normalize()
+
+    expected_latest = (
+        today
+        - pd.Timedelta(days=1)
+    ).normalize()
+
+    target_date = (
+        latest_file_date
+        + pd.Timedelta(days=1)
+    ).normalize()
+
+    print(
+        f"latest daily CSV       : "
+        f"{latest_path.name}"
+    )
+    print(
+        f"latest data date       : "
+        f"{latest_file_date.date()}"
+    )
+    print(
+        f"internal date          : "
+        f"{internal_date.date()}"
+    )
+    print(
+        f"rows                   : "
+        f"{rows}"
+    )
+    print(
+        f"unique machines        : "
+        f"{unique_machines}"
+    )
+    print(
+        f"minimum machines       : "
+        f"{min_machines}"
+    )
+    print(
+        f"today                  : "
+        f"{today.date()}"
+    )
+    print(
+        f"expected latest        : "
+        f"{expected_latest.date()}"
+    )
+    print(
+        f"prediction target      : "
+        f"{target_date.date()}"
+    )
+    print(
+        f"allow gap              : "
+        f"{allow_gap}"
+    )
+
+    if latest_file_date > expected_latest:
+        raise RuntimeError(
+            "Latest Big March daily CSV is dated "
+            "in the future relative to expected "
+            "morning operation. "
+            f"latest={latest_file_date.date()}, "
+            f"expected={expected_latest.date()}"
+        )
+
+    if (
+        not allow_gap
+        and latest_file_date != expected_latest
+    ):
+        raise RuntimeError(
+            "Big March daily CSV is stale. "
+            f"latest={latest_file_date.date()}, "
+            f"expected={expected_latest.date()}. "
+            "Use --allow-gap only for controlled "
+            "maintenance/testing."
+        )
+
+    print()
+    print(
+        "FRESHNESS RESULT       : OK"
+    )
+
+    return {
+        "latest_path": latest_path,
+        "latest_data_date": latest_file_date,
+        "target_date": target_date,
+        "rows": rows,
+        "unique_machines": unique_machines,
+    }
+
+
 def main() -> None:
 
     args = parse_args()
@@ -407,19 +711,28 @@ def main() -> None:
     )
 
     print(
-        f"project root          : {PROJECT_ROOT}"
+        f"project root          : "
+        f"{PROJECT_ROOT}"
     )
     print(
-        f"python                : {sys.executable}"
+        f"python                : "
+        f"{sys.executable}"
     )
     print(
-        f"fetch days            : {args.fetch_days}"
+        f"fetch days            : "
+        f"{args.fetch_days}"
     )
     print(
-        f"min machines          : {args.min_machines}"
+        f"min machines          : "
+        f"{args.min_machines}"
     )
     print(
-        f"skip fetch            : {args.skip_fetch}"
+        f"skip fetch            : "
+        f"{args.skip_fetch}"
+    )
+    print(
+        f"allow gap             : "
+        f"{args.allow_gap}"
     )
 
     # --------------------------------------------------------
@@ -429,19 +742,28 @@ def main() -> None:
         "PREFLIGHT"
     )
 
-    for path in (
+    required_scripts = (
         SCRIPT_FETCH,
         SCRIPT_CONVERT,
-        SCRIPT_FORWARD,
-    ):
+        SCRIPT_JUGGLER_FORWARD,
+        SCRIPT_NONJUGGLER_FORWARD,
+        SCRIPT_JUGGLER_FUTURE,
+        SCRIPT_NONJUGGLER_FUTURE,
+    )
+
+    for path in required_scripts:
+
         check_file(
             path
         )
 
         print(
-            f"script exists         : {path.name}"
+            f"script exists         : "
+            f"{path.name}"
         )
 
+    # Preserve existing V3 behavior:
+    # CDP is confirmed even when --skip-fetch is used.
     ensure_cdp(
         args.chrome_wait_sec
     )
@@ -451,26 +773,28 @@ def main() -> None:
         "Compiling required scripts..."
     )
 
-    for path in (
-        SCRIPT_FETCH,
-        SCRIPT_CONVERT,
-        SCRIPT_FORWARD,
-    ):
+    for path in required_scripts:
+
         compile_script(
             path
         )
 
         print(
-            f"py_compile OK         : {path.name}"
+            f"py_compile OK         : "
+            f"{path.name}"
         )
 
-    total_started = time.perf_counter()
+    total_started = (
+        time.perf_counter()
+    )
+
     elapsed_rows = []
 
     # --------------------------------------------------------
-    # Fetch newest HTML
+    # 1) Fetch newest HTML
     # --------------------------------------------------------
     if not args.skip_fetch:
+
         elapsed = run_stage(
             "FETCH NEWEST HTML",
             SCRIPT_FETCH,
@@ -500,7 +824,7 @@ def main() -> None:
         )
 
     # --------------------------------------------------------
-    # HTML -> daily CSV
+    # 2) HTML -> daily CSV
     # --------------------------------------------------------
     elapsed = run_stage(
         "BATCH HTML TO DAILY CSV",
@@ -521,16 +845,85 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Frozen forward test
+    # 2.5) Freshness guard
     # --------------------------------------------------------
-    elapsed = run_stage(
-        "FROZEN TOP3 FORWARD TEST",
-        SCRIPT_FORWARD,
+    freshness_started = (
+        time.perf_counter()
+    )
+
+    freshness = freshness_guard(
+        min_machines=args.min_machines,
+        allow_gap=args.allow_gap,
+    )
+
+    freshness_elapsed = (
+        time.perf_counter()
+        - freshness_started
     )
 
     elapsed_rows.append(
         (
-            "FROZEN TOP3 FORWARD TEST",
+            "FRESHNESS GUARD",
+            freshness_elapsed,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 3) Juggler frozen forward
+    # --------------------------------------------------------
+    elapsed = run_stage(
+        "JUGGLER FROZEN FORWARD",
+        SCRIPT_JUGGLER_FORWARD,
+    )
+
+    elapsed_rows.append(
+        (
+            "JUGGLER FROZEN FORWARD",
+            elapsed,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 4) Non-Juggler frozen forward
+    # --------------------------------------------------------
+    elapsed = run_stage(
+        "NONJUGGLER FROZEN FORWARD",
+        SCRIPT_NONJUGGLER_FORWARD,
+    )
+
+    elapsed_rows.append(
+        (
+            "NONJUGGLER FROZEN FORWARD",
+            elapsed,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 5) Juggler future ranking
+    # --------------------------------------------------------
+    elapsed = run_stage(
+        "JUGGLER FUTURE RANKING",
+        SCRIPT_JUGGLER_FUTURE,
+    )
+
+    elapsed_rows.append(
+        (
+            "JUGGLER FUTURE RANKING",
+            elapsed,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 6) Non-Juggler future ranking
+    # --------------------------------------------------------
+    elapsed = run_stage(
+        "NONJUGGLER FUTURE RANKING",
+        SCRIPT_NONJUGGLER_FUTURE,
+    )
+
+    elapsed_rows.append(
+        (
+            "NONJUGGLER FUTURE RANKING",
             elapsed,
         )
     )
@@ -549,13 +942,27 @@ def main() -> None:
 
     for label, elapsed in elapsed_rows:
         print(
-            f"{label:<28}: "
+            f"{label:<32}: "
             f"OK  ({elapsed:.2f} sec)"
         )
 
     print()
     print(
-        f"total elapsed sec     : "
+        f"latest data date       : "
+        f"{freshness['latest_data_date'].date()}"
+    )
+    print(
+        f"prediction target      : "
+        f"{freshness['target_date'].date()}"
+    )
+    print(
+        f"validated machines     : "
+        f"{freshness['unique_machines']}"
+    )
+
+    print()
+    print(
+        f"total elapsed sec      : "
         f"{total_elapsed:.2f}"
     )
 
@@ -564,19 +971,36 @@ def main() -> None:
         "09 V3 daily update complete."
     )
     print(
-        "If CDP was not running, Chrome was started automatically."
+        "If CDP was not running, Chrome was "
+        "started automatically."
     )
     print(
-        "If the Oyagi store tab was absent, fetch V3 opened it automatically."
+        "If the Oyagi store tab was absent, "
+        "fetch V3 opened it automatically."
     )
     print(
-        "The development period through 2026-08-26 remains locked."
+        "Freshness validation passed before "
+        "forward evaluation and future ranking."
     )
     print(
-        "No automatic model promotion is performed."
+        "The development period through "
+        "2026-08-26 remains locked."
     )
     print(
-        "No Maruhan Maebashi files were modified."
+        "Juggler and Non-Juggler frozen "
+        "forward evaluations were updated."
+    )
+    print(
+        "Juggler and Non-Juggler future "
+        "rankings were generated."
+    )
+    print(
+        "No automatic model promotion "
+        "is performed."
+    )
+    print(
+        "No Maruhan Maebashi files were "
+        "modified."
     )
 
 

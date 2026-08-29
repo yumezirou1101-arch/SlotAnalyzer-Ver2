@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import re
 
 import pandas as pd
@@ -8,7 +9,7 @@ import pandas as pd
 
 # ============================================================
 # Big March Takasaki Oyagi
-# Frozen JUGGLER_RECENT7_WIN Top3 Future Ranking
+# Frozen NON_JUGGLER WEEKDAY_AVG Top1 Future Ranking
 # ============================================================
 #
 # Frozen development period:
@@ -18,12 +19,12 @@ import pandas as pd
 #   2026-08-27 onward
 #
 # Frozen rule:
-#   - JUGGLER only
-#   - score = win rate over previous 7 observed days
-#   - rank by recent7_win desc
-#   - tie break: recent7_n desc, machine_no asc
-#   - ranks 1-3 = PRIMARY
-#   - ranks 4-10 = RESERVE
+#   - NON_JUGGLER only
+#   - score = same-weekday historical average diff
+#   - rank by weekday_avg desc
+#   - tie break: machine_no asc
+#   - rank 1 = PRIMARY
+#   - ranks 2-10 = RESERVE
 #
 # Data source policy:
 #   1) locked integrated development dataset through 2026-08-26
@@ -56,17 +57,16 @@ QUALITY_DIR = (
 OUTPUT_DIR = (
     DATA_DIR
     / "analysis_31days_deep"
-    / "09_juggler_recent7_future_ranking"
+    / "12_nonjuggler_weekday_future_ranking"
 )
 
 DEVELOPMENT_END = pd.Timestamp("2026-08-26")
 FORWARD_START = pd.Timestamp("2026-08-27")
 
-WINDOW = 7
-TOPN_PRIMARY = 3
+TOPN_PRIMARY = 1
 TOPN_DISPLAY = 10
 
-MODEL_NAME = "JUGGLER_RECENT7_WIN_TOP3_FROZEN"
+MODEL_NAME = "NON_JUGGLER_WEEKDAY_AVG_TOP1_FROZEN"
 
 DAILY_FILE_RE = re.compile(
     r"^ana_slo_bigmarch_oyagi_(\d{8})\.csv$",
@@ -81,12 +81,35 @@ def header(title: str) -> None:
     print("=" * 122)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Frozen NON_JUGGLER WEEKDAY_AVG "
+            "Top1 future ranking for Big March "
+            "Takasaki Oyagi."
+        )
+    )
+
+    parser.add_argument(
+        "--target-date",
+        type=str,
+        default=None,
+        help=(
+            "Optional target date YYYY-MM-DD. "
+            "Default: latest data date + 1 day."
+        ),
+    )
+
+    return parser.parse_args()
+
+
 def normalize(
     df: pd.DataFrame,
     source: str,
 ) -> pd.DataFrame:
 
     x = df.copy()
+
     x.columns = [
         str(c).strip()
         for c in x.columns
@@ -136,14 +159,14 @@ def normalize(
         errors="coerce",
     )
 
-    if x["diff"].isna().any():
-        raise RuntimeError(
-            f"{source}: invalid or missing diff exists."
-        )
-
     if x["G"].isna().any():
         raise RuntimeError(
             f"{source}: invalid or missing G exists."
+        )
+
+    if x["diff"].isna().any():
+        raise RuntimeError(
+            f"{source}: invalid or missing diff exists."
         )
 
     if (x["G"] < 0).any():
@@ -164,9 +187,9 @@ def normalize(
             f"{source}: duplicate date-machine rows exist."
         )
 
-    x["win"] = (
-        x["diff"] > 0
-    ).astype(int)
+    x["weekday"] = (
+        x["date"].dt.weekday
+    )
 
     x["is_juggler"] = (
         x["machine_name"]
@@ -233,6 +256,7 @@ def discover_forward_daily_files():
     for path in DATA_DIR.glob(
         "ana_slo_bigmarch_oyagi_*.csv"
     ):
+
         match = DAILY_FILE_RE.fullmatch(
             path.name
         )
@@ -385,15 +409,37 @@ def load_frozen_history() -> tuple[
     )
 
 
+def resolve_target_date(
+    latest_date: pd.Timestamp,
+    requested: str | None,
+) -> pd.Timestamp:
+
+    if requested is None:
+        return (
+            latest_date
+            + pd.Timedelta(days=1)
+        ).normalize()
+
+    target_date = pd.to_datetime(
+        requested,
+        format="%Y-%m-%d",
+        errors="raise",
+    ).normalize()
+
+    if target_date <= latest_date:
+        raise RuntimeError(
+            "--target-date must be later than "
+            f"latest data date {latest_date.date()}."
+        )
+
+    return target_date
+
+
 def build_future_ranking(
     history: pd.DataFrame,
     latest_date: pd.Timestamp,
+    target_date: pd.Timestamp,
 ) -> pd.DataFrame:
-
-    target_date = (
-        latest_date
-        + pd.Timedelta(days=1)
-    ).normalize()
 
     latest_panel = history[
         history["date"] == latest_date
@@ -404,8 +450,8 @@ def build_future_ranking(
             "Latest data panel is empty."
         )
 
-    current_juggler = latest_panel[
-        latest_panel["is_juggler"]
+    current_nonjuggler = latest_panel[
+        ~latest_panel["is_juggler"]
     ][
         [
             "machine_no",
@@ -413,99 +459,118 @@ def build_future_ranking(
         ]
     ].copy()
 
-    if current_juggler.empty:
+    if current_nonjuggler.empty:
         raise RuntimeError(
-            "No current Juggler machines were found "
-            "on the latest day."
+            "No current NON_JUGGLER machines were "
+            "found on the latest day."
         )
 
     # Safety:
-    # only data strictly before target day.
+    # only history strictly before target day.
     history_before_target = history[
         history["date"] < target_date
     ].copy()
 
-    history_j = history_before_target[
-        history_before_target["is_juggler"]
-    ].copy()
-
-    rows = []
-
-    for _, current in (
-        current_juggler.iterrows()
-    ):
-
-        machine_no = int(
-            current["machine_no"]
-        )
-
-        grp = history_j[
-            history_j["machine_no"]
-            == machine_no
-        ].copy()
-
-        recent = (
-            grp
-            .sort_values("date")
-            .tail(WINDOW)
-        )
-
-        if recent.empty:
-            recent7_win = -1.0
-            recent7_n = 0
-            recent7_avg_diff = 0.0
-
-        else:
-            recent7_win = float(
-                recent["win"].mean()
-            )
-
-            recent7_n = int(
-                recent["date"].nunique()
-            )
-
-            recent7_avg_diff = float(
-                recent["diff"].mean()
-            )
-
-        rows.append(
-            {
-                "target_date":
-                    target_date.date(),
-                "latest_data_date":
-                    latest_date.date(),
-                "model":
-                    MODEL_NAME,
-                "machine_no":
-                    machine_no,
-                "machine_name":
-                    current["machine_name"],
-                "recent7_win":
-                    recent7_win,
-                "recent7_n":
-                    recent7_n,
-                "recent7_avg_diff":
-                    recent7_avg_diff,
-            }
-        )
-
-    ranking = pd.DataFrame(
-        rows
+    history_nonjuggler = (
+        history_before_target[
+            ~history_before_target[
+                "is_juggler"
+            ]
+        ]
+        .copy()
     )
 
-    if ranking.empty:
-        raise RuntimeError(
-            "Future ranking is empty."
-        )
+    target_weekday = int(
+        target_date.weekday()
+    )
 
+    weekday_history = history_nonjuggler[
+        history_nonjuggler["weekday"]
+        == target_weekday
+    ].copy()
+
+    weekday_stats = (
+        weekday_history
+        .groupby(
+            "machine_no",
+            as_index=False,
+        )
+        .agg(
+            weekday_avg=(
+                "diff",
+                "mean",
+            ),
+            weekday_history_n=(
+                "date",
+                "nunique",
+            ),
+        )
+    )
+
+    ranking = (
+        current_nonjuggler
+        .merge(
+            weekday_stats,
+            on="machine_no",
+            how="left",
+        )
+    )
+
+    median_weekday_avg = (
+        ranking["weekday_avg"]
+        .median(
+            skipna=True
+        )
+    )
+
+    if pd.isna(
+        median_weekday_avg
+    ):
+        median_weekday_avg = 0.0
+
+    ranking["weekday_avg"] = (
+        ranking["weekday_avg"]
+        .fillna(
+            float(
+                median_weekday_avg
+            )
+        )
+    )
+
+    ranking[
+        "weekday_history_n"
+    ] = (
+        ranking[
+            "weekday_history_n"
+        ]
+        .fillna(0)
+        .astype(int)
+    )
+
+    ranking["target_date"] = (
+        target_date.date()
+    )
+
+    ranking[
+        "latest_data_date"
+    ] = (
+        latest_date.date()
+    )
+
+    ranking["model"] = (
+        MODEL_NAME
+    )
+
+    # Exact frozen baseline ranking:
+    # weekday_avg desc, machine_no asc.
+    #
+    # weekday_history_n is diagnostic only.
     ranking = ranking.sort_values(
         [
-            "recent7_win",
-            "recent7_n",
+            "weekday_avg",
             "machine_no",
         ],
         ascending=[
-            False,
             False,
             True,
         ],
@@ -530,9 +595,11 @@ def build_future_ranking(
 
 def main() -> None:
 
+    args = parse_args()
+
     header(
-        "09 - Big March Takasaki Oyagi "
-        "Frozen JUGGLER RECENT7 WIN "
+        "12 - Big March Takasaki Oyagi "
+        "Frozen NON_JUGGLER WEEKDAY_AVG "
         "Future Ranking"
     )
 
@@ -547,13 +614,16 @@ def main() -> None:
     ).normalize()
 
     target_date = (
-        latest_date
-        + pd.Timedelta(days=1)
-    ).normalize()
+        resolve_target_date(
+            latest_date,
+            args.target_date,
+        )
+    )
 
     ranking = build_future_ranking(
         history,
         latest_date,
+        target_date,
     )
 
     top10 = (
@@ -608,17 +678,17 @@ def main() -> None:
     )
 
     print(
+        f"target weekday         : "
+        f"{target_date.day_name()}"
+    )
+
+    print(
         f"model                  : "
         f"{MODEL_NAME}"
     )
 
     print(
-        f"window                 : "
-        f"{WINDOW}"
-    )
-
-    print(
-        f"current Juggler count  : "
+        f"current NON_JUGGLER    : "
         f"{len(ranking)}"
     )
 
@@ -637,7 +707,7 @@ def main() -> None:
     )
 
     header(
-        "PRIMARY TOP3"
+        "PRIMARY TOP1"
     )
 
     print(
@@ -646,9 +716,8 @@ def main() -> None:
                 "prediction_rank",
                 "machine_no",
                 "machine_name",
-                "recent7_win",
-                "recent7_n",
-                "recent7_avg_diff",
+                "weekday_avg",
+                "weekday_history_n",
             ]
         ].to_string(
             index=False
@@ -656,7 +725,7 @@ def main() -> None:
     )
 
     header(
-        "RESERVE 4-10"
+        "RESERVE 2-10"
     )
 
     print(
@@ -665,9 +734,8 @@ def main() -> None:
                 "prediction_rank",
                 "machine_no",
                 "machine_name",
-                "recent7_win",
-                "recent7_n",
-                "recent7_avg_diff",
+                "weekday_avg",
+                "weekday_history_n",
             ]
         ].to_string(
             index=False
@@ -686,15 +754,15 @@ def main() -> None:
     all_path = (
         OUTPUT_DIR
         / (
-            f"09_prediction_{compact}"
-            "_all_juggler.csv"
+            f"12_prediction_{compact}"
+            "_all_nonjuggler.csv"
         )
     )
 
     top10_path = (
         OUTPUT_DIR
         / (
-            f"09_prediction_{compact}"
+            f"12_prediction_{compact}"
             "_top10.csv"
         )
     )
@@ -702,7 +770,7 @@ def main() -> None:
     metadata_path = (
         OUTPUT_DIR
         / (
-            f"09_prediction_{compact}"
+            f"12_prediction_{compact}"
             "_metadata.csv"
         )
     )
@@ -726,15 +794,15 @@ def main() -> None:
                     target_date.date(),
                 "latest_data_date":
                     latest_date.date(),
+                "target_weekday":
+                    target_date.day_name(),
                 "model":
                     MODEL_NAME,
-                "window":
-                    WINDOW,
                 "primary_topn":
                     TOPN_PRIMARY,
                 "display_topn":
                     TOPN_DISPLAY,
-                "current_juggler_count":
+                "current_nonjuggler_count":
                     len(ranking),
                 "development_end":
                     DEVELOPMENT_END.date(),
@@ -772,8 +840,9 @@ def main() -> None:
     )
 
     print(
-        "The frozen JUGGLER_RECENT7_WIN "
-        "ranking rule was not changed."
+        "The frozen NON_JUGGLER "
+        "WEEKDAY_AVG ranking rule "
+        "was not changed."
     )
 
     print(
@@ -783,8 +852,14 @@ def main() -> None:
     )
 
     print(
-        "Ranks 1-3 are PRIMARY. "
-        "Ranks 4-10 are RESERVE only."
+        "Rank 1 is PRIMARY. "
+        "Ranks 2-10 are RESERVE only."
+    )
+
+    print(
+        "weekday_history_n is diagnostic "
+        "only and is not used as a "
+        "tie-break."
     )
 
     print(

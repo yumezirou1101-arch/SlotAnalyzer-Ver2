@@ -441,11 +441,9 @@ def build_weekday_signal(
         .sort_values(
             [
                 "weekday_avg",
-                "weekday_n",
                 "machine_no",
             ],
             ascending=[
-                False,
                 False,
                 True,
             ],
