@@ -144,18 +144,18 @@ async def ensure_list_page(page):
 
 
 async def collect_date_links(page):
-    anchors = page.locator("a")
-    count = await anchors.count()
+    anchor_rows = await page.locator("a").evaluate_all(
+        """elements => elements.map((element, index) => ({
+            index,
+            text: (element.innerText || element.textContent || "").trim(),
+            href: element.href || element.getAttribute("href") || ""
+        }))"""
+    )
     found = {}
 
-    for i in range(count):
-        a = anchors.nth(i)
-
-        try:
-            text = (await a.inner_text()).strip()
-            href = await a.get_attribute("href")
-        except Exception:
-            continue
+    for row in anchor_rows:
+        text = str(row.get("text", "")).strip()
+        href = str(row.get("href", "")).strip()
 
         if not href:
             continue
@@ -194,30 +194,27 @@ async def collect_date_links(page):
 
 async def find_link_by_date(page, date_iso: str):
     anchors = page.locator("a")
-    count = await anchors.count()
+    anchor_rows = await anchors.evaluate_all(
+        """elements => elements.map((element, index) => ({
+            index,
+            text: (element.innerText || element.textContent || "").trim(),
+            href: element.href || element.getAttribute("href") || ""
+        }))"""
+    )
     label_prefix = date_iso.replace("-", "/")
 
-    for i in range(count):
-        a = anchors.nth(i)
-
-        try:
-            text = (await a.inner_text()).strip()
-            href = await a.get_attribute("href")
-        except Exception:
-            continue
-
-        if not href:
-            continue
+    for row in anchor_rows:
+        text = str(row.get("text", "")).strip()
+        href = str(row.get("href", "")).strip()
 
         if (
             text.startswith(label_prefix)
             and date_iso in href
             and "ana-slo.com" in href
         ):
-            return a
+            return anchors.nth(int(row["index"]))
 
     return None
-
 
 def find_main_table(html: str) -> pd.DataFrame:
     tables = pd.read_html(StringIO(html))
@@ -491,11 +488,28 @@ async def main():
                 href = await link.get_attribute("href")
                 print(f"href                  : {href}")
 
-                async with page.expect_navigation(
-                    wait_until="domcontentloaded",
-                    timeout=30000,
+                href_lower = str(href or "").lower()
+                if (
+                    "ana-slo.com" not in href_lower
+                    or date_iso not in href_lower
+                    or "-data" not in href_lower
                 ):
-                    await link.click()
+                    raise RuntimeError(
+                        f"Invalid daily href for {date_iso}: {href!r}"
+                    )
+
+                print(f"DOM click href        : {href}")
+
+                await link.evaluate(
+                    "(element) => element.click()"
+                )
+
+                await page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=60000,
+                )
+
+                print(f"current URL after click: {page.url}")
 
                 await page.wait_for_timeout(2200)
 
@@ -597,6 +611,39 @@ async def main():
             print(f"{status:<22}: {count}")
 
         print(f"log                   : {log_path}")
+
+        failure_statuses = {
+            "FAILED",
+            "FAILED_VALIDATION",
+            "ERROR",
+        }
+
+        failed_rows = [
+            row
+            for row in logs
+            if row["status"] in failure_statuses
+        ]
+
+        if failed_rows:
+            print()
+            print("FINAL RESULT          : FAILED")
+            print(f"failed dates          : {len(failed_rows)}")
+
+            for row in failed_rows:
+                print(
+                    f"  {row['date']} | {row['status']} | {row['reason']}"
+                )
+
+            await browser.close()
+
+            raise RuntimeError(
+                "Big March Oyagi Ana-Slo fetch failed for one or more "
+                "selected dates. See the fetch log above. "
+                "Downstream processing must stop."
+            )
+
+        print()
+        print("FINAL RESULT          : OK")
         print()
         print("If the store tab was missing, V3 opened it automatically.")
         print("Historical machine count changes are allowed.")
