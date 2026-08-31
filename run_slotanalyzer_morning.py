@@ -27,12 +27,16 @@ from datetime import datetime
 #    -> one-click daily update V3
 #    -> includes frozen Top3 forward evaluation
 #
+# 3) Yasuda Maebashi
+#    -> one-click daily update V1
+#    -> acquisition, freshness, conversion, and quality validation
+#
 # Safety
 # ------
 # - Existing store pipelines are not modified here.
 # - This script only calls the already-tested pipelines.
 # - Each store is evaluated independently.
-# - If one store fails, the other store is still attempted.
+# - If one store fails, the other stores are still attempted.
 # - Final summary clearly reports OK / FAILED.
 # ============================================================
 
@@ -57,6 +61,11 @@ BIGMARCH_SCRIPT = (
     / "ana_slo_bigmarch_oyagi_one_click_daily_update_v3.py"
 )
 
+YASUDA_SCRIPT = (
+    MACHINE_DIR
+    / "ana_slo_yasuda_maebashi_one_click_daily_update_v1.py"
+)
+
 
 def header(
     title: str,
@@ -73,7 +82,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "SlotAnalyzer morning runner for "
-            "Maruhan Maebashi and Big March Oyagi."
+            "Maruhan Maebashi, Big March Oyagi, and Yasuda Maebashi."
         )
     )
 
@@ -95,10 +104,18 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--skip-yasuda",
+        action="store_true",
+        help=(
+            "Skip Yasuda Maebashi."
+        ),
+    )
+
+    parser.add_argument(
         "--skip-fetch",
         action="store_true",
         help=(
-            "Skip HTML fetch for both stores "
+            "Skip HTML fetch for all selected stores "
             "and use existing data."
         ),
     )
@@ -119,6 +136,16 @@ def parse_args():
         default=1,
         help=(
             "Number of newest Big March date links "
+            "to inspect. Default: 1."
+        ),
+    )
+
+    parser.add_argument(
+        "--yasuda-fetch-days",
+        type=int,
+        default=1,
+        help=(
+            "Number of newest Yasuda Maebashi date links "
             "to inspect. Default: 1."
         ),
     )
@@ -309,6 +336,11 @@ def main() -> None:
     )
 
     print(
+        f"skip Yasuda           : "
+        f"{args.skip_yasuda}"
+    )
+
+    print(
         f"skip fetch            : "
         f"{args.skip_fetch}"
     )
@@ -321,6 +353,11 @@ def main() -> None:
     print(
         f"Big March fetch days  : "
         f"{args.bigmarch_fetch_days}"
+    )
+
+    print(
+        f"Yasuda fetch days     : "
+        f"{args.yasuda_fetch_days}"
     )
 
     print(
@@ -353,6 +390,15 @@ def main() -> None:
             (
                 "Big March",
                 BIGMARCH_SCRIPT,
+            )
+        )
+
+    if not args.skip_yasuda:
+
+        scripts_to_check.append(
+            (
+                "Yasuda",
+                YASUDA_SCRIPT,
             )
         )
 
@@ -471,6 +517,35 @@ def main() -> None:
             ),
             BIGMARCH_SCRIPT,
             bigmarch_args,
+        )
+
+        results.append(
+            result
+        )
+
+    # --------------------------------------------------------
+    # YASUDA
+    # --------------------------------------------------------
+
+    if not args.skip_yasuda:
+
+        yasuda_args = [
+            "--fetch-days",
+            str(
+                args.yasuda_fetch_days
+            ),
+        ]
+
+        if args.skip_fetch:
+
+            yasuda_args.append(
+                "--skip-fetch"
+            )
+
+        result = run_store(
+            "YASUDA MAEBASHI",
+            YASUDA_SCRIPT,
+            yasuda_args,
         )
 
         results.append(
