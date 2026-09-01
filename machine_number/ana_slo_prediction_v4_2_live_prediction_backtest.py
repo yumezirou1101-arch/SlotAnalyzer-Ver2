@@ -1159,6 +1159,366 @@ def build_overall_summary(
     return out
 
 
+
+# ============================================================
+# TOP10 VS OUTSIDE TOP10 VS STORE
+# ============================================================
+
+def build_top10_comparison_daily_row(
+    merged: pd.DataFrame,
+    actual: pd.DataFrame,
+    target_date: pd.Timestamp,
+) -> dict:
+
+    top10 = (
+        merged[
+            merged["prediction_rank"] <= 10
+        ]
+        .sort_values("prediction_rank")
+        .copy()
+    )
+
+    if len(top10) != 10:
+        raise RuntimeError(
+            f"{target_date.date()}: "
+            f"expected 10 TOP10 rows, got {len(top10)}"
+        )
+
+    top10_machine_nos = set(
+        pd.to_numeric(
+            top10["machine_no"],
+            errors="coerce",
+        )
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+
+    if len(top10_machine_nos) != 10:
+        raise RuntimeError(
+            f"{target_date.date()}: "
+            "TOP10 machine numbers are not 10 unique values"
+        )
+
+    actual_work = actual.copy()
+
+    actual_work["machine_no"] = pd.to_numeric(
+        actual_work["machine_no"],
+        errors="coerce",
+    )
+
+    actual_work["diff"] = pd.to_numeric(
+        actual_work["diff"],
+        errors="coerce",
+    )
+
+    actual_work = actual_work.dropna(
+        subset=[
+            "machine_no",
+            "diff",
+        ]
+    ).copy()
+
+    actual_work["machine_no"] = (
+        actual_work["machine_no"].astype(int)
+    )
+
+    store = actual_work.copy()
+
+    outside = actual_work[
+        ~actual_work["machine_no"].isin(
+            top10_machine_nos
+        )
+    ].copy()
+
+    top10_actual = actual_work[
+        actual_work["machine_no"].isin(
+            top10_machine_nos
+        )
+    ].copy()
+
+    if len(top10_actual) != 10:
+        raise RuntimeError(
+            f"{target_date.date()}: "
+            f"expected 10 TOP10 actual rows, "
+            f"got {len(top10_actual)}"
+        )
+
+    expected_outside_n = (
+        len(store) - 10
+    )
+
+    if len(outside) != expected_outside_n:
+        raise RuntimeError(
+            f"{target_date.date()}: "
+            f"expected {expected_outside_n} outside rows, "
+            f"got {len(outside)}"
+        )
+
+    def metrics(
+        frame: pd.DataFrame,
+    ) -> dict:
+
+        diffs = frame["diff"].astype(float)
+
+        return {
+            "n": int(len(frame)),
+            "avg_diff": float(diffs.mean()),
+            "median_diff": float(diffs.median()),
+            "win_rate": float(
+                (diffs > 0).mean() * 100.0
+            ),
+            "plus1000_rate": float(
+                (diffs >= 1000).mean() * 100.0
+            ),
+            "plus2000_rate": float(
+                (diffs >= 2000).mean() * 100.0
+            ),
+            "total_diff": float(diffs.sum()),
+        }
+
+    top10_m = metrics(top10_actual)
+    outside_m = metrics(outside)
+    store_m = metrics(store)
+
+    return {
+        "target_date": target_date,
+
+        "top10_n": top10_m["n"],
+        "top10_avg_diff": top10_m["avg_diff"],
+        "top10_median_diff": top10_m["median_diff"],
+        "top10_win_rate": top10_m["win_rate"],
+        "top10_plus1000_rate":
+            top10_m["plus1000_rate"],
+        "top10_plus2000_rate":
+            top10_m["plus2000_rate"],
+        "top10_total_diff":
+            top10_m["total_diff"],
+
+        "outside_top10_n":
+            outside_m["n"],
+        "outside_top10_avg_diff":
+            outside_m["avg_diff"],
+        "outside_top10_median_diff":
+            outside_m["median_diff"],
+        "outside_top10_win_rate":
+            outside_m["win_rate"],
+        "outside_top10_plus1000_rate":
+            outside_m["plus1000_rate"],
+        "outside_top10_plus2000_rate":
+            outside_m["plus2000_rate"],
+        "outside_top10_total_diff":
+            outside_m["total_diff"],
+
+        "store_n": store_m["n"],
+        "store_avg_diff":
+            store_m["avg_diff"],
+        "store_median_diff":
+            store_m["median_diff"],
+        "store_win_rate":
+            store_m["win_rate"],
+        "store_plus1000_rate":
+            store_m["plus1000_rate"],
+        "store_plus2000_rate":
+            store_m["plus2000_rate"],
+        "store_total_diff":
+            store_m["total_diff"],
+
+        "top10_avg_diff_lift_vs_outside":
+            float(
+                top10_m["avg_diff"]
+                - outside_m["avg_diff"]
+            ),
+
+        "top10_avg_diff_lift_vs_store":
+            float(
+                top10_m["avg_diff"]
+                - store_m["avg_diff"]
+            ),
+
+        "top10_win_rate_lift_vs_outside":
+            float(
+                top10_m["win_rate"]
+                - outside_m["win_rate"]
+            ),
+
+        "top10_win_rate_lift_vs_store":
+            float(
+                top10_m["win_rate"]
+                - store_m["win_rate"]
+            ),
+    }
+
+
+
+
+def build_top10_comparison_overall(
+    comparison_daily_df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if comparison_daily_df.empty:
+        return pd.DataFrame()
+
+    x = comparison_daily_df.copy()
+
+    lift_vs_outside_values = (
+        x[
+            "top10_avg_diff_lift_vs_outside"
+        ]
+        .astype(float)
+        .to_numpy()
+    )
+
+    lift_vs_store_values = (
+        x[
+            "top10_avg_diff_lift_vs_store"
+        ]
+        .astype(float)
+        .to_numpy()
+    )
+
+    outside_ci_low, outside_ci_high = (
+        bootstrap_mean_ci(
+            lift_vs_outside_values
+        )
+    )
+
+    store_ci_low, store_ci_high = (
+        bootstrap_mean_ci(
+            lift_vs_store_values
+        )
+    )
+
+    return pd.DataFrame(
+        [
+            {
+                "evaluated_days": int(
+                    x["target_date"].nunique()
+                ),
+
+                "mean_top10_avg_diff": float(
+                    x["top10_avg_diff"].mean()
+                ),
+
+                "mean_outside_top10_avg_diff": float(
+                    x[
+                        "outside_top10_avg_diff"
+                    ].mean()
+                ),
+
+                "mean_store_avg_diff": float(
+                    x["store_avg_diff"].mean()
+                ),
+
+                "mean_top10_win_rate": float(
+                    x["top10_win_rate"].mean()
+                ),
+
+                "mean_outside_top10_win_rate": float(
+                    x[
+                        "outside_top10_win_rate"
+                    ].mean()
+                ),
+
+                "mean_store_win_rate": float(
+                    x["store_win_rate"].mean()
+                ),
+
+                "mean_top10_plus1000_rate": float(
+                    x[
+                        "top10_plus1000_rate"
+                    ].mean()
+                ),
+
+                "mean_outside_top10_plus1000_rate": float(
+                    x[
+                        "outside_top10_plus1000_rate"
+                    ].mean()
+                ),
+
+                "mean_store_plus1000_rate": float(
+                    x[
+                        "store_plus1000_rate"
+                    ].mean()
+                ),
+
+                "mean_top10_plus2000_rate": float(
+                    x[
+                        "top10_plus2000_rate"
+                    ].mean()
+                ),
+
+                "mean_outside_top10_plus2000_rate": float(
+                    x[
+                        "outside_top10_plus2000_rate"
+                    ].mean()
+                ),
+
+                "mean_store_plus2000_rate": float(
+                    x[
+                        "store_plus2000_rate"
+                    ].mean()
+                ),
+
+                "mean_top10_avg_diff_lift_vs_outside":
+                    float(
+                        x[
+                            "top10_avg_diff_lift_vs_outside"
+                        ].mean()
+                    ),
+
+                "mean_top10_avg_diff_lift_vs_store":
+                    float(
+                        x[
+                            "top10_avg_diff_lift_vs_store"
+                        ].mean()
+                    ),
+
+                "mean_top10_win_rate_lift_vs_outside":
+                    float(
+                        x[
+                            "top10_win_rate_lift_vs_outside"
+                        ].mean()
+                    ),
+
+                "mean_top10_win_rate_lift_vs_store":
+                    float(
+                        x[
+                            "top10_win_rate_lift_vs_store"
+                        ].mean()
+                    ),
+
+                "top10_total_diff": float(
+                    x["top10_total_diff"].sum()
+                ),
+
+                "outside_top10_total_diff": float(
+                    x[
+                        "outside_top10_total_diff"
+                    ].sum()
+                ),
+
+                "store_total_diff": float(
+                    x["store_total_diff"].sum()
+                ),
+
+                "mean_lift_vs_outside_ci95_low":
+                    outside_ci_low,
+
+                "mean_lift_vs_outside_ci95_high":
+                    outside_ci_high,
+
+                "mean_lift_vs_store_ci95_low":
+                    store_ci_low,
+
+                "mean_lift_vs_store_ci95_high":
+                    store_ci_high,
+            }
+        ]
+    )
+
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -1209,6 +1569,7 @@ def main() -> None:
     quality_rows = []
     detail_frames = []
     daily_rows = []
+    comparison_rows = []
 
     for (
         filename_target_date,
@@ -1481,6 +1842,14 @@ def main() -> None:
                 )
             )
 
+        comparison_rows.append(
+            build_top10_comparison_daily_row(
+                merged,
+                actual,
+                filename_target_date,
+            )
+        )
+
     status_df = pd.DataFrame(
         status_rows
     )
@@ -1554,6 +1923,27 @@ def main() -> None:
         )
     )
 
+    comparison_daily_df = pd.DataFrame(
+        comparison_rows
+    )
+
+    if not comparison_daily_df.empty:
+        comparison_daily_df = (
+            comparison_daily_df
+            .sort_values(
+                "target_date"
+            )
+            .reset_index(
+                drop=True
+            )
+        )
+
+    comparison_overall_df = (
+        build_top10_comparison_overall(
+            comparison_daily_df
+        )
+    )
+
     # --------------------------------------------------------
     # Save
     # --------------------------------------------------------
@@ -1583,6 +1973,16 @@ def main() -> None:
         / "69_live_prediction_overall.csv"
     )
 
+    comparison_daily_path = (
+        OUTPUT_DIR
+        / "69_top10_vs_outside_daily.csv"
+    )
+
+    comparison_overall_path = (
+        OUTPUT_DIR
+        / "69_top10_vs_outside_overall.csv"
+    )
+
     status_df.to_csv(
         status_path,
         index=False,
@@ -1609,6 +2009,18 @@ def main() -> None:
 
     overall_df.to_csv(
         overall_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    comparison_daily_df.to_csv(
+        comparison_daily_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    comparison_overall_df.to_csv(
+        comparison_overall_path,
         index=False,
         encoding="utf-8-sig",
     )
@@ -1704,6 +2116,8 @@ def main() -> None:
         detail_path,
         daily_path,
         overall_path,
+        comparison_daily_path,
+        comparison_overall_path,
     ):
         print(path)
 
