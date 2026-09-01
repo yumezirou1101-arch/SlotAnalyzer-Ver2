@@ -286,6 +286,13 @@ def build_future_panel(
 
 def main() -> None:
 
+    raise RuntimeError(
+        "FORMAL_OUTPUT_PATH_DISABLED: this legacy non-fixed script may not "
+        "write formal 64 predictions. Use "
+        "ana_slo_prediction_v4_2_future_top10_auto.py so the Forward Guard "
+        "and frozen-output protection cannot be bypassed."
+    )
+
     header(
         "64 - V4.2_C Future TOP10 Prediction"
     )

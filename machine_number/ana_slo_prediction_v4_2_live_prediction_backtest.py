@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import re
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -74,6 +75,27 @@ EVAL_BANDS = {
 
 EXPECTED_MODEL = "CHAMPION_V4.2_C"
 EXPECTED_WEIGHT_FINGERPRINT = "a1eaf45d71ded209"
+
+PREDICTION_CLASS_FORWARD_VALID = "FORWARD_VALID"
+PREDICTION_CLASS_LEGACY = "LEGACY_UNVERIFIED"
+PREDICTION_CLASS_GUARD_FAIL = "FORWARD_GUARD_FAIL"
+
+JST = ZoneInfo("Asia/Tokyo")
+EXPECTED_FORWARD_CUTOFF = (
+    9,
+    0,
+)
+
+NEW_GUARD_EVIDENCE_FIELDS = {
+    "generated_at_jst",
+    "forward_guard_version",
+    "forward_valid",
+    "forward_cutoff_jst",
+    "target_actual_absent_at_generation",
+    "target_source_absent_at_generation",
+    "all514_sha256",
+    "top10_sha256",
+}
 
 BOOTSTRAP_REPS = 10000
 BOOTSTRAP_SEED = 20260825
@@ -694,10 +716,91 @@ def load_prediction(
     )
 
 
+def parse_strict_bool(
+    value,
+) -> bool | None:
+    if isinstance(
+        value,
+        (bool, np.bool_),
+    ):
+        return bool(value)
+
+    text = str(
+        value
+    ).strip().lower()
+
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return None
+
+
+def clean_text(
+    value,
+) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def parse_forward_cutoff(
+    value,
+) -> tuple[int, int] | None:
+    match = re.fullmatch(
+        r"(\d{2}):(\d{2})\s+Asia/Tokyo",
+        clean_text(value),
+    )
+    if match is None:
+        return None
+
+    hour = int(
+        match.group(1)
+    )
+    minute = int(
+        match.group(2)
+    )
+    if hour > 23 or minute > 59:
+        return None
+    return (
+        hour,
+        minute,
+    )
+
+
+def empty_metadata_result(
+    path: Path,
+    exists: bool,
+) -> dict:
+    return {
+        "metadata_exists": exists,
+        "metadata_path": str(path),
+        "metadata_model": "",
+        "metadata_weight_fingerprint": "",
+        "metadata_target_date": pd.NaT,
+        "metadata_latest_data_date": pd.NaT,
+        "metadata_model_ok": False,
+        "metadata_fingerprint_ok": False,
+        "metadata_dates_ok": False,
+        "prediction_class": PREDICTION_CLASS_LEGACY,
+        "forward_guard_evidence_present": False,
+        "forward_guard_ok": False,
+        "forward_guard_fail_reasons": "",
+        "metadata_generated_at_jst": pd.NaT,
+        "metadata_forward_guard_version": "",
+        "metadata_forward_valid": None,
+        "metadata_top10_sha256": "",
+        "metadata_all514_sha256": "",
+        "current_all514_sha256": "",
+        "top10_hash_ok": False,
+        "all514_hash_ok": False,
+    }
+
+
 def load_metadata_for_target(
     target_date: pd.Timestamp,
+    prediction_path: Path,
 ) -> dict:
-
     path = (
         PREDICTION_DIR
         / (
@@ -708,97 +811,227 @@ def load_metadata_for_target(
     )
 
     if not path.exists():
-        return {
-            "metadata_exists": False,
-            "metadata_path": str(
-                path
-            ),
-            "metadata_model": "",
-            "metadata_weight_fingerprint": "",
-            "metadata_target_date": pd.NaT,
-            "metadata_latest_data_date": pd.NaT,
-            "metadata_model_ok": False,
-            "metadata_fingerprint_ok": False,
-            "metadata_dates_ok": False,
-        }
+        return empty_metadata_result(
+            path,
+            False,
+        )
 
     meta = read_csv_flexible(
         path
     )
-
     if meta.empty:
-        return {
-            "metadata_exists": True,
-            "metadata_path": str(
-                path
-            ),
-            "metadata_model": "",
-            "metadata_weight_fingerprint": "",
-            "metadata_target_date": pd.NaT,
-            "metadata_latest_data_date": pd.NaT,
-            "metadata_model_ok": False,
-            "metadata_fingerprint_ok": False,
-            "metadata_dates_ok": False,
-        }
+        return empty_metadata_result(
+            path,
+            True,
+        )
 
     row = meta.iloc[0]
-
     meta_target = pd.to_datetime(
-        row.get(
-            "target_date",
-            pd.NaT,
-        ),
+        row.get("target_date", pd.NaT),
         errors="coerce",
     )
-
     meta_latest = pd.to_datetime(
-        row.get(
-            "latest_data_date",
-            pd.NaT,
-        ),
+        row.get("latest_data_date", pd.NaT),
         errors="coerce",
     )
+    model = clean_text(
+        row.get("model", "")
+    )
+    fingerprint = clean_text(
+        row.get("weight_fingerprint", "")
+    )
+    metadata_dates_ok = bool(
+        pd.notna(meta_target)
+        and pd.notna(meta_latest)
+        and pd.Timestamp(meta_target).normalize()
+        == target_date.normalize()
+        and pd.Timestamp(meta_latest).normalize()
+        < target_date.normalize()
+    )
 
-    model = str(
-        row.get(
-            "model",
-            "",
-        )
-    ).strip()
+    evidence_present = any(
+        field in meta.columns
+        for field in NEW_GUARD_EVIDENCE_FIELDS
+    )
 
-    fingerprint = str(
-        row.get(
-            "weight_fingerprint",
-            "",
-        )
-    ).strip()
-
-    return {
+    result = {
         "metadata_exists": True,
-        "metadata_path": str(
-            path
-        ),
+        "metadata_path": str(path),
         "metadata_model": model,
-        "metadata_weight_fingerprint":
-            fingerprint,
-        "metadata_target_date":
-            meta_target,
-        "metadata_latest_data_date":
-            meta_latest,
-        "metadata_model_ok":
-            model == EXPECTED_MODEL,
-        "metadata_fingerprint_ok":
-            fingerprint
-            == EXPECTED_WEIGHT_FINGERPRINT,
-        "metadata_dates_ok": bool(
-            pd.notna(meta_target)
-            and pd.notna(meta_latest)
-            and pd.Timestamp(meta_target)
-            == target_date
-            and pd.Timestamp(meta_latest)
-            < target_date
+        "metadata_weight_fingerprint": fingerprint,
+        "metadata_target_date": meta_target,
+        "metadata_latest_data_date": meta_latest,
+        "metadata_model_ok": model == EXPECTED_MODEL,
+        "metadata_fingerprint_ok": (
+            fingerprint == EXPECTED_WEIGHT_FINGERPRINT
         ),
+        "metadata_dates_ok": metadata_dates_ok,
+        "prediction_class": PREDICTION_CLASS_LEGACY,
+        "forward_guard_evidence_present": evidence_present,
+        "forward_guard_ok": False,
+        "forward_guard_fail_reasons": "",
+        "metadata_generated_at_jst": pd.NaT,
+        "metadata_forward_guard_version": "",
+        "metadata_forward_valid": None,
+        "metadata_top10_sha256": "",
+        "metadata_all514_sha256": "",
+        "current_all514_sha256": "",
+        "top10_hash_ok": False,
+        "all514_hash_ok": False,
     }
+
+    if not evidence_present:
+        return result
+
+    reasons = []
+    guard_version = clean_text(
+        row.get("forward_guard_version", "")
+    )
+    forward_valid = parse_strict_bool(
+        row.get("forward_valid", None)
+    )
+    actual_absent = parse_strict_bool(
+        row.get(
+            "target_actual_absent_at_generation",
+            None,
+        )
+    )
+    source_absent = parse_strict_bool(
+        row.get(
+            "target_source_absent_at_generation",
+            None,
+        )
+    )
+    generated_at = pd.to_datetime(
+        row.get("generated_at_jst", pd.NaT),
+        errors="coerce",
+    )
+    cutoff = parse_forward_cutoff(
+        row.get("forward_cutoff_jst", "")
+    )
+    top10_expected_hash = clean_text(
+        row.get("top10_sha256", "")
+    ).lower()
+    all514_expected_hash = clean_text(
+        row.get("all514_sha256", "")
+    ).lower()
+    all514_path = (
+        PREDICTION_DIR
+        / (
+            "64_prediction_"
+            f"{target_date.strftime('%Y%m%d')}"
+            "_all514.csv"
+        )
+    )
+
+    current_top10_hash = sha256_file(
+        prediction_path
+    )
+    current_all514_hash = (
+        sha256_file(all514_path)
+        if all514_path.exists()
+        else ""
+    )
+    top10_hash_ok = bool(
+        top10_expected_hash
+        and top10_expected_hash == current_top10_hash.lower()
+    )
+    all514_hash_ok = bool(
+        all514_expected_hash
+        and all514_expected_hash == current_all514_hash.lower()
+    )
+
+    if forward_valid is not True:
+        reasons.append("forward_valid_not_true")
+    if not guard_version:
+        reasons.append("forward_guard_version_missing")
+    if not result["metadata_model_ok"]:
+        reasons.append("model_mismatch")
+    if not result["metadata_fingerprint_ok"]:
+        reasons.append("weight_fingerprint_mismatch")
+    if (
+        pd.isna(meta_target)
+        or pd.Timestamp(meta_target).normalize()
+        != target_date.normalize()
+    ):
+        reasons.append("metadata_target_date_mismatch")
+
+    expected_latest = target_date.normalize() - pd.Timedelta(
+        days=1
+    )
+    if (
+        pd.isna(meta_latest)
+        or pd.Timestamp(meta_latest).normalize()
+        != expected_latest
+    ):
+        reasons.append("latest_data_date_not_target_minus_one")
+    if actual_absent is not True:
+        reasons.append("target_actual_absence_not_proven")
+    if source_absent is not True:
+        reasons.append("target_source_absence_not_proven")
+    if cutoff is None:
+        reasons.append("forward_cutoff_invalid")
+    elif cutoff != EXPECTED_FORWARD_CUTOFF:
+        reasons.append("forward_cutoff_not_0900_jst")
+
+    generated_at_jst = pd.NaT
+    if pd.isna(generated_at):
+        reasons.append("generated_at_jst_invalid")
+    elif getattr(generated_at, "tzinfo", None) is None:
+        reasons.append("generated_at_jst_timezone_missing")
+    else:
+        generated_at_jst = pd.Timestamp(
+            generated_at
+        ).tz_convert(
+            JST
+        )
+        generated_date = pd.Timestamp(
+            generated_at_jst.date()
+        )
+        if generated_date > target_date.normalize():
+            reasons.append("generated_after_target_date")
+        elif (
+            generated_date == target_date.normalize()
+            and cutoff is not None
+            and (
+                generated_at_jst.hour,
+                generated_at_jst.minute,
+                generated_at_jst.second,
+                generated_at_jst.microsecond,
+            ) >= (
+                cutoff[0],
+                cutoff[1],
+                0,
+                0,
+            )
+        ):
+            reasons.append("generated_at_or_after_forward_cutoff")
+
+    if not top10_hash_ok:
+        reasons.append("top10_sha256_mismatch")
+    if not all514_hash_ok:
+        reasons.append("all514_sha256_mismatch")
+
+    result.update(
+        {
+            "prediction_class": (
+                PREDICTION_CLASS_FORWARD_VALID
+                if not reasons
+                else PREDICTION_CLASS_GUARD_FAIL
+            ),
+            "forward_guard_ok": not reasons,
+            "forward_guard_fail_reasons": ";".join(reasons),
+            "metadata_generated_at_jst": generated_at_jst,
+            "metadata_forward_guard_version": guard_version,
+            "metadata_forward_valid": forward_valid,
+            "metadata_top10_sha256": top10_expected_hash,
+            "metadata_all514_sha256": all514_expected_hash,
+            "current_all514_sha256": current_all514_hash,
+            "top10_hash_ok": top10_hash_ok,
+            "all514_hash_ok": all514_hash_ok,
+        }
+    )
+    return result
 
 
 # ============================================================
@@ -1518,6 +1751,203 @@ def build_top10_comparison_overall(
     )
 
 
+def filter_prediction_class(
+    frame: pd.DataFrame,
+    prediction_class: str,
+) -> pd.DataFrame:
+    if (
+        frame.empty
+        or "prediction_class" not in frame.columns
+    ):
+        return pd.DataFrame(
+            columns=frame.columns
+        )
+    return (
+        frame[
+            frame["prediction_class"]
+            == prediction_class
+        ]
+        .copy()
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+def next_forward_checkpoint(
+    evaluated_days: int,
+) -> str:
+    if evaluated_days < 10:
+        return "10"
+    if evaluated_days < 15:
+        return "15"
+    if evaluated_days < 21:
+        return "21"
+    return "FORMAL_REVIEW_READY"
+
+
+def build_forward_summary(
+    status_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if status_df.empty:
+        forward_days = 0
+        legacy_days = 0
+    else:
+        forward_days = int(
+            status_df.loc[
+                status_df["status"]
+                == "EVALUATED_FORWARD_VALID",
+                "target_date",
+            ].nunique()
+        )
+        legacy_days = int(
+            status_df.loc[
+                status_df["status"]
+                == "EVALUATED_LEGACY_UNVERIFIED",
+                "target_date",
+            ].nunique()
+        )
+
+    return pd.DataFrame(
+        [
+            {
+                "forward_valid_evaluated_days":
+                    forward_days,
+                "legacy_evaluated_days":
+                    legacy_days,
+                "next_checkpoint":
+                    next_forward_checkpoint(
+                        forward_days
+                    ),
+            }
+        ]
+    )
+
+
+def build_forward_coverage(
+    actual_map: dict[pd.Timestamp, Path],
+    prediction_files: list[tuple[pd.Timestamp, Path]],
+    status_df: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = [
+        "date",
+        "actual_exists",
+        "prediction_exists",
+        "prediction_class",
+        "evaluation_status",
+    ]
+    if status_df.empty:
+        return pd.DataFrame(
+            columns=columns
+        )
+
+    evidence_rows = status_df[
+        status_df["prediction_class"].isin(
+            [
+                PREDICTION_CLASS_FORWARD_VALID,
+                PREDICTION_CLASS_GUARD_FAIL,
+            ]
+        )
+    ]
+    if evidence_rows.empty:
+        return pd.DataFrame(
+            columns=columns
+        )
+
+    guard_start = pd.Timestamp(
+        evidence_rows["target_date"].min()
+    ).normalize()
+    prediction_map = {
+        pd.Timestamp(date).normalize(): path
+        for date, path in prediction_files
+    }
+    status_map = {
+        pd.Timestamp(row["target_date"]).normalize(): row
+        for _, row in status_df.iterrows()
+    }
+    dates = sorted(
+        {
+            pd.Timestamp(date).normalize()
+            for date in actual_map
+        }
+        | set(
+            prediction_map
+        )
+    )
+
+    rows = []
+    for date in dates:
+        if date < guard_start:
+            continue
+
+        actual_exists = date in actual_map
+        prediction_exists = date in prediction_map
+        status_row = status_map.get(
+            date
+        )
+
+        if prediction_exists and status_row is not None:
+            prediction_class = status_row[
+                "prediction_class"
+            ]
+            evaluation_status = status_row[
+                "status"
+            ]
+        elif actual_exists:
+            prediction_class = "MISSING"
+            evaluation_status = (
+                "MISSING_FROZEN_PREDICTION"
+            )
+        else:
+            prediction_class = ""
+            evaluation_status = "NO_DATA"
+
+        rows.append(
+            {
+                "date": date,
+                "actual_exists": actual_exists,
+                "prediction_exists": prediction_exists,
+                "prediction_class": prediction_class,
+                "evaluation_status": evaluation_status,
+            }
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=columns,
+    )
+
+
+def resolve_evaluation_status(
+    prediction_ok: bool,
+    metadata_ok: bool,
+    prediction_class: str,
+    actual_exists: bool,
+    actual_ok: bool,
+) -> str:
+    if not prediction_ok:
+        return "SKIPPED_PREDICTION_QUALITY_FAIL"
+    if prediction_class == PREDICTION_CLASS_GUARD_FAIL:
+        return "SKIPPED_FORWARD_GUARD_FAIL"
+    if not metadata_ok:
+        return "SKIPPED_METADATA_CHECK_FAIL"
+    if not actual_exists:
+        return (
+            "PENDING_FORWARD_VALID"
+            if prediction_class
+            == PREDICTION_CLASS_FORWARD_VALID
+            else "PENDING_LEGACY_UNVERIFIED"
+        )
+    if not actual_ok:
+        return "SKIPPED_ACTUAL_QUALITY_FAIL"
+    return (
+        "EVALUATED_FORWARD_VALID"
+        if prediction_class
+        == PREDICTION_CLASS_FORWARD_VALID
+        else "EVALUATED_LEGACY_UNVERIFIED"
+    )
+
+
 
 # ============================================================
 # MAIN
@@ -1589,7 +2019,8 @@ def main() -> None:
 
         metadata = (
             load_metadata_for_target(
-                filename_target_date
+                filename_target_date,
+                prediction_path,
             )
         )
 
@@ -1659,35 +2090,17 @@ def main() -> None:
             ]
         )
 
-        if not prediction_ok:
+        prediction_class = metadata[
+            "prediction_class"
+        ]
 
-            status = (
-                "SKIPPED_PREDICTION_QUALITY_FAIL"
-            )
-
-        elif not metadata_ok:
-
-            status = (
-                "SKIPPED_METADATA_CHECK_FAIL"
-            )
-
-        elif not actual_quality[
-            "actual_exists"
-        ]:
-
-            status = (
-                "PENDING_ACTUAL_DATA"
-            )
-
-        elif not actual_ok:
-
-            status = (
-                "SKIPPED_ACTUAL_QUALITY_FAIL"
-            )
-
-        else:
-
-            status = "EVALUATED"
+        status = resolve_evaluation_status(
+            prediction_ok,
+            metadata_ok,
+            prediction_class,
+            actual_quality["actual_exists"],
+            actual_ok,
+        )
 
         status_rows.append(
             {
@@ -1695,6 +2108,12 @@ def main() -> None:
                     filename_target_date,
                 "status":
                     status,
+                "prediction_class":
+                    prediction_class,
+                "forward_guard_fail_reasons":
+                    metadata[
+                        "forward_guard_fail_reasons"
+                    ],
                 "prediction_path":
                     str(
                         prediction_path
@@ -1732,6 +2151,10 @@ def main() -> None:
             f"{metadata_ok}"
         )
         print(
+            f"prediction class      : "
+            f"{prediction_class}"
+        )
+        print(
             f"actual exists         : "
             f"{actual_quality['actual_exists']}"
         )
@@ -1744,7 +2167,10 @@ def main() -> None:
             f"{status}"
         )
 
-        if status != "EVALUATED":
+        if status not in (
+            "EVALUATED_FORWARD_VALID",
+            "EVALUATED_LEGACY_UNVERIFIED",
+        ):
             continue
 
         assert actual is not None
@@ -1822,6 +2248,9 @@ def main() -> None:
         ] = pred_checks[
             "prediction_sha256"
         ]
+        merged[
+            "prediction_class"
+        ] = prediction_class
 
         detail_frames.append(
             merged
@@ -1832,22 +2261,30 @@ def main() -> None:
             cutoff,
         ) in EVAL_BANDS.items():
 
-            daily_rows.append(
-                evaluate_band(
+            daily_row = evaluate_band(
                     merged,
                     actual,
                     filename_target_date,
                     band_name,
                     cutoff,
                 )
+            daily_row[
+                "prediction_class"
+            ] = prediction_class
+            daily_rows.append(
+                daily_row
             )
 
-        comparison_rows.append(
-            build_top10_comparison_daily_row(
+        comparison_row = build_top10_comparison_daily_row(
                 merged,
                 actual,
                 filename_target_date,
             )
+        comparison_row[
+            "prediction_class"
+        ] = prediction_class
+        comparison_rows.append(
+            comparison_row
         )
 
     status_df = pd.DataFrame(
@@ -1944,6 +2381,81 @@ def main() -> None:
         )
     )
 
+    forward_detail_df = filter_prediction_class(
+        detail_df,
+        PREDICTION_CLASS_FORWARD_VALID,
+    )
+    legacy_detail_df = filter_prediction_class(
+        detail_df,
+        PREDICTION_CLASS_LEGACY,
+    )
+    forward_daily_df = filter_prediction_class(
+        daily_df,
+        PREDICTION_CLASS_FORWARD_VALID,
+    )
+    legacy_daily_df = filter_prediction_class(
+        daily_df,
+        PREDICTION_CLASS_LEGACY,
+    )
+    forward_overall_df = build_overall_summary(
+        forward_daily_df
+    )
+    legacy_overall_df = build_overall_summary(
+        legacy_daily_df
+    )
+    if forward_overall_df.empty and not legacy_overall_df.empty:
+        forward_overall_df = legacy_overall_df.head(
+            0
+        ).copy()
+    if legacy_overall_df.empty and not forward_overall_df.empty:
+        legacy_overall_df = forward_overall_df.head(
+            0
+        ).copy()
+    forward_comparison_daily_df = filter_prediction_class(
+        comparison_daily_df,
+        PREDICTION_CLASS_FORWARD_VALID,
+    )
+    legacy_comparison_daily_df = filter_prediction_class(
+        comparison_daily_df,
+        PREDICTION_CLASS_LEGACY,
+    )
+    forward_comparison_overall_df = (
+        build_top10_comparison_overall(
+            forward_comparison_daily_df
+        )
+    )
+    legacy_comparison_overall_df = (
+        build_top10_comparison_overall(
+            legacy_comparison_daily_df
+        )
+    )
+    if (
+        forward_comparison_overall_df.empty
+        and not legacy_comparison_overall_df.empty
+    ):
+        forward_comparison_overall_df = (
+            legacy_comparison_overall_df.head(
+                0
+            ).copy()
+        )
+    if (
+        legacy_comparison_overall_df.empty
+        and not forward_comparison_overall_df.empty
+    ):
+        legacy_comparison_overall_df = (
+            forward_comparison_overall_df.head(
+                0
+            ).copy()
+        )
+    coverage_df = build_forward_coverage(
+        actual_map,
+        prediction_files,
+        status_df,
+    )
+    forward_summary_df = build_forward_summary(
+        status_df
+    )
+
     # --------------------------------------------------------
     # Save
     # --------------------------------------------------------
@@ -1981,6 +2493,55 @@ def main() -> None:
     comparison_overall_path = (
         OUTPUT_DIR
         / "69_top10_vs_outside_overall.csv"
+    )
+
+    forward_detail_path = (
+        OUTPUT_DIR
+        / "69_forward_valid_detail.csv"
+    )
+    forward_daily_path = (
+        OUTPUT_DIR
+        / "69_forward_valid_daily.csv"
+    )
+    forward_overall_path = (
+        OUTPUT_DIR
+        / "69_forward_valid_overall.csv"
+    )
+    legacy_detail_path = (
+        OUTPUT_DIR
+        / "69_legacy_unverified_detail.csv"
+    )
+    legacy_daily_path = (
+        OUTPUT_DIR
+        / "69_legacy_unverified_daily.csv"
+    )
+    legacy_overall_path = (
+        OUTPUT_DIR
+        / "69_legacy_unverified_overall.csv"
+    )
+    forward_comparison_daily_path = (
+        OUTPUT_DIR
+        / "69_forward_valid_top10_vs_outside_daily.csv"
+    )
+    forward_comparison_overall_path = (
+        OUTPUT_DIR
+        / "69_forward_valid_top10_vs_outside_overall.csv"
+    )
+    legacy_comparison_daily_path = (
+        OUTPUT_DIR
+        / "69_legacy_unverified_top10_vs_outside_daily.csv"
+    )
+    legacy_comparison_overall_path = (
+        OUTPUT_DIR
+        / "69_legacy_unverified_top10_vs_outside_overall.csv"
+    )
+    coverage_path = (
+        OUTPUT_DIR
+        / "69_forward_coverage.csv"
+    )
+    forward_summary_path = (
+        OUTPUT_DIR
+        / "69_forward_summary.csv"
     )
 
     status_df.to_csv(
@@ -2025,6 +2586,62 @@ def main() -> None:
         encoding="utf-8-sig",
     )
 
+    for frame, path in (
+        (
+            forward_detail_df,
+            forward_detail_path,
+        ),
+        (
+            forward_daily_df,
+            forward_daily_path,
+        ),
+        (
+            forward_overall_df,
+            forward_overall_path,
+        ),
+        (
+            legacy_detail_df,
+            legacy_detail_path,
+        ),
+        (
+            legacy_daily_df,
+            legacy_daily_path,
+        ),
+        (
+            legacy_overall_df,
+            legacy_overall_path,
+        ),
+        (
+            forward_comparison_daily_df,
+            forward_comparison_daily_path,
+        ),
+        (
+            forward_comparison_overall_df,
+            forward_comparison_overall_path,
+        ),
+        (
+            legacy_comparison_daily_df,
+            legacy_comparison_daily_path,
+        ),
+        (
+            legacy_comparison_overall_df,
+            legacy_comparison_overall_path,
+        ),
+        (
+            coverage_df,
+            coverage_path,
+        ),
+        (
+            forward_summary_df,
+            forward_summary_path,
+        ),
+    ):
+        frame.to_csv(
+            path,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
     # --------------------------------------------------------
     # Display
     # --------------------------------------------------------
@@ -2046,6 +2663,7 @@ def main() -> None:
                 [
                     "target_date",
                     "status",
+                    "prediction_class",
                     "metadata_model",
                     "metadata_weight_fingerprint",
                 ]
@@ -2107,6 +2725,15 @@ def main() -> None:
         )
 
     header(
+        "FORWARD VALID PROGRESS"
+    )
+    print(
+        forward_summary_df.to_string(
+            index=False
+        )
+    )
+
+    header(
         "FILES SAVED"
     )
 
@@ -2118,6 +2745,18 @@ def main() -> None:
         overall_path,
         comparison_daily_path,
         comparison_overall_path,
+        forward_detail_path,
+        forward_daily_path,
+        forward_overall_path,
+        legacy_detail_path,
+        legacy_daily_path,
+        legacy_overall_path,
+        forward_comparison_daily_path,
+        forward_comparison_overall_path,
+        legacy_comparison_daily_path,
+        legacy_comparison_overall_path,
+        coverage_path,
+        forward_summary_path,
     ):
         print(path)
 

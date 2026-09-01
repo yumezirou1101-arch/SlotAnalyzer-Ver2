@@ -7,6 +7,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from ana_slo_prediction_v4_2_forward_guard import (
+    validate_consecutive_latest_date,
+    validate_forward_time,
+    validate_not_frozen,
+    validate_target_actual_absent,
+)
+
 
 PROJECT_ROOT = Path(
     r"C:\Users\user\Desktop\Documents\SlotAnalyzer"
@@ -17,6 +24,12 @@ MACHINE_DATA_DIR = (
     / "data"
     / "maruhan_maebashi"
     / "machine_number"
+)
+
+FORMAL_OUTPUT_DIR = (
+    MACHINE_DATA_DIR
+    / "analysis_31days_deep"
+    / "64_Ver4_2_future_top10"
 )
 
 FIXED_SCRIPT = (
@@ -313,6 +326,25 @@ def main() -> None:
             )
         )
 
+    # A formal prediction may never use a gap, be backfilled after its
+    # deadline, coexist with target actual data, or replace a frozen set.
+    validate_not_frozen(
+        FORMAL_OUTPUT_DIR,
+        target_date,
+    )
+    validate_consecutive_latest_date(
+        target_date,
+        latest_date,
+    )
+    generated_at_jst = validate_forward_time(
+        target_date
+    )
+    validate_target_actual_absent(
+        PROJECT_ROOT,
+        MACHINE_DATA_DIR,
+        target_date,
+    )
+
     print(
         f"latest daily CSV      : {latest_path}"
     )
@@ -339,6 +371,14 @@ def main() -> None:
 
     print(
         f"internal date check   : {validation['date_ok']}"
+    )
+
+    print(
+        f"forward guard time    : {generated_at_jst.isoformat()}"
+    )
+
+    print(
+        "forward validity      : OK"
     )
 
     fixed = load_module(

@@ -7,6 +7,16 @@ import importlib.util
 import numpy as np
 import pandas as pd
 
+from ana_slo_prediction_v4_2_forward_guard import (
+    FORWARD_CUTOFF_HOUR_JST,
+    FORWARD_GUARD_VERSION,
+    sha256_file,
+    validate_consecutive_latest_date,
+    validate_forward_time,
+    validate_not_frozen,
+    validate_target_actual_absent,
+)
+
 
 # ============================================================
 # 64 - V4.2_C Future TOP10 Prediction
@@ -298,6 +308,53 @@ def main() -> None:
         "64 - V4.2_C Future TOP10 Prediction"
     )
 
+    # Final formal-output defense. These checks also apply when this
+    # fixed script is imported or invoked outside the normal 79 path.
+    all_path, top10_path, metadata_path = validate_not_frozen(
+        OUTPUT_DIR,
+        TARGET_DATE,
+    )
+    validate_consecutive_latest_date(
+        TARGET_DATE,
+        EXPECTED_LATEST_DATA_DATE,
+    )
+    validate_forward_time(
+        TARGET_DATE
+    )
+    validate_target_actual_absent(
+        PROJECT_ROOT,
+        DATA_DIR,
+        TARGET_DATE,
+    )
+
+    input_ymd = EXPECTED_LATEST_DATA_DATE.strftime(
+        "%Y%m%d"
+    )
+    input_daily_path = (
+        DATA_DIR
+        / f"ana_slo_{input_ymd}.csv"
+    )
+    input_source_path = (
+        PROJECT_ROOT
+        / f"ana_slo_{input_ymd}_source.html"
+    )
+
+    for label, path in (
+        (
+            "validated latest daily CSV",
+            input_daily_path,
+        ),
+        (
+            "validated latest source HTML",
+            input_source_path,
+        ),
+    ):
+        if not path.exists() or path.stat().st_size <= 0:
+            raise RuntimeError(
+                "FORWARD_GUARD_REJECTED: required input is missing or empty. "
+                f"label={label}, path={path}"
+            )
+
     m56 = load_module(
         SOURCE_56,
         "slotanalyzer_source56",
@@ -396,13 +453,11 @@ def main() -> None:
         latest_date
         != EXPECTED_LATEST_DATA_DATE
     ):
-
-        print()
-        print(
-            "[WARNING] Latest data date differs from the expected 2026-08-20."
-        )
-        print(
-            "Review inputs before treating this as the planned 2026-08-22 prediction."
+        raise RuntimeError(
+            "FORWARD_GUARD_REJECTED: assembled latest data date differs "
+            "from EXPECTED_LATEST_DATA_DATE. "
+            f"actual={latest_date.date()}, "
+            f"expected={EXPECTED_LATEST_DATA_DATE.date()}"
         )
 
     latest_snapshot = df[
@@ -604,40 +659,54 @@ def main() -> None:
         exist_ok=True,
     )
 
-    ymd = TARGET_DATE.strftime(
-        "%Y%m%d"
+    # Re-check immediately before saving. This closes the normal race
+    # window and makes a concurrent/partial writer fail closed.
+    generated_at_jst = validate_forward_time(
+        TARGET_DATE
     )
-
-    all_path = (
-        OUTPUT_DIR
-        / f"64_prediction_{ymd}_all514.csv"
+    validate_target_actual_absent(
+        PROJECT_ROOT,
+        DATA_DIR,
+        TARGET_DATE,
     )
-
-    top10_path = (
-        OUTPUT_DIR
-        / f"64_prediction_{ymd}_top10.csv"
-    )
-
-    metadata_path = (
-        OUTPUT_DIR
-        / f"64_prediction_{ymd}_metadata.csv"
+    all_path, top10_path, metadata_path = validate_not_frozen(
+        OUTPUT_DIR,
+        TARGET_DATE,
     )
 
     ranked.to_csv(
         all_path,
         index=False,
         encoding="utf-8-sig",
+        mode="x",
     )
 
     top10.to_csv(
         top10_path,
         index=False,
         encoding="utf-8-sig",
+        mode="x",
+    )
+
+    all514_sha256 = sha256_file(
+        all_path
+    )
+    top10_sha256 = sha256_file(
+        top10_path
+    )
+    daily_csv_sha256 = sha256_file(
+        input_daily_path
+    )
+    source_html_sha256 = sha256_file(
+        input_source_path
     )
 
     metadata = pd.DataFrame(
         [
             {
+                "generated_at_jst":
+                    generated_at_jst.isoformat(),
+
                 "target_date":
                     TARGET_DATE.date(),
 
@@ -656,6 +725,33 @@ def main() -> None:
                             champion_weights.values()
                         )
                     ),
+
+                "forward_guard_version":
+                    FORWARD_GUARD_VERSION,
+
+                "forward_valid":
+                    True,
+
+                "forward_cutoff_jst":
+                    f"{FORWARD_CUTOFF_HOUR_JST:02d}:00 Asia/Tokyo",
+
+                "target_actual_absent_at_generation":
+                    True,
+
+                "target_source_absent_at_generation":
+                    True,
+
+                "daily_csv_sha256":
+                    daily_csv_sha256,
+
+                "source_html_sha256":
+                    source_html_sha256,
+
+                "all514_sha256":
+                    all514_sha256,
+
+                "top10_sha256":
+                    top10_sha256,
 
                 "machines_ranked":
                     int(
@@ -687,6 +783,7 @@ def main() -> None:
         metadata_path,
         index=False,
         encoding="utf-8-sig",
+        mode="x",
     )
 
     header(

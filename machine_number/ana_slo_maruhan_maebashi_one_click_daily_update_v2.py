@@ -12,6 +12,12 @@ import urllib.request
 
 import pandas as pd
 
+from ana_slo_prediction_v4_2_forward_guard import (
+    validate_consecutive_latest_date,
+    validate_forward_time,
+    validate_target_actual_absent,
+)
+
 
 # ============================================================
 # Maruhan Mega City Maebashi Inter
@@ -586,15 +592,24 @@ def normalize_date(
 
 def resolve_prediction_target(
     requested_target: str | None,
+    source_date: pd.Timestamp,
 ) -> pd.Timestamp:
     if requested_target:
         return normalize_date(
             requested_target
         )
 
-    # Normal morning operation predicts "today".
-    # The latest actual/source must therefore normally be yesterday.
-    return pd.Timestamp.now().normalize()
+    # The validated source date is the single source of truth:
+    # yesterday -> today, today -> tomorrow. The Forward Guard below
+    # rejects stale/past targets and same-day runs at/after 09:00 JST.
+    return (
+        normalize_date(
+            source_date
+        )
+        + pd.Timedelta(
+            days=1
+        )
+    )
 
 
 def validate_freshness(
@@ -784,10 +799,6 @@ def main() -> None:
             errors="raise",
         )
 
-    prediction_target = resolve_prediction_target(
-        args.target_date
-    )
-
     header(
         "Maruhan Mega City Maebashi Inter "
         "- True One-Click Daily Update V2"
@@ -901,6 +912,11 @@ def main() -> None:
         discover_latest_source()
     )
 
+    prediction_target = resolve_prediction_target(
+        args.target_date,
+        source_date,
+    )
+
     header(
         "RESOLVED SOURCE"
     )
@@ -956,6 +972,28 @@ def main() -> None:
         allow_gap=args.allow_gap,
     )
 
+    # Formal Forward validity is stricter than the legacy --allow-gap
+    # freshness option. A formal prediction always requires target-1 data.
+    validate_consecutive_latest_date(
+        prediction_target,
+        source_date,
+    )
+    generated_at_jst = validate_forward_time(
+        prediction_target
+    )
+    validate_target_actual_absent(
+        PROJECT_ROOT,
+        DATA_DIR,
+        prediction_target,
+    )
+
+    print(
+        f"forward guard time    : {generated_at_jst.isoformat()}"
+    )
+    print(
+        "forward validity      : OK"
+    )
+
     # --------------------------------------------------------
     # 3) 69 LIVE PREDICTION BACKTEST
     # --------------------------------------------------------
@@ -1006,13 +1044,12 @@ def main() -> None:
     # --------------------------------------------------------
     # 5) 79 LIVE PIPELINE
     # --------------------------------------------------------
-    live_args = []
-
-    if args.target_date:
-        live_args += [
-            "--target-date",
-            args.target_date,
-        ]
+    live_args = [
+        "--target-date",
+        prediction_target.strftime(
+            "%Y-%m-%d"
+        ),
+    ]
 
     if args.allow_gap:
         live_args.append(
