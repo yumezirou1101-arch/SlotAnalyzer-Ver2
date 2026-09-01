@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import csv
+import msvcrt
+import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 # ============================================================
@@ -50,6 +55,22 @@ MACHINE_DIR = (
     / "machine_number"
 )
 
+LOG_DIR = PROJECT_ROOT / "logs" / "morning_automation"
+MORNING_HISTORY = LOG_DIR / "morning_run_history.csv"
+JST = ZoneInfo("Asia/Tokyo")
+MORNING_HISTORY_FIELDS = [
+    "run_id",
+    "started_at_jst",
+    "completed_at_jst",
+    "elapsed_sec",
+    "scope",
+    "store",
+    "status",
+    "returncode",
+    "error",
+]
+CSV_LOCK_TIMEOUT_SEC = 5.0
+
 
 MARUHAN_SCRIPT = (
     MACHINE_DIR
@@ -75,6 +96,96 @@ def header(
     print("=" * 120)
     print(title)
     print("=" * 120)
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def new_run_id(prefix: str = "morning") -> str:
+    return (
+        f"{prefix}_{now_jst():%Y%m%dT%H%M%S%f%z}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+
+
+def system_exit_status(exc: SystemExit) -> tuple[str, int]:
+    code = exc.code
+    if code is None:
+        code = 0
+    elif not isinstance(code, int):
+        code = 1
+    return (
+        "OK" if code == 0 else "FAILED",
+        code,
+    )
+
+
+def append_morning_history(
+    row: dict,
+    history_path: Path = MORNING_HISTORY,
+) -> bool:
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = history_path.with_suffix(history_path.suffix + ".lock")
+        with lock_path.open("a+b") as lock_handle:
+            if lock_handle.seek(0, 2) == 0:
+                lock_handle.write(b"\0")
+                lock_handle.flush()
+            deadline = time.perf_counter() + CSV_LOCK_TIMEOUT_SEC
+            while True:
+                lock_handle.seek(0)
+                try:
+                    msvcrt.locking(
+                        lock_handle.fileno(),
+                        msvcrt.LK_NBLCK,
+                        1,
+                    )
+                    break
+                except OSError:
+                    if time.perf_counter() >= deadline:
+                        raise TimeoutError(
+                            f"CSV history lock timed out: {lock_path}"
+                        )
+                    time.sleep(0.05)
+            try:
+                write_header = (
+                    not history_path.exists()
+                    or history_path.stat().st_size == 0
+                )
+                with history_path.open(
+                    "a",
+                    newline="",
+                    encoding="utf-8",
+                ) as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=MORNING_HISTORY_FIELDS,
+                    )
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(
+                        {
+                            key: row.get(key, "")
+                            for key in MORNING_HISTORY_FIELDS
+                        }
+                    )
+                    handle.flush()
+            finally:
+                lock_handle.seek(0)
+                msvcrt.locking(
+                    lock_handle.fileno(),
+                    msvcrt.LK_UNLCK,
+                    1,
+                )
+        return True
+    except Exception as exc:
+        print(
+            "WARNING: morning timing history could not be saved: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False
 
 
 def parse_args():
@@ -206,6 +317,7 @@ def compile_script(
 
 
 def run_store(
+    run_id: str,
     store_name: str,
     script_path: Path,
     args: list[str],
@@ -236,19 +348,26 @@ def run_store(
 
     print()
 
+    started_at = now_jst()
     started = time.perf_counter()
+    returncode = ""
 
     try:
 
         result = subprocess.run(
             command,
             cwd=PROJECT_ROOT,
+            env={
+                **os.environ,
+                "SLOTANALYZER_MORNING_RUN_ID": run_id,
+            },
         )
 
         elapsed = (
             time.perf_counter()
             - started
         )
+        returncode = result.returncode
 
         if result.returncode == 0:
 
@@ -275,6 +394,23 @@ def run_store(
             f"{type(exc).__name__}: "
             f"{exc}"
         )
+        returncode = 1
+
+    completed_at = now_jst()
+
+    append_morning_history(
+        {
+            "run_id": run_id,
+            "started_at_jst": started_at.isoformat(),
+            "completed_at_jst": completed_at.isoformat(),
+            "elapsed_sec": f"{elapsed:.6f}",
+            "scope": "STORE",
+            "store": store_name,
+            "status": status,
+            "returncode": returncode,
+            "error": error,
+        }
+    )
 
     print()
 
@@ -302,9 +438,10 @@ def run_store(
     }
 
 
-def main() -> None:
+def main(run_id: str | None = None) -> None:
 
     args = parse_args()
+    run_id = run_id or new_run_id()
 
     header(
         "SlotAnalyzer - Morning Runner"
@@ -471,6 +608,7 @@ def main() -> None:
             )
 
         result = run_store(
+            run_id,
             (
                 "MARUHAN MEGA CITY "
                 "MAEBASHI INTER"
@@ -511,6 +649,7 @@ def main() -> None:
             )
 
         result = run_store(
+            run_id,
             (
                 "BIG MARCH "
                 "TAKASAKI OYAGI"
@@ -543,6 +682,7 @@ def main() -> None:
             )
 
         result = run_store(
+            run_id,
             "YASUDA MAEBASHI",
             YASUDA_SCRIPT,
             yasuda_args,
@@ -649,5 +789,34 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    master_run_id = new_run_id()
+    master_started_at = now_jst()
+    master_started = time.perf_counter()
+    master_status = "FAILED"
+    master_returncode = 1
+    master_error = ""
 
-    main()
+    try:
+        main(master_run_id)
+        master_status = "OK"
+        master_returncode = 0
+    except BaseException as exc:
+        master_error = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, SystemExit):
+            master_status, master_returncode = system_exit_status(exc)
+        raise
+    finally:
+        completed_at = now_jst()
+        append_morning_history(
+            {
+                "run_id": master_run_id,
+                "started_at_jst": master_started_at.isoformat(),
+                "completed_at_jst": completed_at.isoformat(),
+                "elapsed_sec": f"{time.perf_counter() - master_started:.6f}",
+                "scope": "MASTER",
+                "store": "",
+                "status": master_status,
+                "returncode": master_returncode,
+                "error": master_error,
+            }
+        )

@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import csv
 import json
+import msvcrt
 import os
 import re
 import subprocess
 import sys
 import time
 import urllib.request
+import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -121,6 +126,36 @@ REMOTE_PROFILE_DIR = (
     / ".chrome_remote_profile_9222"
 )
 
+TIMING_LOG_DIR = (
+    PROJECT_ROOT
+    / "logs"
+    / "morning_automation"
+)
+MARUHAN_TIMING_HISTORY = (
+    TIMING_LOG_DIR
+    / "maruhan_one_click_stage_history.csv"
+)
+JST = ZoneInfo("Asia/Tokyo")
+TIMING_HISTORY_FIELDS = [
+    "run_id",
+    "target_date",
+    "latest_data_date",
+    "stage",
+    "started_at_jst",
+    "completed_at_jst",
+    "elapsed_sec",
+    "status",
+    "returncode",
+    "error",
+]
+TIMING_RUN_ID = ""
+TIMING_TARGET_DATE = ""
+TIMING_LATEST_DATA_DATE = ""
+CSV_LOCK_TIMEOUT_SEC = 5.0
+MORNING_RUN_ID_RE = re.compile(
+    r"^morning_\d{8}T\d{12}\+0900_[0-9a-f]{8}$"
+)
+
 SOURCE_RE = re.compile(
     r"^ana_slo_(\d{8})_source\.html$",
     re.IGNORECASE,
@@ -178,6 +213,127 @@ def header(
     )
     print(
         "=" * 126
+    )
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def new_timing_run_id() -> str:
+    return (
+        f"maruhan_{now_jst():%Y%m%dT%H%M%S%f%z}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+
+
+def resolve_timing_run_id(value: str | None) -> str:
+    candidate = (value or "").strip()
+    if MORNING_RUN_ID_RE.fullmatch(candidate):
+        return candidate
+    return new_timing_run_id()
+
+
+def system_exit_status(exc: SystemExit) -> tuple[str, int]:
+    code = exc.code
+    if code is None:
+        code = 0
+    elif not isinstance(code, int):
+        code = 1
+    return (
+        "OK" if code == 0 else "FAILED",
+        code,
+    )
+
+
+def append_timing_history(
+    row: dict,
+    history_path: Path = MARUHAN_TIMING_HISTORY,
+) -> bool:
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = history_path.with_suffix(history_path.suffix + ".lock")
+        with lock_path.open("a+b") as lock_handle:
+            if lock_handle.seek(0, 2) == 0:
+                lock_handle.write(b"\0")
+                lock_handle.flush()
+            deadline = time.perf_counter() + CSV_LOCK_TIMEOUT_SEC
+            while True:
+                lock_handle.seek(0)
+                try:
+                    msvcrt.locking(
+                        lock_handle.fileno(),
+                        msvcrt.LK_NBLCK,
+                        1,
+                    )
+                    break
+                except OSError:
+                    if time.perf_counter() >= deadline:
+                        raise TimeoutError(
+                            f"CSV history lock timed out: {lock_path}"
+                        )
+                    time.sleep(0.05)
+            try:
+                write_header = (
+                    not history_path.exists()
+                    or history_path.stat().st_size == 0
+                )
+                with history_path.open(
+                    "a",
+                    newline="",
+                    encoding="utf-8",
+                ) as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=TIMING_HISTORY_FIELDS,
+                    )
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(
+                        {
+                            key: row.get(key, "")
+                            for key in TIMING_HISTORY_FIELDS
+                        }
+                    )
+                    handle.flush()
+            finally:
+                lock_handle.seek(0)
+                msvcrt.locking(
+                    lock_handle.fileno(),
+                    msvcrt.LK_UNLCK,
+                    1,
+                )
+        return True
+    except Exception as exc:
+        print(
+            "WARNING: Maruhan timing history could not be saved: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+
+def record_timing(
+    stage: str,
+    started_at: datetime,
+    started_perf: float,
+    status: str,
+    returncode,
+    error: str = "",
+) -> None:
+    append_timing_history(
+        {
+            "run_id": TIMING_RUN_ID,
+            "target_date": TIMING_TARGET_DATE,
+            "latest_data_date": TIMING_LATEST_DATA_DATE,
+            "stage": stage,
+            "started_at_jst": started_at.isoformat(),
+            "completed_at_jst": now_jst().isoformat(),
+            "elapsed_sec": f"{time.perf_counter() - started_perf:.6f}",
+            "status": status,
+            "returncode": returncode,
+            "error": error,
+        }
     )
 
 
@@ -432,6 +588,7 @@ def run_stage(
     label: str,
     script: Path,
     args: list[str] | None = None,
+    history_stage: str | None = None,
 ) -> float:
     args = (
         args
@@ -460,19 +617,42 @@ def run_stage(
         )
     )
 
+    started_at = now_jst()
     started = (
         time.perf_counter()
     )
 
-    result = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+        )
+    except Exception as exc:
+        if history_stage:
+            record_timing(
+                history_stage,
+                started_at,
+                started,
+                "FAILED",
+                1,
+                f"{type(exc).__name__}: {exc}",
+            )
+        raise
 
     elapsed = (
         time.perf_counter()
         - started
     )
+
+    if history_stage:
+        record_timing(
+            history_stage,
+            started_at,
+            started,
+            "OK" if result.returncode == 0 else "FAILED",
+            result.returncode,
+            "" if result.returncode == 0 else f"exit code {result.returncode}",
+        )
 
     print()
     print(
@@ -774,6 +954,8 @@ def summarize_69_output(path: Path) -> str:
 
 
 def main() -> None:
+    global TIMING_TARGET_DATE
+    global TIMING_LATEST_DATA_DATE
     args = parse_args()
 
     if (
@@ -847,9 +1029,30 @@ def main() -> None:
             f"{path.name}"
         )
 
-    ensure_cdp(
-        args.chrome_wait_sec
-    )
+    cdp_started_at = now_jst()
+    cdp_started = time.perf_counter()
+    try:
+        ensure_cdp(
+            args.chrome_wait_sec
+        )
+    except Exception as exc:
+        record_timing(
+            "PREFLIGHT_CDP",
+            cdp_started_at,
+            cdp_started,
+            "FAILED",
+            1,
+            f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    else:
+        record_timing(
+            "PREFLIGHT_CDP",
+            cdp_started_at,
+            cdp_started,
+            "OK",
+            0,
+        )
 
     print()
     print(
@@ -891,6 +1094,7 @@ def main() -> None:
                     args.fetch_days
                 ),
             ],
+            history_stage="FETCH",
         )
 
         stage_rows.append(
@@ -904,6 +1108,14 @@ def main() -> None:
         print(
             "STEP 1 / 5 - FETCH NEWEST HTML : SKIPPED"
         )
+        skipped_at = now_jst()
+        record_timing(
+            "FETCH",
+            skipped_at,
+            time.perf_counter(),
+            "SKIPPED",
+            0,
+        )
 
     # --------------------------------------------------------
     # Resolve the source explicitly.
@@ -916,6 +1128,8 @@ def main() -> None:
         args.target_date,
         source_date,
     )
+    TIMING_TARGET_DATE = str(prediction_target.date())
+    TIMING_LATEST_DATA_DATE = str(source_date.date())
 
     header(
         "RESOLVED SOURCE"
@@ -939,6 +1153,7 @@ def main() -> None:
                 source_html
             ),
         ],
+        history_stage="CONVERT",
     )
 
     stage_rows.append(
@@ -965,27 +1180,48 @@ def main() -> None:
     # --------------------------------------------------------
     # Freshness guard
     # --------------------------------------------------------
-    validate_freshness(
-        source_date=source_date,
-        daily_csv=daily_csv,
-        prediction_target=prediction_target,
-        allow_gap=args.allow_gap,
-    )
+    guard_started_at = now_jst()
+    guard_started = time.perf_counter()
+    try:
+        validate_freshness(
+            source_date=source_date,
+            daily_csv=daily_csv,
+            prediction_target=prediction_target,
+            allow_gap=args.allow_gap,
+        )
 
-    # Formal Forward validity is stricter than the legacy --allow-gap
-    # freshness option. A formal prediction always requires target-1 data.
-    validate_consecutive_latest_date(
-        prediction_target,
-        source_date,
-    )
-    generated_at_jst = validate_forward_time(
-        prediction_target
-    )
-    validate_target_actual_absent(
-        PROJECT_ROOT,
-        DATA_DIR,
-        prediction_target,
-    )
+        # Formal Forward validity is stricter than the legacy --allow-gap
+        # freshness option. A formal prediction always requires target-1 data.
+        validate_consecutive_latest_date(
+            prediction_target,
+            source_date,
+        )
+        generated_at_jst = validate_forward_time(
+            prediction_target
+        )
+        validate_target_actual_absent(
+            PROJECT_ROOT,
+            DATA_DIR,
+            prediction_target,
+        )
+    except Exception as exc:
+        record_timing(
+            "FRESHNESS_FORWARD_GUARD",
+            guard_started_at,
+            guard_started,
+            "FAILED",
+            1,
+            f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    else:
+        record_timing(
+            "FRESHNESS_FORWARD_GUARD",
+            guard_started_at,
+            guard_started,
+            "OK",
+            0,
+        )
 
     print(
         f"forward guard time    : {generated_at_jst.isoformat()}"
@@ -1000,6 +1236,7 @@ def main() -> None:
     elapsed = run_stage(
         "STEP 3 / 5 - LIVE PREDICTION BACKTEST 69",
         SCRIPT_69,
+        history_stage="69_BACKTEST",
     )
 
     stage_rows.append(
@@ -1032,6 +1269,7 @@ def main() -> None:
     elapsed = run_stage(
         "STEP 4 / 5 - CHAMPION / CHALLENGER FORWARD",
         SCRIPT_FORWARD,
+        history_stage="63_FORWARD",
     )
 
     stage_rows.append(
@@ -1060,6 +1298,7 @@ def main() -> None:
         "STEP 5 / 5 - LIVE PREDICTION PIPELINE 79",
         SCRIPT_LIVE,
         live_args,
+        history_stage="79_PIPELINE",
     )
 
     stage_rows.append(
@@ -1155,4 +1394,29 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    TIMING_RUN_ID = resolve_timing_run_id(
+        os.environ.get("SLOTANALYZER_MORNING_RUN_ID")
+    )
+    total_started_at = now_jst()
+    total_started_perf = time.perf_counter()
+    total_status = "FAILED"
+    total_returncode = 1
+    total_error = ""
+    try:
+        main()
+        total_status = "OK"
+        total_returncode = 0
+    except BaseException as exc:
+        total_error = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, SystemExit):
+            total_status, total_returncode = system_exit_status(exc)
+        raise
+    finally:
+        record_timing(
+            "TOTAL",
+            total_started_at,
+            total_started_perf,
+            total_status,
+            total_returncode,
+            total_error,
+        )

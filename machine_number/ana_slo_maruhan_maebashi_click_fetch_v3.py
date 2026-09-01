@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from io import StringIO
 import argparse
 import asyncio
 import csv
+import msvcrt
+import os
 import re
+import sys
+import time
+import uuid
 
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -68,6 +74,26 @@ LOG_DIR = (
     / "fetch_logs"
 )
 
+FETCH_TIMING_HISTORY = (
+    PROJECT_ROOT
+    / "logs"
+    / "morning_automation"
+    / "maruhan_fetch_timing_history.csv"
+)
+JST = ZoneInfo("Asia/Tokyo")
+FETCH_TIMING_FIELDS = [
+    "run_id",
+    "fetch_started_at_jst",
+    "fetch_completed_at_jst",
+    "fetch_elapsed_sec",
+    "status",
+    "error",
+]
+CSV_LOCK_TIMEOUT_SEC = 5.0
+MORNING_RUN_ID_RE = re.compile(
+    r"^morning_\d{8}T\d{12}\+0900_[0-9a-f]{8}$"
+)
+
 DATE_TEXT_RE = re.compile(
     r"^\s*(20\d{2})/(\d{1,2})/(\d{1,2})"
 )
@@ -78,6 +104,91 @@ def header(title: str) -> None:
     print("=" * 118)
     print(title)
     print("=" * 118)
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def new_fetch_run_id() -> str:
+    return (
+        f"fetch_{now_jst():%Y%m%dT%H%M%S%f%z}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+
+
+def resolve_fetch_run_id(value: str | None) -> str:
+    candidate = (value or "").strip()
+    if MORNING_RUN_ID_RE.fullmatch(candidate):
+        return candidate
+    return new_fetch_run_id()
+
+
+def append_fetch_timing_history(
+    row: dict,
+    history_path: Path = FETCH_TIMING_HISTORY,
+) -> bool:
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = history_path.with_suffix(history_path.suffix + ".lock")
+        with lock_path.open("a+b") as lock_handle:
+            if lock_handle.seek(0, 2) == 0:
+                lock_handle.write(b"\0")
+                lock_handle.flush()
+            deadline = time.perf_counter() + CSV_LOCK_TIMEOUT_SEC
+            while True:
+                lock_handle.seek(0)
+                try:
+                    msvcrt.locking(
+                        lock_handle.fileno(),
+                        msvcrt.LK_NBLCK,
+                        1,
+                    )
+                    break
+                except OSError:
+                    if time.perf_counter() >= deadline:
+                        raise TimeoutError(
+                            f"CSV history lock timed out: {lock_path}"
+                        )
+                    time.sleep(0.05)
+            try:
+                write_header = (
+                    not history_path.exists()
+                    or history_path.stat().st_size == 0
+                )
+                with history_path.open(
+                    "a",
+                    newline="",
+                    encoding="utf-8",
+                ) as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=FETCH_TIMING_FIELDS,
+                    )
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(
+                        {
+                            key: row.get(key, "")
+                            for key in FETCH_TIMING_FIELDS
+                        }
+                    )
+                    handle.flush()
+            finally:
+                lock_handle.seek(0)
+                msvcrt.locking(
+                    lock_handle.fileno(),
+                    msvcrt.LK_UNLCK,
+                    1,
+                )
+        return True
+    except Exception as exc:
+        print(
+            "WARNING: fetch timing history could not be saved: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False
 
 
 def parse_args():
@@ -1220,4 +1331,29 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    fetch_run_id = resolve_fetch_run_id(
+        os.environ.get("SLOTANALYZER_MORNING_RUN_ID")
+    )
+    fetch_started_at = now_jst()
+    fetch_started_perf = time.perf_counter()
+    fetch_status = "FAILED"
+    fetch_error = ""
+    try:
+        asyncio.run(main())
+        fetch_status = "OK"
+    except BaseException as exc:
+        fetch_error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        append_fetch_timing_history(
+            {
+                "run_id": fetch_run_id,
+                "fetch_started_at_jst": fetch_started_at.isoformat(),
+                "fetch_completed_at_jst": now_jst().isoformat(),
+                "fetch_elapsed_sec": (
+                    f"{time.perf_counter() - fetch_started_perf:.6f}"
+                ),
+                "status": fetch_status,
+                "error": fetch_error,
+            }
+        )
