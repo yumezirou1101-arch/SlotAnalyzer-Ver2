@@ -36,3 +36,6 @@ minrepo_*_files/
 *_tmp_*.txt
 .chrome_remote_profile_9222/
 *_source_files/
+
+# Morning automation runtime files
+logs/morning_automation/
