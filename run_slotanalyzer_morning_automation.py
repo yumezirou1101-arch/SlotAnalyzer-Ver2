@@ -219,10 +219,26 @@ def _has_big_or_yasuda_completion_artifact(
     ymd = operation_date.strftime("%Y%m%d")
     if store == STORE_BIGMARCH:
         data_dir = project_root / "data/bigmarch_takasaki_oyagi/machine_number"
+        analysis = data_dir / "analysis_31days_deep"
         candidates = [
-            data_dir / f"ana_slo_bigmarch_oyagi_{expected:%Y%m%d}.csv",
-            data_dir / "analysis_31days_deep/09_juggler_recent7_future_ranking" / f"09_prediction_{ymd}_metadata.csv",
-            data_dir / "analysis_31days_deep/12_nonjuggler_weekday_future_ranking" / f"12_prediction_{ymd}_metadata.csv",
+            analysis
+            / "09_juggler_recent7_future_ranking"
+            / f"09_prediction_{ymd}_all_juggler.csv",
+            analysis
+            / "09_juggler_recent7_future_ranking"
+            / f"09_prediction_{ymd}_top10.csv",
+            analysis
+            / "09_juggler_recent7_future_ranking"
+            / f"09_prediction_{ymd}_metadata.csv",
+            analysis
+            / "12_nonjuggler_weekday_future_ranking"
+            / f"12_prediction_{ymd}_all_nonjuggler.csv",
+            analysis
+            / "12_nonjuggler_weekday_future_ranking"
+            / f"12_prediction_{ymd}_top10.csv",
+            analysis
+            / "12_nonjuggler_weekday_future_ranking"
+            / f"12_prediction_{ymd}_metadata.csv",
         ]
     else:
         candidates = [

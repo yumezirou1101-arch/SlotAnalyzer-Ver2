@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 
@@ -35,7 +35,9 @@ from slotanalyzer_morning_automation_support import (
     maruhan_pipeline_start_allowed,
     other_store_retry_allowed,
     run_logged_subprocess,
+    verify_big_march_completion,
     verify_maruhan_completion,
+    verify_yasuda_completion,
     VerificationResult,
     STORE_BIGMARCH,
     STORE_MARUHAN,
@@ -58,6 +60,118 @@ def make_html(day: date, store: str, rows: int) -> str:
         + "".join(body_rows)
         + "</table></body></html>"
     )
+
+
+def write_big_march_daily(root: Path, operation: date, rows: int = 200) -> Path:
+    expected = operation - timedelta(days=1)
+    path = (
+        root
+        / "data/bigmarch_takasaki_oyagi/machine_number"
+        / f"ana_slo_bigmarch_oyagi_{expected:%Y%m%d}.csv"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["date", "machine_name", "machine_no", "G", "diff"],
+        )
+        writer.writeheader()
+        for number in range(1, rows + 1):
+            writer.writerow(
+                {
+                    "date": expected.isoformat(),
+                    "machine_name": f"Machine {number}",
+                    "machine_no": number,
+                    "G": 1000,
+                    "diff": number,
+                }
+            )
+    return path
+
+
+def write_big_march_target_artifacts(root: Path, operation: date) -> list[Path]:
+    expected = operation - timedelta(days=1)
+    ymd = operation.strftime("%Y%m%d")
+    analysis = (
+        root
+        / "data/bigmarch_takasaki_oyagi/machine_number/analysis_31days_deep"
+    )
+    paths = [
+        analysis / "08_juggler_recent7_top3_forward/08_forward_status.csv",
+        analysis
+        / "11_nonjuggler_weekday_top1_forward"
+        / "11_nonjuggler_weekday_top1_forward_summary.csv",
+        analysis
+        / "09_juggler_recent7_future_ranking"
+        / f"09_prediction_{ymd}_all_juggler.csv",
+        analysis
+        / "09_juggler_recent7_future_ranking"
+        / f"09_prediction_{ymd}_top10.csv",
+        analysis
+        / "09_juggler_recent7_future_ranking"
+        / f"09_prediction_{ymd}_metadata.csv",
+        analysis
+        / "12_nonjuggler_weekday_future_ranking"
+        / f"12_prediction_{ymd}_all_nonjuggler.csv",
+        analysis
+        / "12_nonjuggler_weekday_future_ranking"
+        / f"12_prediction_{ymd}_top10.csv",
+        analysis
+        / "12_nonjuggler_weekday_future_ranking"
+        / f"12_prediction_{ymd}_metadata.csv",
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.name.endswith("_metadata.csv"):
+            path.write_text(
+                "target_date,latest_data_date\n"
+                f"{operation.isoformat()},{expected.isoformat()}\n",
+                encoding="utf-8-sig",
+            )
+        else:
+            path.write_text("status\nOK\n", encoding="utf-8-sig")
+    return paths
+
+
+def write_yasuda_daily(root: Path, operation: date) -> Path:
+    expected = operation - timedelta(days=1)
+    path = (
+        root
+        / "data/yasuda_maebashi/machine_number"
+        / f"ana_slo_{expected:%Y%m%d}.csv"
+    )
+    columns = [
+        "日付",
+        "台番号",
+        "機種名",
+        "G数",
+        "差枚",
+        "BB",
+        "RB",
+        "合成確率",
+        "BB確率",
+        "RB確率",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for number in range(1, 321):
+            writer.writerow(
+                {
+                    "日付": expected.isoformat(),
+                    "台番号": number,
+                    "機種名": f"Machine {number}",
+                    "G数": 1000,
+                    "差枚": number,
+                    "BB": 1,
+                    "RB": 1,
+                    "合成確率": "1/100",
+                    "BB確率": "1/200",
+                    "RB確率": "1/200",
+                }
+            )
+    return path
 
 
 class Phase2SupportTests(unittest.TestCase):
@@ -222,6 +336,82 @@ class Phase2SupportTests(unittest.TestCase):
         for item in state["stores"].values():
             item["status"] = "SUCCESS"
         self.assertTrue(automation.all_terminal(state))
+
+    def test_big_march_daily_only_does_not_block_startup_recovery(self):
+        operation = date(2026, 9, 2)
+        current = datetime(2026, 9, 2, 8, 0, tzinfo=JST)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_big_march_daily(root, operation)
+            verification = verify_big_march_completion(root, operation)
+            self.assertEqual(verification.status, "PARTIAL")
+
+            state = automation.create_state(operation, "automation_test", current)
+            automation.reconcile_startup_state(state, root, operation, current)
+
+            item = state["stores"][STORE_BIGMARCH]
+            self.assertEqual(item["status"], "PENDING")
+            self.assertNotEqual(
+                item["error_category"], "PREEXISTING_COMPLETION_ARTIFACT"
+            )
+
+    def test_big_march_partial_target_artifact_requires_manual_review(self):
+        operation = date(2026, 9, 2)
+        current = datetime(2026, 9, 2, 8, 0, tzinfo=JST)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = (
+                root
+                / "data/bigmarch_takasaki_oyagi/machine_number"
+                / "analysis_31days_deep/09_juggler_recent7_future_ranking"
+                / "09_prediction_20260902_top10.csv"
+            )
+            target.parent.mkdir(parents=True)
+            target.write_text("rank\n1\n", encoding="utf-8-sig")
+
+            state = automation.create_state(operation, "automation_test", current)
+            automation.reconcile_startup_state(state, root, operation, current)
+
+            item = state["stores"][STORE_BIGMARCH]
+            self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+            self.assertEqual(
+                item["error_category"], "PREEXISTING_COMPLETION_ARTIFACT"
+            )
+
+    def test_big_march_complete_artifacts_without_state_stay_manual(self):
+        operation = date(2026, 9, 2)
+        current = datetime(2026, 9, 2, 8, 0, tzinfo=JST)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_big_march_daily(root, operation)
+            write_big_march_target_artifacts(root, operation)
+            self.assertTrue(verify_big_march_completion(root, operation).ok)
+
+            state = automation.create_state(operation, "automation_test", current)
+            automation.reconcile_startup_state(state, root, operation, current)
+
+            item = state["stores"][STORE_BIGMARCH]
+            self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+            self.assertEqual(
+                item["error_category"], "PREEXISTING_COMPLETION_ARTIFACT"
+            )
+
+    def test_yasuda_daily_remains_complete_and_startup_stays_manual(self):
+        operation = date(2026, 9, 2)
+        current = datetime(2026, 9, 2, 8, 0, tzinfo=JST)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_yasuda_daily(root, operation)
+            self.assertTrue(verify_yasuda_completion(root, operation).ok)
+
+            state = automation.create_state(operation, "automation_test", current)
+            automation.reconcile_startup_state(state, root, operation, current)
+
+            item = state["stores"][STORE_YASUDA]
+            self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+            self.assertEqual(
+                item["error_category"], "PREEXISTING_COMPLETION_ARTIFACT"
+            )
 
     def test_maruhan_partial_64_requires_manual_review(self):
         operation = date(2026, 9, 2)
