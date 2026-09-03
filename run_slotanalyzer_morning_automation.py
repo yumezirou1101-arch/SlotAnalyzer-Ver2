@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import os
+import subprocess
 import sys
 import time
 import uuid
-from ctypes import wintypes
 from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 
@@ -70,6 +69,8 @@ DEFAULT_MAX_FETCH_ATTEMPTS = 20
 DEFAULT_CHROME_WAIT_SEC = 15
 PROVISIONAL_MARUHAN_LAST_START = datetime_time(8, 30)
 OTHER_STORE_DEADLINE = datetime_time(9, 30)
+SLEEP_HELPER_PATH = PROJECT_ROOT / "sleep_windows_after_delay.py"
+SLEEP_HELPER_DELAY_SEC = 10
 
 STORE_LABELS = {
     STORE_MARUHAN: "Maruhan Mega City Maebashi Inter",
@@ -564,52 +565,112 @@ def should_sleep_on_success(
     )
 
 
-def request_windows_sleep(set_suspend_state=None) -> None:
-    if set_suspend_state is None:
-        if os.name != "nt":
-            raise OSError("Windows sleep is only available on Windows.")
-        powrprof = ctypes.WinDLL("PowrProf.dll", use_last_error=True)
-        set_suspend_state = powrprof.SetSuspendState
-        set_suspend_state.argtypes = [
-            wintypes.BOOLEAN,
-            wintypes.BOOLEAN,
-            wintypes.BOOLEAN,
-        ]
-        set_suspend_state.restype = wintypes.BOOLEAN
-
-    # SetSuspendState(Hibernate, ForceCritical, DisableWakeEvent).
-    # False, False, False requests normal sleep (not hibernation), does not
-    # force a critical suspend, and leaves wake events enabled.
-    if not set_suspend_state(False, False, False):
-        error_code = ctypes.get_last_error()
-        detail = f" (Windows error {error_code})" if error_code else ""
-        raise OSError(f"SetSuspendState returned FALSE{detail}.")
+def launch_sleep_helper(
+    parent_automation_run_id: str,
+    delay_sec: int = SLEEP_HELPER_DELAY_SEC,
+    popen=None,
+    *,
+    dry_run: bool = False,
+) -> int:
+    if os.name != "nt":
+        raise OSError("Detached sleep helper is only available on Windows.")
+    if popen is None:
+        popen = subprocess.Popen
+    command = [
+        sys.executable,
+        str(SLEEP_HELPER_PATH.resolve()),
+        "--parent-automation-run-id",
+        parent_automation_run_id,
+        "--delay-sec",
+        str(delay_sec),
+    ]
+    if dry_run:
+        command.append("--dry-run")
+    process = popen(
+        command,
+        cwd=str(PROJECT_ROOT),
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=(
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        ),
+    )
+    return process.pid
 
 
 def maybe_sleep_on_success(
     enabled: bool,
     state: dict,
     wrapper_returncode: int,
-    sleep_request=None,
+    helper_launcher=None,
 ) -> bool:
     if not should_sleep_on_success(enabled, state, wrapper_returncode):
         return False
 
-    print("All stores completed successfully. Requesting normal Windows sleep...")
+    print("All stores completed successfully. Launching detached sleep helper...")
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        if sleep_request is None:
-            sleep_request = request_windows_sleep
-        sleep_request()
+        if helper_launcher is None:
+            helper_launcher = launch_sleep_helper
+        helper_pid = helper_launcher(state["automation_run_id"])
     except Exception as exc:
         print(
-            f"WARNING: Windows sleep request failed: {type(exc).__name__}: {exc}",
+            f"WARNING: Windows sleep helper launch failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
             flush=True,
         )
         return False
+    print(
+        f"Detached sleep helper launched: pid={helper_pid} "
+        f"delay={SLEEP_HELPER_DELAY_SEC}s"
+    )
+    sys.stdout.flush()
     return True
+
+
+def flush_output_streams() -> None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+
+def finalize_automation_run(
+    state_path: Path,
+    state: dict,
+    sleep_enabled: bool,
+    *,
+    save_function=None,
+    summary_function=None,
+    flush_function=None,
+    helper_launcher=None,
+    clock=None,
+) -> int:
+    if save_function is None:
+        save_function = save_state
+    if summary_function is None:
+        summary_function = print_summary
+    if flush_function is None:
+        flush_function = flush_output_streams
+    if clock is None:
+        clock = now_jst
+
+    save_function(state_path, state, clock())
+    summary_function(state)
+    wrapper_returncode = 0 if all(
+        item["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
+        for item in state["stores"].values()
+    ) else 1
+    flush_function()
+    maybe_sleep_on_success(
+        sleep_enabled,
+        state,
+        wrapper_returncode,
+        helper_launcher,
+    )
+    return wrapper_returncode
 
 
 def main() -> int:
@@ -680,20 +741,11 @@ def main() -> int:
                     sleep_sec = max(1, min(sleep_sec, int((min(future_retries) - current).total_seconds())))
                 print(f"Waiting {sleep_sec} seconds before the next readiness pass...")
                 time.sleep(sleep_sec)
-            save_state(state_path, state, now_jst())
-            print_summary(state)
-            wrapper_returncode = 0 if all(
-                item["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
-                for item in state["stores"].values()
-            ) else 1
-            sys.stdout.flush()
-            sys.stderr.flush()
-            maybe_sleep_on_success(
-                args.sleep_on_success,
+            return finalize_automation_run(
+                state_path,
                 state,
-                wrapper_returncode,
+                args.sleep_on_success,
             )
-            return wrapper_returncode
     except LockUnavailableError as exc:
         print(f"ALREADY RUNNING: {exc}")
         return 0

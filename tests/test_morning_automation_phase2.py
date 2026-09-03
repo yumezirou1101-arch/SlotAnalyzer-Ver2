@@ -190,7 +190,7 @@ class Phase2SupportTests(unittest.TestCase):
         calls = []
 
         result = automation.maybe_sleep_on_success(
-            False, state, 0, lambda: calls.append(True)
+            False, state, 0, lambda run_id: calls.append(run_id)
         )
 
         self.assertFalse(result)
@@ -207,11 +207,11 @@ class Phase2SupportTests(unittest.TestCase):
         calls = []
 
         result = automation.maybe_sleep_on_success(
-            True, state, 0, lambda: calls.append(True)
+            True, state, 0, lambda run_id: calls.append(run_id) or 1234
         )
 
         self.assertTrue(result)
-        self.assertEqual(calls, [True])
+        self.assertEqual(calls, ["test_run"])
 
     def test_sleep_option_accepts_success_and_already_complete(self):
         state = self._state_with_statuses(
@@ -220,18 +220,18 @@ class Phase2SupportTests(unittest.TestCase):
         calls = []
 
         result = automation.maybe_sleep_on_success(
-            True, state, 0, lambda: calls.append(True)
+            True, state, 0, lambda run_id: calls.append(run_id) or 1234
         )
 
         self.assertTrue(result)
-        self.assertEqual(calls, [True])
+        self.assertEqual(calls, ["test_run"])
 
     def test_sleep_option_failed_final_does_not_request_sleep(self):
         state = self._state_with_statuses(["SUCCESS", "FAILED_FINAL", "SUCCESS"])
         calls = []
 
         result = automation.maybe_sleep_on_success(
-            True, state, 1, lambda: calls.append(True)
+            True, state, 1, lambda run_id: calls.append(run_id)
         )
 
         self.assertFalse(result)
@@ -244,7 +244,7 @@ class Phase2SupportTests(unittest.TestCase):
         calls = []
 
         result = automation.maybe_sleep_on_success(
-            True, state, 1, lambda: calls.append(True)
+            True, state, 1, lambda run_id: calls.append(run_id)
         )
 
         self.assertFalse(result)
@@ -255,43 +255,159 @@ class Phase2SupportTests(unittest.TestCase):
         calls = []
 
         result = automation.maybe_sleep_on_success(
-            True, state, 1, lambda: calls.append(True)
+            True, state, 1, lambda run_id: calls.append(run_id)
         )
 
         self.assertFalse(result)
         self.assertEqual(calls, [])
 
-    def test_sleep_request_failure_preserves_success_and_returncode(self):
+    def test_sleep_helper_launch_failure_preserves_success_and_returncode(self):
         state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
         original_statuses = [
             state["stores"][store]["status"] for store in automation.STORE_ORDER
         ]
 
-        def fail_sleep():
-            raise OSError("mock sleep failure")
+        def fail_launch(run_id):
+            raise OSError(f"mock helper launch failure: {run_id}")
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
-            result = automation.maybe_sleep_on_success(True, state, 0, fail_sleep)
+            result = automation.maybe_sleep_on_success(True, state, 0, fail_launch)
 
         self.assertFalse(result)
-        self.assertIn("WARNING: Windows sleep request failed", stderr.getvalue())
+        self.assertIn(
+            "WARNING: Windows sleep helper launch failed", stderr.getvalue()
+        )
         self.assertEqual(
             [state["stores"][store]["status"] for store in automation.STORE_ORDER],
             original_statuses,
         )
         self.assertTrue(automation.should_sleep_on_success(True, state, 0))
 
-    def test_windows_sleep_requests_non_hibernate_without_force(self):
+    def test_sleep_option_missing_store_does_not_launch_helper(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        del state["stores"][automation.STORE_YASUDA]
         calls = []
 
-        def set_suspend_state(hibernate, force_critical, disable_wake_event):
-            calls.append((hibernate, force_critical, disable_wake_event))
-            return True
+        result = automation.maybe_sleep_on_success(
+            True, state, 0, lambda run_id: calls.append(run_id)
+        )
 
-        automation.request_windows_sleep(set_suspend_state)
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
 
-        self.assertEqual(calls, [(False, False, False)])
+    def test_sleep_helper_popen_arguments_are_detached_and_not_waited(self):
+        calls = []
+
+        class Process:
+            pid = 4321
+
+            def wait(self):
+                raise AssertionError("wrapper must not wait for the helper")
+
+            def communicate(self):
+                raise AssertionError("wrapper must not communicate with the helper")
+
+        def fake_popen(command, **kwargs):
+            calls.append((command, kwargs))
+            return Process()
+
+        pid = automation.launch_sleep_helper("test_run", 10, fake_popen)
+
+        self.assertEqual(pid, 4321)
+        self.assertEqual(len(calls), 1)
+        command, kwargs = calls[0]
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[1], str(automation.SLEEP_HELPER_PATH.resolve()))
+        self.assertEqual(
+            command[2:],
+            ["--parent-automation-run-id", "test_run", "--delay-sec", "10"],
+        )
+        self.assertEqual(kwargs["cwd"], str(automation.PROJECT_ROOT))
+        self.assertFalse(kwargs["shell"])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(kwargs["close_fds"])
+        self.assertEqual(
+            kwargs["creationflags"],
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+
+    def test_sleep_helper_dry_run_is_explicitly_forwarded(self):
+        calls = []
+
+        class Process:
+            pid = 4321
+
+        def fake_popen(command, **kwargs):
+            calls.append(command)
+            return Process()
+
+        automation.launch_sleep_helper(
+            "detached_dry_run", 10, fake_popen, dry_run=True
+        )
+
+        self.assertEqual(calls[0][-1], "--dry-run")
+
+    def test_finalization_order_is_save_summary_flush_then_helper_launch(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        events = []
+
+        def save_function(path, value, current):
+            events.append("save")
+
+        def summary_function(value):
+            events.append("summary")
+
+        def flush_function():
+            events.append("flush")
+
+        def helper_launcher(run_id):
+            events.append("launch")
+            return 4321
+
+        returncode = automation.finalize_automation_run(
+            Path("unused.json"),
+            state,
+            True,
+            save_function=save_function,
+            summary_function=summary_function,
+            flush_function=flush_function,
+            helper_launcher=helper_launcher,
+            clock=lambda: datetime(2026, 9, 3, 8, 1, tzinfo=JST),
+        )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(events, ["save", "summary", "flush", "launch"])
+
+    def test_finalization_keeps_zero_when_helper_launch_fails(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+
+        def fail_launch(run_id):
+            raise OSError(f"mock helper launch failure: {run_id}")
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            returncode = automation.finalize_automation_run(
+                Path("unused.json"),
+                state,
+                True,
+                save_function=lambda path, value, current: None,
+                summary_function=lambda value: None,
+                flush_function=lambda: None,
+                helper_launcher=fail_launch,
+                clock=lambda: datetime(2026, 9, 3, 8, 1, tzinfo=JST),
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertIn(
+            "WARNING: Windows sleep helper launch failed", stderr.getvalue()
+        )
+        self.assertEqual(
+            [state["stores"][store]["status"] for store in automation.STORE_ORDER],
+            ["SUCCESS", "SUCCESS", "SUCCESS"],
+        )
 
     def test_operation_date_is_fixed_and_expected_is_previous_day(self):
         current = datetime(2026, 9, 2, 8, 0, tzinfo=JST)
