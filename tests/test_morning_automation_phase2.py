@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -175,6 +178,121 @@ def write_yasuda_daily(root: Path, operation: date) -> Path:
 
 
 class Phase2SupportTests(unittest.TestCase):
+    def _state_with_statuses(self, statuses: list[str]) -> dict:
+        current = datetime(2026, 9, 3, 8, 0, tzinfo=JST)
+        state = automation.create_state(date(2026, 9, 3), "test_run", current)
+        for store, status in zip(automation.STORE_ORDER, statuses):
+            state["stores"][store]["status"] = status
+        return state
+
+    def test_sleep_option_disabled_does_not_request_sleep(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        calls = []
+
+        result = automation.maybe_sleep_on_success(
+            False, state, 0, lambda: calls.append(True)
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
+
+    def test_sleep_cli_option_defaults_off_and_can_be_enabled(self):
+        with patch.object(sys, "argv", ["automation"]):
+            self.assertFalse(automation.parse_args().sleep_on_success)
+        with patch.object(sys, "argv", ["automation", "--sleep-on-success"]):
+            self.assertTrue(automation.parse_args().sleep_on_success)
+
+    def test_sleep_option_all_success_requests_sleep_once(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        calls = []
+
+        result = automation.maybe_sleep_on_success(
+            True, state, 0, lambda: calls.append(True)
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(calls, [True])
+
+    def test_sleep_option_accepts_success_and_already_complete(self):
+        state = self._state_with_statuses(
+            ["SUCCESS", "ALREADY_COMPLETE", "SUCCESS"]
+        )
+        calls = []
+
+        result = automation.maybe_sleep_on_success(
+            True, state, 0, lambda: calls.append(True)
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(calls, [True])
+
+    def test_sleep_option_failed_final_does_not_request_sleep(self):
+        state = self._state_with_statuses(["SUCCESS", "FAILED_FINAL", "SUCCESS"])
+        calls = []
+
+        result = automation.maybe_sleep_on_success(
+            True, state, 1, lambda: calls.append(True)
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
+
+    def test_sleep_option_manual_review_does_not_request_sleep(self):
+        state = self._state_with_statuses(
+            ["SUCCESS", "NEEDS_MANUAL_REVIEW", "SUCCESS"]
+        )
+        calls = []
+
+        result = automation.maybe_sleep_on_success(
+            True, state, 1, lambda: calls.append(True)
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
+
+    def test_sleep_option_nonzero_wrapper_return_does_not_request_sleep(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        calls = []
+
+        result = automation.maybe_sleep_on_success(
+            True, state, 1, lambda: calls.append(True)
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
+
+    def test_sleep_request_failure_preserves_success_and_returncode(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        original_statuses = [
+            state["stores"][store]["status"] for store in automation.STORE_ORDER
+        ]
+
+        def fail_sleep():
+            raise OSError("mock sleep failure")
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            result = automation.maybe_sleep_on_success(True, state, 0, fail_sleep)
+
+        self.assertFalse(result)
+        self.assertIn("WARNING: Windows sleep request failed", stderr.getvalue())
+        self.assertEqual(
+            [state["stores"][store]["status"] for store in automation.STORE_ORDER],
+            original_statuses,
+        )
+        self.assertTrue(automation.should_sleep_on_success(True, state, 0))
+
+    def test_windows_sleep_requests_non_hibernate_without_force(self):
+        calls = []
+
+        def set_suspend_state(hibernate, force_critical, disable_wake_event):
+            calls.append((hibernate, force_critical, disable_wake_event))
+            return True
+
+        automation.request_windows_sleep(set_suspend_state)
+
+        self.assertEqual(calls, [(False, False, False)])
+
     def test_operation_date_is_fixed_and_expected_is_previous_day(self):
         current = datetime(2026, 9, 2, 8, 0, tzinfo=JST)
         operation, expected = determine_operation_dates(current)

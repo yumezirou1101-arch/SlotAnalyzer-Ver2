@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 import time
 import uuid
+from ctypes import wintypes
 from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 
@@ -97,6 +99,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_CHROME_WAIT_SEC,
         help="Seconds to wait for common Chrome/CDP preflight. Default: 15.",
+    )
+    parser.add_argument(
+        "--sleep-on-success",
+        action="store_true",
+        help="Request normal Windows sleep after all stores complete successfully.",
     )
     args = parser.parse_args()
     if args.retry_interval_sec < 1:
@@ -537,6 +544,74 @@ def print_summary(state: dict) -> None:
             print(f"  {item.get('error_category')}: {item['error']}")
 
 
+def should_sleep_on_success(
+    enabled: bool,
+    state: dict,
+    wrapper_returncode: int,
+) -> bool:
+    try:
+        required_store_states = [state["stores"][store] for store in STORE_ORDER]
+    except (KeyError, TypeError):
+        return False
+    return (
+        enabled
+        and wrapper_returncode == 0
+        and all_terminal(state)
+        and all(
+            item["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
+            for item in required_store_states
+        )
+    )
+
+
+def request_windows_sleep(set_suspend_state=None) -> None:
+    if set_suspend_state is None:
+        if os.name != "nt":
+            raise OSError("Windows sleep is only available on Windows.")
+        powrprof = ctypes.WinDLL("PowrProf.dll", use_last_error=True)
+        set_suspend_state = powrprof.SetSuspendState
+        set_suspend_state.argtypes = [
+            wintypes.BOOLEAN,
+            wintypes.BOOLEAN,
+            wintypes.BOOLEAN,
+        ]
+        set_suspend_state.restype = wintypes.BOOLEAN
+
+    # SetSuspendState(Hibernate, ForceCritical, DisableWakeEvent).
+    # False, False, False requests normal sleep (not hibernation), does not
+    # force a critical suspend, and leaves wake events enabled.
+    if not set_suspend_state(False, False, False):
+        error_code = ctypes.get_last_error()
+        detail = f" (Windows error {error_code})" if error_code else ""
+        raise OSError(f"SetSuspendState returned FALSE{detail}.")
+
+
+def maybe_sleep_on_success(
+    enabled: bool,
+    state: dict,
+    wrapper_returncode: int,
+    sleep_request=None,
+) -> bool:
+    if not should_sleep_on_success(enabled, state, wrapper_returncode):
+        return False
+
+    print("All stores completed successfully. Requesting normal Windows sleep...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        if sleep_request is None:
+            sleep_request = request_windows_sleep
+        sleep_request()
+    except Exception as exc:
+        print(
+            f"WARNING: Windows sleep request failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
+
+
 def main() -> int:
     args = parse_args()
     started = now_jst()
@@ -545,7 +620,7 @@ def main() -> int:
     print("SlotAnalyzer Phase 2 morning automation")
     print(f"operation date        : {operation_date}")
     print(f"expected data date    : {expected_data_date}")
-    print("Maruhan last start    : 08:30 JST (PROVISIONAL / 暫定)")
+    print("Maruhan last start    : 08:30 JST (PROVISIONAL)")
     print("Maruhan formal cutoff : 09:00 JST (existing Forward Guard)")
     print("other store deadline  : 09:30 JST")
     try:
@@ -605,11 +680,20 @@ def main() -> int:
                     sleep_sec = max(1, min(sleep_sec, int((min(future_retries) - current).total_seconds())))
                 print(f"Waiting {sleep_sec} seconds before the next readiness pass...")
                 time.sleep(sleep_sec)
+            save_state(state_path, state, now_jst())
             print_summary(state)
-            return 0 if all(
+            wrapper_returncode = 0 if all(
                 item["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
                 for item in state["stores"].values()
             ) else 1
+            sys.stdout.flush()
+            sys.stderr.flush()
+            maybe_sleep_on_success(
+                args.sleep_on_success,
+                state,
+                wrapper_returncode,
+            )
+            return wrapper_returncode
     except LockUnavailableError as exc:
         print(f"ALREADY RUNNING: {exc}")
         return 0
