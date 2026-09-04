@@ -41,6 +41,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     run_logged_subprocess,
     verify_store_completion,
 )
+from slotanalyzer_morning_notification import send_notification_best_effort  # noqa: E402
 
 
 LOG_ROOT = PROJECT_ROOT / "logs" / "morning_automation"
@@ -646,6 +647,7 @@ def finalize_automation_run(
     summary_function=None,
     flush_function=None,
     helper_launcher=None,
+    notification_function=None,
     clock=None,
 ) -> int:
     if save_function is None:
@@ -656,6 +658,8 @@ def finalize_automation_run(
         flush_function = flush_output_streams
     if clock is None:
         clock = now_jst
+    if notification_function is None:
+        notification_function = send_notification_best_effort
 
     save_function(state_path, state, clock())
     summary_function(state)
@@ -663,6 +667,14 @@ def finalize_automation_run(
         item["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
         for item in state["stores"].values()
     ) else 1
+    flush_function()
+    try:
+        notification_function(state, PROJECT_ROOT)
+    except Exception as exc:
+        print(
+            f"WARNING: Gmail notification failed unexpectedly: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     flush_function()
     maybe_sleep_on_success(
         sleep_enabled,

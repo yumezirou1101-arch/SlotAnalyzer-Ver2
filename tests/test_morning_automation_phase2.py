@@ -367,6 +367,9 @@ class Phase2SupportTests(unittest.TestCase):
             events.append("launch")
             return 4321
 
+        def notification_function(value, root):
+            events.append("notify")
+
         returncode = automation.finalize_automation_run(
             Path("unused.json"),
             state,
@@ -375,11 +378,12 @@ class Phase2SupportTests(unittest.TestCase):
             summary_function=summary_function,
             flush_function=flush_function,
             helper_launcher=helper_launcher,
+            notification_function=notification_function,
             clock=lambda: datetime(2026, 9, 3, 8, 1, tzinfo=JST),
         )
 
         self.assertEqual(returncode, 0)
-        self.assertEqual(events, ["save", "summary", "flush", "launch"])
+        self.assertEqual(events, ["save", "summary", "flush", "notify", "flush", "launch"])
 
     def test_finalization_keeps_zero_when_helper_launch_fails(self):
         state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
@@ -397,6 +401,7 @@ class Phase2SupportTests(unittest.TestCase):
                 summary_function=lambda value: None,
                 flush_function=lambda: None,
                 helper_launcher=fail_launch,
+                notification_function=lambda value, root: None,
                 clock=lambda: datetime(2026, 9, 3, 8, 1, tzinfo=JST),
             )
 
