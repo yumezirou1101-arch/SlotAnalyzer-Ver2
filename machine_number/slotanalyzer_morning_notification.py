@@ -81,6 +81,19 @@ class StoreSection:
     detail_lines: list[str]
 
 
+@dataclass(frozen=True)
+class YesterdayNormalEvaluation:
+    target_date: date
+    status: str
+    message: str
+    detail_rows: list[dict[str, str]]
+    summary_rows: list[dict[str, str]]
+
+    @property
+    def formal(self) -> bool:
+        return self.status == "EVALUATED_FORWARD_VALID"
+
+
 class CredentialReadError(RuntimeError):
     pass
 
@@ -231,7 +244,7 @@ def _ranking_table_html(block: RankingBlock, limit: int = 10) -> str:
     return "".join(parts)
 
 
-def _render_section_plain(section: StoreSection) -> str:
+def _render_section_plain(section: StoreSection, *, include_details: bool = True) -> str:
     lines = [section.heading, *section.summary_lines]
     for block in section.rankings:
         lines.append(f"{block.label}:")
@@ -240,22 +253,275 @@ def _render_section_plain(section: StoreSection) -> str:
             if block.rows
             else [f"  {block.unavailable_message}"]
         )
-    if section.detail_lines:
+    if include_details and section.detail_lines:
         lines.extend(["詳細情報:", *section.detail_lines])
     return "\n".join(lines)
 
 
-def _render_section_html(section: StoreSection) -> str:
+def _render_section_html(section: StoreSection, *, include_details: bool = True) -> str:
     summary = "".join(f"<div>{html.escape(line)}</div>" for line in section.summary_lines)
     rankings = "".join(_ranking_table_html(block) for block in section.rankings)
     details = ""
-    if section.detail_lines:
+    if include_details and section.detail_lines:
         detail_rows = "".join(f"<div>{html.escape(line)}</div>" for line in section.detail_lines)
         details = f'<h4 style="margin:18px 0 4px">詳細情報</h4>{detail_rows}'
     return (
         '<section style="margin:18px 0">'
         f'<h3 style="margin:0 0 6px">{html.escape(section.heading)}</h3>'
         f'{summary}{rankings}{details}</section>'
+    )
+
+
+def _exact_date_rows(rows: list[dict[str, str]], target_date: date) -> list[dict[str, str]]:
+    expected = target_date.isoformat()
+    return [row for row in rows if row.get("target_date", row.get("date", "")) == expected]
+
+
+def _inventory_blocks_missing_prediction(state: dict) -> bool:
+    guard = _store_state(state, STORE_MARUHAN).get("inventory_guard") or {}
+    return bool(guard.get("blocked"))
+
+
+def _load_yesterday_normal_evaluation(
+    state: dict,
+    root: Path,
+    operation_date: date,
+) -> YesterdayNormalEvaluation:
+    target_date = operation_date - timedelta(days=1)
+    base = (
+        root
+        / "data/maruhan_maebashi/machine_number/analysis_31days_deep"
+        / "69_Ver4_2_live_prediction_backtest"
+    )
+    try:
+        status_rows = _exact_date_rows(
+            _read_rows(base / "69_live_prediction_status.csv"), target_date
+        )
+        coverage_rows = _exact_date_rows(
+            _read_rows(base / "69_forward_coverage.csv"), target_date
+        )
+        coverage = coverage_rows[0] if len(coverage_rows) == 1 else {}
+        status = status_rows[0] if len(status_rows) == 1 else {}
+        coverage_status = coverage.get("evaluation_status", "")
+
+        if not status:
+            if coverage_status == "MISSING_FROZEN_PREDICTION":
+                message = "正式な凍結予測がないため未評価（MISSING_FROZEN_PREDICTION）"
+            elif _inventory_blocks_missing_prediction(state):
+                message = "Inventory Guardにより正式予測なし"
+            else:
+                message = "昨日の正式評価データがないため答え合わせ未評価"
+            return YesterdayNormalEvaluation(target_date, "NOT_EVALUATED", message, [], [])
+
+        evaluation_status = status.get("status", "")
+        prediction_class = status.get("prediction_class", "")
+        if evaluation_status in {"PENDING_FORWARD_VALID", "SKIPPED_ACTUAL_QUALITY_FAIL"}:
+            return YesterdayNormalEvaluation(
+                target_date, evaluation_status,
+                "昨日実績未取得のため答え合わせ未評価", [], [],
+            )
+        if prediction_class == "LEGACY_UNVERIFIED" or "LEGACY_UNVERIFIED" in evaluation_status:
+            return YesterdayNormalEvaluation(
+                target_date, evaluation_status,
+                "Legacy predictionのため正式成績対象外", [], [],
+            )
+        if prediction_class == "FORWARD_GUARD_FAIL" or evaluation_status == "SKIPPED_FORWARD_GUARD_FAIL":
+            return YesterdayNormalEvaluation(
+                target_date, evaluation_status,
+                "Forward Guard不成立のため正式成績対象外", [], [],
+            )
+        if coverage_status == "MISSING_FROZEN_PREDICTION":
+            return YesterdayNormalEvaluation(
+                target_date, coverage_status,
+                "正式な凍結予測がないため未評価（MISSING_FROZEN_PREDICTION）", [], [],
+            )
+        if evaluation_status != "EVALUATED_FORWARD_VALID" or prediction_class != "FORWARD_VALID":
+            return YesterdayNormalEvaluation(
+                target_date, evaluation_status or "NOT_EVALUATED",
+                "昨日の正式予測結果は未評価", [], [],
+            )
+
+        if (
+            len(coverage_rows) != 1
+            or coverage.get("evaluation_status") != "EVALUATED_FORWARD_VALID"
+            or coverage.get("prediction_class") != "FORWARD_VALID"
+            or coverage.get("actual_exists", "").lower() != "true"
+            or coverage.get("prediction_exists", "").lower() != "true"
+        ):
+            raise ValueError("D-1 forward coverage is not formally evaluated")
+        actual_name = Path(status.get("actual_path", "")).name
+        if actual_name != f"ana_slo_{target_date:%Y%m%d}.csv":
+            raise ValueError("D-1 actual path does not match the evaluation target")
+
+        detail_rows = _exact_date_rows(
+            _read_rows(base / "69_forward_valid_detail.csv"), target_date
+        )
+        daily_rows = _exact_date_rows(
+            _read_rows(base / "69_forward_valid_daily.csv"), target_date
+        )
+        prediction_sha = status.get("prediction_sha256", "").lower()
+        detail_shas = {row.get("prediction_sha256", "").lower() for row in detail_rows}
+        ranks = {int(row.get("prediction_rank", "0")) for row in detail_rows}
+        if (
+            len(detail_rows) != 10
+            or ranks != set(range(1, 11))
+            or not prediction_sha
+            or detail_shas != {prediction_sha}
+            or any(row.get("prediction_class") != "FORWARD_VALID" for row in detail_rows)
+        ):
+            raise ValueError("D-1 detail rows or prediction SHA-256 are inconsistent")
+        for row in detail_rows:
+            if row.get("actual_win") not in {"0", "1"}:
+                raise ValueError("D-1 detail actual_win is invalid")
+            float(row["actual_diff"])
+            if row.get("score", ""):
+                float(row["score"])
+
+        required_bands = {"TOP3", "TOP5", "TOP10"}
+        summary_rows = [row for row in daily_rows if row.get("band") in required_bands]
+        if (
+            len(summary_rows) != 3
+            or {row.get("band") for row in summary_rows} != required_bands
+            or any(row.get("prediction_class") != "FORWARD_VALID" for row in summary_rows)
+        ):
+            raise ValueError("D-1 Top3/5/10 summary rows are incomplete")
+        for row in summary_rows:
+            int(row["selected_n"])
+            for key in ("avg_diff", "win_rate", "plus1000_rate", "plus2000_rate"):
+                float(row[key])
+
+        detail_rows.sort(key=lambda row: int(row["prediction_rank"]))
+        band_order = {"TOP3": 3, "TOP5": 5, "TOP10": 10}
+        summary_rows.sort(key=lambda row: band_order[row["band"]])
+        return YesterdayNormalEvaluation(
+            target_date, evaluation_status, "", detail_rows, summary_rows
+        )
+    except Exception as exc:
+        return YesterdayNormalEvaluation(
+            target_date, "RESULT_READ_ERROR",
+            f"昨日結果取得エラー（{type(exc).__name__}）", [], [],
+        )
+
+
+def _signed_medals(value: str) -> str:
+    number = float(value)
+    return f"+{number:,.0f}" if number > 0 else f"{number:,.0f}"
+
+
+def _rate(value: str) -> str:
+    return f"{float(value):.1f}%"
+
+
+def _render_yesterday_plain(result: YesterdayNormalEvaluation) -> str:
+    lines = [f"【昨日の予測結果 {result.target_date.isoformat()}】", "NORMAL"]
+    if not result.formal:
+        lines.extend([result.status, result.message])
+        return "\n".join(lines)
+    lines.append("EVALUATED_FORWARD_VALID")
+    for row in result.detail_rows:
+        outcome = "WIN" if row.get("actual_win") == "1" else "LOSE"
+        score = row.get("score", "")
+        score_text = f" Score {float(score):.2f}" if score else ""
+        lines.append(
+            f"{int(row['prediction_rank'])}. {row['machine_no']}番台　{row['machine_name']}"
+            f"　{_signed_medals(row['actual_diff'])}枚　{outcome}{score_text}"
+        )
+    lines.append("集計（69計算済み）:")
+    for row in result.summary_rows:
+        lines.append(
+            f"{row['band']}　平均 {_signed_medals(row['avg_diff'])}枚　"
+            f"勝率 {_rate(row['win_rate'])}　+1000 {_rate(row['plus1000_rate'])}　"
+            f"+2000 {_rate(row['plus2000_rate'])}　{row['selected_n']}台"
+        )
+    return "\n".join(lines)
+
+
+def _render_yesterday_html(result: YesterdayNormalEvaluation) -> str:
+    heading = html.escape(f"【昨日の予測結果 {result.target_date.isoformat()}】")
+    if not result.formal:
+        return (
+            '<section style="margin:20px 0">'
+            f'<h3 style="margin:0 0 6px">{heading}</h3><div>NORMAL</div>'
+            f'<div style="font-weight:bold">{html.escape(result.status)}</div>'
+            f'<div style="margin-top:5px;color:#a33">{html.escape(result.message)}</div></section>'
+        )
+    header_style = "padding:7px 3px;border-bottom:2px solid #777;font-size:11px;color:#444;white-space:nowrap"
+    cell_style = "padding:7px 3px;border-bottom:1px solid #ddd;vertical-align:top;font-size:13px"
+    parts = [
+        '<section style="margin:20px 0">',
+        f'<h3 style="margin:0 0 6px">{heading}</h3>',
+        '<div>NORMAL</div><div style="font-weight:bold;color:#176b32">EVALUATED_FORWARD_VALID</div>',
+        '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse;margin-top:6px">',
+        '<thead><tr>',
+        f'<th width="8%" style="{header_style};text-align:center">No.</th>',
+        f'<th width="14%" style="{header_style};text-align:center">台</th>',
+        f'<th width="43%" style="{header_style};text-align:left">機種</th>',
+        f'<th width="22%" style="{header_style};text-align:right">実差枚</th>',
+        f'<th width="13%" style="{header_style};text-align:center">結果</th>',
+        '</tr></thead><tbody>',
+    ]
+    for row in result.detail_rows:
+        outcome = "WIN" if row.get("actual_win") == "1" else "LOSE"
+        color = "#176b32" if outcome == "WIN" else "#a33"
+        score = row.get("score", "")
+        score_html = (
+            f'<div style="font-size:11px;color:#666">Score {float(score):.2f}</div>'
+            if score else ""
+        )
+        parts.extend([
+            '<tr>',
+            f'<td style="{cell_style};text-align:center;white-space:nowrap">{int(row["prediction_rank"])}</td>',
+            f'<td style="{cell_style};text-align:center;white-space:nowrap">{html.escape(row["machine_no"])}</td>',
+            f'<td style="{cell_style};text-align:left;overflow-wrap:anywhere;word-break:break-word">{html.escape(row["machine_name"])}{score_html}</td>',
+            f'<td style="{cell_style};text-align:right;white-space:nowrap">{html.escape(_signed_medals(row["actual_diff"]))}</td>',
+            f'<td style="{cell_style};text-align:center;font-weight:bold;color:{color}">{outcome}</td>',
+            '</tr>',
+        ])
+    parts.extend([
+        '</tbody></table>', '<h4 style="margin:16px 0 4px">集計（69計算済み）</h4>',
+        '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse">',
+        '<thead><tr>',
+        f'<th width="14%" style="{header_style}">範囲</th>',
+        f'<th width="24%" style="{header_style};text-align:right">平均差枚</th>',
+        f'<th width="17%" style="{header_style};text-align:right">勝率</th>',
+        f'<th width="17%" style="{header_style};text-align:right">+1k</th>',
+        f'<th width="17%" style="{header_style};text-align:right">+2k</th>',
+        f'<th width="11%" style="{header_style};text-align:right">台数</th>',
+        '</tr></thead><tbody>',
+    ])
+    for row in result.summary_rows:
+        parts.extend([
+            '<tr>',
+            f'<td style="{cell_style}">{html.escape(row["band"])}</td>',
+            f'<td style="{cell_style};text-align:right;white-space:nowrap">{html.escape(_signed_medals(row["avg_diff"]))}</td>',
+            f'<td style="{cell_style};text-align:right">{html.escape(_rate(row["win_rate"]))}</td>',
+            f'<td style="{cell_style};text-align:right">{html.escape(_rate(row["plus1000_rate"]))}</td>',
+            f'<td style="{cell_style};text-align:right">{html.escape(_rate(row["plus2000_rate"]))}</td>',
+            f'<td style="{cell_style};text-align:right">{html.escape(row["selected_n"])}</td>',
+            '</tr>',
+        ])
+    parts.extend(['</tbody></table>', '</section>'])
+    return "".join(parts)
+
+
+def _render_details_plain(sections: list[StoreSection]) -> str:
+    lines = ["【詳細情報】"]
+    for section in sections:
+        if section.detail_lines:
+            lines.extend([section.heading, *section.detail_lines])
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _render_details_html(sections: list[StoreSection]) -> str:
+    blocks = []
+    for section in sections:
+        if section.detail_lines:
+            rows = "".join(f"<div>{html.escape(line)}</div>" for line in section.detail_lines)
+            blocks.append(f'<h4 style="margin:12px 0 4px">{html.escape(section.heading)}</h4>{rows}')
+    return (
+        '<section style="margin:20px 0"><h3 style="margin:0 0 6px">【詳細情報】</h3>'
+        + "".join(blocks) + "</section>"
+        if blocks else ""
     )
 
 
@@ -436,11 +702,20 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
         status = str(item.get("status", ""))
         if status not in {"SUCCESS", "ALREADY_COMPLETE"}:
             warnings.append(f"{store}: {status} {item.get('error_category', '')} {item.get('error', '')}".strip())
+    yesterday = _load_yesterday_normal_evaluation(
+        state, project_root, operation_date
+    )
     warning_text = "\n".join(f"⚠ {value}" for value in dict.fromkeys(warnings)) or "異常警告: なし"
+    today_plain = "\n\n".join(
+        _render_section_plain(section, include_details=False) for section in sections
+    )
+    detail_plain = _render_details_plain(sections)
     plain = (
         f"SlotAnalyzer 朝結果\n日付: {operation_date.isoformat()}\n"
         f"overall status: {overall}\n" + "\n".join(summaries) + "\n\n" + warning_text
-        + "\n\n" + "\n\n".join(_render_section_plain(section) for section in sections)
+        + "\n\n" + today_plain
+        + "\n\n" + _render_yesterday_plain(yesterday)
+        + (("\n\n" + detail_plain) if detail_plain else "")
     )
     summary_html = "".join(f"<div>{html.escape(value)}</div>" for value in summaries)
     if warnings:
@@ -450,7 +725,11 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
         )
     else:
         warnings_html = "<div>異常警告: なし</div>"
-    sections_html = "".join(_render_section_html(section) for section in sections)
+    sections_html = "".join(
+        _render_section_html(section, include_details=False) for section in sections
+    )
+    yesterday_html = _render_yesterday_html(yesterday)
+    details_html = _render_details_html(sections)
     html_body = (
         '<html><body style="margin:0;padding:12px;font-family:sans-serif;line-height:1.45;color:#222">'
         f'<h2 style="margin:0 0 8px">SlotAnalyzer 朝結果</h2>'
@@ -459,6 +738,8 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
         f'{summary_html}'
         f'<div style="margin:12px 0;padding:9px;background:#fff4e5;border-left:4px solid #e67e22">{warnings_html}</div>'
         f'{sections_html}'
+        f'{yesterday_html}'
+        f'{details_html}'
         "</body></html>"
     )
     return NotificationMessage(

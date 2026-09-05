@@ -38,6 +38,58 @@ def state_with(statuses):
     }
 
 
+def write_csv_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_formal_69_fixture(root: Path, target: date, *, sha: str = "frozen-sha") -> None:
+    base = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/69_Ver4_2_live_prediction_backtest"
+    iso = target.isoformat()
+    write_csv_rows(base / "69_live_prediction_status.csv", [{
+        "target_date": iso,
+        "status": "EVALUATED_FORWARD_VALID",
+        "prediction_class": "FORWARD_VALID",
+        "actual_path": str(root / f"data/maruhan_maebashi/machine_number/ana_slo_{target:%Y%m%d}.csv"),
+        "prediction_sha256": sha,
+    }])
+    write_csv_rows(base / "69_forward_coverage.csv", [{
+        "date": iso,
+        "actual_exists": "True",
+        "prediction_exists": "True",
+        "prediction_class": "FORWARD_VALID",
+        "evaluation_status": "EVALUATED_FORWARD_VALID",
+    }])
+    write_csv_rows(base / "69_forward_valid_detail.csv", [{
+        "target_date": iso,
+        "prediction_rank": rank,
+        "machine_no": 700 + rank,
+        "machine_name": f"NORMAL-{rank}",
+        "score": 80 - rank / 10,
+        "actual_diff": 2300 if rank == 1 else -1100,
+        "actual_win": 1 if rank == 1 else 0,
+        "prediction_sha256": sha,
+        "prediction_class": "FORWARD_VALID",
+    } for rank in range(1, 11)])
+    write_csv_rows(base / "69_forward_valid_daily.csv", [{
+        "target_date": iso,
+        "band": band,
+        "selected_n": selected,
+        "avg_diff": average,
+        "win_rate": rate,
+        "plus1000_rate": rate,
+        "plus2000_rate": rate,
+        "prediction_class": "FORWARD_VALID",
+    } for band, selected, average, rate in (
+        ("TOP3", 3, 200, 33.3333),
+        ("TOP5", 5, -340, 20),
+        ("TOP10", 10, -680, 10),
+    )])
+
+
 class FakeSMTP:
     calls = []
 
@@ -90,6 +142,144 @@ class MorningNotificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             message = notification.build_notification_message(state_with(["NEEDS_MANUAL_REVIEW"] * 3), Path(directory))
         self.assertIn("MANUAL_REVIEW", message.plain)
+
+    def test_yesterday_formal_normal_shows_top10_and_69_summaries(self):
+        state = state_with(["SUCCESS"] * 3)
+        state["operation_date"] = "2026-09-06"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_formal_69_fixture(root, date(2026, 9, 5))
+            message = notification.build_notification_message(state, root)
+        self.assertIn("【昨日の予測結果 2026-09-05】", message.plain)
+        self.assertIn("EVALUATED_FORWARD_VALID", message.plain)
+        self.assertEqual(message.plain.count("番台　NORMAL-"), 10)
+        self.assertIn("+2,300枚　WIN", message.plain)
+        self.assertIn("-1,100枚　LOSE", message.plain)
+        self.assertIn("TOP3　平均 +200枚　勝率 33.3%", message.plain)
+        self.assertIn("TOP5　平均 -340枚　勝率 20.0%", message.plain)
+        self.assertIn("TOP10　平均 -680枚　勝率 10.0%", message.plain)
+        self.assertIn(">実差枚</th>", message.html)
+        self.assertNotIn("overflow-x", message.html)
+        self.assertLess(message.plain.index("NORMAL Top10"), message.plain.index("【昨日の予測結果"))
+        self.assertLess(message.plain.index("【昨日の予測結果"), message.plain.index("【詳細情報】"))
+
+    def test_yesterday_does_not_fallback_to_older_69_result(self):
+        state = state_with(["SUCCESS"] * 3)
+        state["operation_date"] = "2026-09-06"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_formal_69_fixture(root, date(2026, 9, 4))
+            message = notification.build_notification_message(state, root)
+        self.assertIn("【昨日の予測結果 2026-09-05】", message.plain)
+        self.assertIn("昨日の正式評価データがないため答え合わせ未評価", message.plain)
+        self.assertNotIn("NORMAL-1", message.plain)
+
+    def test_yesterday_legacy_and_forward_guard_fail_are_not_formal(self):
+        cases = [
+            ("EVALUATED_LEGACY_UNVERIFIED", "LEGACY_UNVERIFIED", "Legacy prediction"),
+            ("SKIPPED_FORWARD_GUARD_FAIL", "FORWARD_GUARD_FAIL", "Forward Guard不成立"),
+        ]
+        for status, prediction_class, expected in cases:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                base = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/69_Ver4_2_live_prediction_backtest"
+                write_csv_rows(base / "69_live_prediction_status.csv", [{
+                    "target_date": "2026-09-05",
+                    "status": status,
+                    "prediction_class": prediction_class,
+                }])
+                result = notification._load_yesterday_normal_evaluation(
+                    state_with(["SUCCESS"] * 3), root, date(2026, 9, 6)
+                )
+            self.assertFalse(result.formal)
+            self.assertIn(expected, result.message)
+
+    def test_yesterday_missing_frozen_prediction_is_not_evaluated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/69_Ver4_2_live_prediction_backtest"
+            write_csv_rows(base / "69_forward_coverage.csv", [{
+                "date": "2026-09-05",
+                "actual_exists": "True",
+                "prediction_exists": "False",
+                "prediction_class": "MISSING",
+                "evaluation_status": "MISSING_FROZEN_PREDICTION",
+            }])
+            result = notification._load_yesterday_normal_evaluation(
+                state_with(["SUCCESS"] * 3), root, date(2026, 9, 6)
+            )
+        self.assertFalse(result.formal)
+        self.assertIn("MISSING_FROZEN_PREDICTION", result.message)
+
+    def test_yesterday_pending_actual_is_not_evaluated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/69_Ver4_2_live_prediction_backtest"
+            write_csv_rows(base / "69_live_prediction_status.csv", [{
+                "target_date": "2026-09-05",
+                "status": "PENDING_FORWARD_VALID",
+                "prediction_class": "FORWARD_VALID",
+            }])
+            result = notification._load_yesterday_normal_evaluation(
+                state_with(["SUCCESS"] * 3), root, date(2026, 9, 6)
+            )
+        self.assertIn("昨日実績未取得", result.message)
+
+    def test_yesterday_inventory_block_only_explains_missing_prediction(self):
+        state = state_with(["NEEDS_MANUAL_REVIEW", "SUCCESS", "SUCCESS"])
+        state["stores"][automation.STORE_MARUHAN]["inventory_guard"] = {"blocked": True}
+        with tempfile.TemporaryDirectory() as directory:
+            result = notification._load_yesterday_normal_evaluation(
+                state, Path(directory), date(2026, 9, 6)
+            )
+        self.assertFalse(result.formal)
+        self.assertEqual(result.message, "Inventory Guardにより正式予測なし")
+
+    def test_yesterday_existing_formal_result_wins_over_current_inventory_block(self):
+        state = state_with(["NEEDS_MANUAL_REVIEW", "SUCCESS", "SUCCESS"])
+        state["stores"][automation.STORE_MARUHAN]["inventory_guard"] = {"blocked": True}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_formal_69_fixture(root, date(2026, 9, 5))
+            result = notification._load_yesterday_normal_evaluation(
+                state, root, date(2026, 9, 6)
+            )
+        self.assertTrue(result.formal)
+
+    def test_yesterday_prediction_sha_mismatch_is_read_error_not_formal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_formal_69_fixture(root, date(2026, 9, 5))
+            detail = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/69_Ver4_2_live_prediction_backtest/69_forward_valid_detail.csv"
+            rows = notification._read_rows(detail)
+            rows[0]["prediction_sha256"] = "different"
+            write_csv_rows(detail, rows)
+            result = notification._load_yesterday_normal_evaluation(
+                state_with(["SUCCESS"] * 3), root, date(2026, 9, 6)
+            )
+        self.assertFalse(result.formal)
+        self.assertEqual(result.status, "RESULT_READ_ERROR")
+
+    def test_yesterday_read_error_does_not_change_status_or_today_content(self):
+        state = state_with(["SUCCESS"] * 3)
+        state["operation_date"] = "2026-09-06"
+        original_statuses = [item["status"] for item in state["stores"].values()]
+        original_reader = notification._read_rows
+
+        def fail_69_only(path):
+            if "69_Ver4_2_live_prediction_backtest" in str(path):
+                raise PermissionError("fixture")
+            return original_reader(path)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(notification, "_read_rows", side_effect=fail_69_only):
+            message = notification.build_notification_message(state, Path(directory))
+        self.assertIn("昨日結果取得エラー", message.plain)
+        self.assertIn("NORMAL Top10", message.plain)
+        self.assertEqual(
+            [item["status"] for item in state["stores"].values()], original_statuses
+        )
+        self.assertEqual(message.overall_status, "SUCCESS")
 
     def test_plain_ranking_mobile_format_and_safe_scores(self):
         rows = [
