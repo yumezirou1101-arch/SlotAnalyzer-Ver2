@@ -445,62 +445,46 @@ def _render_yesterday_html(result: YesterdayNormalEvaluation) -> str:
             f'<div style="font-weight:bold">{html.escape(result.status)}</div>'
             f'<div style="margin-top:5px;color:#a33">{html.escape(result.message)}</div></section>'
         )
-    header_style = "padding:7px 3px;border-bottom:2px solid #777;font-size:11px;color:#444;white-space:nowrap"
-    cell_style = "padding:7px 3px;border-bottom:1px solid #ddd;vertical-align:top;font-size:13px"
+    cell_style = "padding:7px 4px;vertical-align:top;font-size:13px"
     parts = [
         '<section style="margin:20px 0">',
         f'<h3 style="margin:0 0 6px">{heading}</h3>',
         '<div>NORMAL</div><div style="font-weight:bold;color:#176b32">EVALUATED_FORWARD_VALID</div>',
-        '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse;margin-top:6px">',
-        '<thead><tr>',
-        f'<th width="8%" style="{header_style};text-align:center">No.</th>',
-        f'<th width="14%" style="{header_style};text-align:center">台</th>',
-        f'<th width="43%" style="{header_style};text-align:left">機種</th>',
-        f'<th width="22%" style="{header_style};text-align:right">実差枚</th>',
-        f'<th width="13%" style="{header_style};text-align:center">結果</th>',
-        '</tr></thead><tbody>',
     ]
     for row in result.detail_rows:
         outcome = "WIN" if row.get("actual_win") == "1" else "LOSE"
         color = "#176b32" if outcome == "WIN" else "#a33"
         score = row.get("score", "")
-        score_html = (
-            f'<div style="font-size:11px;color:#666">Score {float(score):.2f}</div>'
-            if score else ""
-        )
+        score_text = f"Score {float(score):.2f}" if score else ""
         parts.extend([
+            '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;'
+            'border-collapse:collapse;margin-top:7px;border-bottom:1px solid #ddd">',
             '<tr>',
-            f'<td style="{cell_style};text-align:center;white-space:nowrap">{int(row["prediction_rank"])}</td>',
-            f'<td style="{cell_style};text-align:center;white-space:nowrap">{html.escape(row["machine_no"])}</td>',
-            f'<td style="{cell_style};text-align:left;overflow-wrap:anywhere;word-break:break-word">{html.escape(row["machine_name"])}{score_html}</td>',
-            f'<td style="{cell_style};text-align:right;white-space:nowrap">{html.escape(_signed_medals(row["actual_diff"]))}</td>',
-            f'<td style="{cell_style};text-align:center;font-weight:bold;color:{color}">{outcome}</td>',
-            '</tr>',
+            f'<td width="9%" style="{cell_style};text-align:center;font-weight:bold;white-space:nowrap">{int(row["prediction_rank"])}</td>',
+            f'<td width="18%" style="{cell_style};text-align:center;white-space:nowrap">{html.escape(row["machine_no"])}</td>',
+            f'<td width="73%" style="{cell_style};text-align:left;overflow-wrap:anywhere;word-break:break-word">{html.escape(row["machine_name"])}</td>',
+            '</tr><tr>',
+            f'<td colspan="3" style="padding:0 4px 8px">'
+            '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse"><tr>'
+            f'<td width="34%" style="font-size:13px;text-align:right;white-space:nowrap">{html.escape(_signed_medals(row["actual_diff"]))}</td>'
+            f'<td width="24%" style="font-size:13px;text-align:center;font-weight:bold;color:{color};white-space:nowrap">{outcome}</td>'
+            f'<td width="42%" style="font-size:12px;text-align:left;color:#666;white-space:nowrap">{html.escape(score_text)}</td>'
+            '</tr></table></td>',
+            '</tr></table>',
         ])
     parts.extend([
-        '</tbody></table>', '<h4 style="margin:16px 0 4px">集計（69計算済み）</h4>',
-        '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse">',
-        '<thead><tr>',
-        f'<th width="14%" style="{header_style}">範囲</th>',
-        f'<th width="24%" style="{header_style};text-align:right">平均差枚</th>',
-        f'<th width="17%" style="{header_style};text-align:right">勝率</th>',
-        f'<th width="17%" style="{header_style};text-align:right">+1k</th>',
-        f'<th width="17%" style="{header_style};text-align:right">+2k</th>',
-        f'<th width="11%" style="{header_style};text-align:right">台数</th>',
-        '</tr></thead><tbody>',
+        '<h4 style="margin:16px 0 4px">集計（69計算済み）</h4>',
     ])
     for row in result.summary_rows:
         parts.extend([
-            '<tr>',
-            f'<td style="{cell_style}">{html.escape(row["band"])}</td>',
-            f'<td style="{cell_style};text-align:right;white-space:nowrap">{html.escape(_signed_medals(row["avg_diff"]))}</td>',
-            f'<td style="{cell_style};text-align:right">{html.escape(_rate(row["win_rate"]))}</td>',
-            f'<td style="{cell_style};text-align:right">{html.escape(_rate(row["plus1000_rate"]))}</td>',
-            f'<td style="{cell_style};text-align:right">{html.escape(_rate(row["plus2000_rate"]))}</td>',
-            f'<td style="{cell_style};text-align:right">{html.escape(row["selected_n"])}</td>',
-            '</tr>',
+            '<div style="margin:7px 0;padding:8px 10px;background:#f6f7f8;border-left:3px solid #777">',
+            f'<div style="font-weight:bold;white-space:nowrap">{html.escape(row["band"])}</div>',
+            f'<div style="font-size:13px;white-space:nowrap">平均 {_signed_medals(row["avg_diff"])}枚 ｜ 勝率 {_rate(row["win_rate"])}</div>',
+            f'<div style="font-size:13px;white-space:nowrap">+1,000 {_rate(row["plus1000_rate"])} ｜ '
+            f'+2,000 {_rate(row["plus2000_rate"])} ｜ {html.escape(row["selected_n"])}台</div>',
+            '</div>',
         ])
-    parts.extend(['</tbody></table>', '</section>'])
+    parts.append('</section>')
     return "".join(parts)
 
 
