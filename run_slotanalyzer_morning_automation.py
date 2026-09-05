@@ -42,6 +42,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     verify_store_completion,
 )
 from slotanalyzer_morning_notification import send_notification_best_effort  # noqa: E402
+from slotanalyzer_inventory_guard import assess_inventory_guard  # noqa: E402
 
 
 LOG_ROOT = PROJECT_ROOT / "logs" / "morning_automation"
@@ -143,6 +144,7 @@ def blank_store_state(store: str, operation_date: date) -> dict:
         "returncode": "",
         "error_category": "",
         "error": "",
+        "inventory_guard": {},
         "verified_artifacts": [],
     }
 
@@ -264,6 +266,34 @@ def reconcile_startup_state(
 ) -> None:
     for store in STORE_ORDER:
         store_state = state["stores"][store]
+        if store == STORE_MARUHAN:
+            inventory_guard = assess_inventory_guard(
+                project_root / "data/maruhan_maebashi/machine_number",
+                operation_date,
+                operation_date - timedelta(days=1),
+            )
+            store_state["inventory_guard"] = inventory_guard.to_dict()
+            existing_inventory_sensitive_output = False
+            if inventory_guard.blocked:
+                existing_inventory_sensitive_output = (
+                    verify_store_completion(
+                        store, project_root, operation_date
+                    ).status
+                    != "NONE"
+                )
+            if inventory_guard.blocked and (
+                store_state["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
+                or existing_inventory_sensitive_output
+            ):
+                store_state.update(
+                    status="NEEDS_MANUAL_REVIEW",
+                    current_stage="INVENTORY_GUARD",
+                    error_category="INVENTORY_GUARD_BLOCKED",
+                    error=inventory_guard.summary(),
+                    last_completed_at_jst=current.isoformat(),
+                    next_retry_at_jst="",
+                )
+                continue
         if store_state["status"] in {"SUCCESS", "ALREADY_COMPLETE"}:
             verification = verify_store_completion(store, project_root, operation_date)
             if verification.ok:
@@ -455,6 +485,17 @@ def _process_store(
         store_state["latest_data_date"] = expected_data_date.isoformat()
 
     current = clock().astimezone(JST)
+    if store == STORE_MARUHAN:
+        inventory_guard = assess_inventory_guard(
+            PROJECT_ROOT / "data/maruhan_maebashi/machine_number",
+            operation_date,
+            expected_data_date,
+        )
+        store_state["inventory_guard"] = inventory_guard.to_dict()
+        # The one-click child performs the authoritative stop after fetch,
+        # conversion, and Freshness, but before 69/63/79. Keeping this
+        # preflight result in state makes the reason visible while preserving
+        # collection of the latest validated daily CSV.
     if not _deadline_open(store, current, operation_date):
         _mark_deadline(store_state, store, current)
         save_state(state_path, state, current)
@@ -499,14 +540,36 @@ def _process_store(
     )
     verification = verify_store_completion(store, PROJECT_ROOT, operation_date)
     classification = classify_pipeline_result(result.returncode, verification)
+    inventory_guard = None
+    if store == STORE_MARUHAN:
+        inventory_guard = assess_inventory_guard(
+            PROJECT_ROOT / "data/maruhan_maebashi/machine_number",
+            operation_date,
+            expected_data_date,
+        )
+        store_state["inventory_guard"] = inventory_guard.to_dict()
+        if inventory_guard.blocked:
+            classification = "NEEDS_MANUAL_REVIEW"
     completed = clock().astimezone(JST)
     store_state.update(
         status=classification,
-        current_stage="PIPELINE",
+        current_stage=(
+            "INVENTORY_GUARD"
+            if inventory_guard is not None and inventory_guard.blocked
+            else "PIPELINE"
+        ),
         returncode=result.returncode,
         last_completed_at_jst=completed.isoformat(),
-        error_category=("" if classification == "SUCCESS" else verification.status or "PIPELINE_FAILED"),
-        error=("" if classification == "SUCCESS" else verification.error or "One-click returned non-zero."),
+        error_category=(
+            "INVENTORY_GUARD_BLOCKED"
+            if inventory_guard is not None and inventory_guard.blocked
+            else ("" if classification == "SUCCESS" else verification.status or "PIPELINE_FAILED")
+        ),
+        error=(
+            inventory_guard.summary()
+            if inventory_guard is not None and inventory_guard.blocked
+            else ("" if classification == "SUCCESS" else verification.error or "One-click returned non-zero.")
+        ),
         verified_artifacts=verification.artifacts,
     )
     _record_history(

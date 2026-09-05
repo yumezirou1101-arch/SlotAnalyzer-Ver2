@@ -23,6 +23,8 @@ import run_slotanalyzer_morning_automation as automation
 from slotanalyzer_morning_automation_support import (
     JST,
     LockUnavailableError,
+    ProcessResult,
+    ReadinessResult,
     StateCorruptError,
     WindowsFileLock,
     append_history_csv,
@@ -575,6 +577,105 @@ class Phase2SupportTests(unittest.TestCase):
         for item in state["stores"].values():
             item["status"] = "SUCCESS"
         self.assertTrue(automation.all_terminal(state))
+
+    def test_known_inventory_change_date_stops_maruhan_and_disables_sleep(self):
+        operation = date(2026, 9, 8)
+        current = datetime(2026, 9, 8, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "automation_inventory_guard", current)
+        args = automation.argparse.Namespace(
+            retry_interval_sec=1,
+            max_fetch_attempts=1,
+            chrome_wait_sec=1,
+            sleep_on_success=True,
+        )
+        ready = ReadinessResult(
+            ready=True,
+            source_exists=True,
+            source_path="fixture",
+            expected_data_date="2026-09-07",
+            category="READY",
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(automation, "check_source_readiness", return_value=ready), \
+                patch.object(automation, "PROJECT_ROOT", Path(directory)), \
+                patch.object(
+                    automation,
+                    "run_logged_subprocess",
+                    return_value=ProcessResult(
+                        1,
+                        current.isoformat(),
+                        current.isoformat(),
+                        0.1,
+                        "fixture.log",
+                    ),
+                ), \
+                patch.object(
+                    automation,
+                    "verify_store_completion",
+                    return_value=VerificationResult("NONE", False),
+                ), \
+                patch.object(automation, "_record_history"):
+            state_path = Path(directory) / "state.json"
+            automation._process_store(
+                STORE_MARUHAN,
+                state,
+                state_path,
+                operation,
+                date(2026, 9, 7),
+                args,
+                clock=lambda: current,
+            )
+        item = state["stores"][STORE_MARUHAN]
+        self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(item["current_stage"], "INVENTORY_GUARD")
+        self.assertTrue(item["inventory_guard"]["blocked"])
+        self.assertFalse(automation.should_sleep_on_success(True, state, 0))
+
+    def test_inventory_guard_precedes_existing_success_reconciliation(self):
+        operation = date(2026, 9, 8)
+        current = datetime(2026, 9, 8, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "automation_existing_output", current)
+        state["stores"][STORE_MARUHAN]["status"] = "SUCCESS"
+        with tempfile.TemporaryDirectory() as directory:
+            automation.reconcile_startup_state(
+                state, Path(directory), operation, current
+            )
+        item = state["stores"][STORE_MARUHAN]
+        self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(item["error_category"], "INVENTORY_GUARD_BLOCKED")
+
+    def test_persistent_inventory_block_disables_sleep_on_zero_diff_day(self):
+        operation = date(2026, 9, 10)
+        current = datetime(2026, 9, 10, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "automation_persistent_guard", current)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data/maruhan_maebashi/machine_number"
+            atomic_write_json(data / "inventory_guard_state.json", {
+                "version": 1,
+                "store": "MARUHAN_MAEBASHI",
+                "detected_at": "2026-09-09T08:01:00+09:00",
+                "change_date": "2026-09-08",
+                "previous_date": "2026-09-07",
+                "previous_machine_count": 514,
+                "current_machine_count": 514,
+                "added_machine_numbers": [],
+                "removed_machine_numbers": [],
+                "renamed_machine_numbers": [{
+                    "machine_no": 500,
+                    "previous_machine_name": "OLD",
+                    "current_machine_name": "NEW",
+                }],
+                "status": "BLOCKED",
+                "approved_at": "",
+                "approved_reason": "",
+            })
+            state["stores"][STORE_MARUHAN]["status"] = "SUCCESS"
+            automation.reconcile_startup_state(state, root, operation, current)
+        item = state["stores"][STORE_MARUHAN]
+        self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(item["inventory_guard"]["persistent_state"]["status"], "BLOCKED")
+        self.assertFalse(automation.should_sleep_on_success(True, state, 0))
 
     def test_big_march_daily_only_does_not_block_startup_recovery(self):
         operation = date(2026, 9, 2)

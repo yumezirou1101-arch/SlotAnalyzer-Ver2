@@ -181,6 +181,78 @@ class MorningNotificationTests(unittest.TestCase):
             lines, _ = notification._maruhan_section(state_with(["SUCCESS"] * 3), Path(directory), date(2026, 9, 4))
         self.assertIn("formal表示不可", "\n".join(lines))
 
+    def test_inventory_guard_warning_is_prominent_and_detailed(self):
+        state = state_with(["NEEDS_MANUAL_REVIEW", "SUCCESS", "SUCCESS"])
+        state["stores"][automation.STORE_MARUHAN]["inventory_guard"] = {
+            "blocked": True,
+            "reason": "Inventory change detected",
+            "comparison": {
+                "previous_machine_count": 514,
+                "current_machine_count": 514,
+                "added_machine_numbers": [900],
+                "removed_machine_numbers": [1],
+                "renamed_machine_numbers": [{
+                    "machine_no": 700,
+                    "previous_machine_name": "OLD",
+                    "current_machine_name": "NEW",
+                }],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            message = notification.build_notification_message(state, Path(directory))
+        self.assertIn("⚠ Maruhan: 台構成変更を検知", message.plain)
+        self.assertIn("⚠ Maruhan: 正式Forward停止", message.plain)
+        self.assertIn("⚠ Maruhan: MANUAL_REVIEW", message.plain)
+        self.assertIn("inventory previous/current: 514 / 514", message.plain)
+        self.assertIn("renamed: 700 OLD -> NEW", message.plain)
+        self.assertNotIn("FORWARD_VALID (formal)", message.plain)
+        self.assertLess(message.plain.index("台構成変更を検知"), message.plain.index("【Maruhan"))
+        self.assertIn("台構成変更を検知", message.html)
+
+    def test_normal_success_gmail_has_no_inventory_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            message = notification.build_notification_message(
+                state_with(["SUCCESS"] * 3), Path(directory)
+            )
+        self.assertNotIn("台構成変更を検知", message.plain)
+        self.assertNotIn("正式Forward停止 (inventory guard)", message.html)
+
+    def test_persistent_unapproved_block_warning_continues_on_zero_diff_day(self):
+        state = state_with(["NEEDS_MANUAL_REVIEW", "SUCCESS", "SUCCESS"])
+        state["operation_date"] = "2026-09-10"
+        state["stores"][automation.STORE_MARUHAN]["inventory_guard"] = {
+            "blocked": True,
+            "reason": "Inventory change remains blocked because explicit approval has not been recorded.",
+            "comparison": {
+                "previous_machine_count": 514,
+                "current_machine_count": 514,
+                "added_machine_numbers": [],
+                "removed_machine_numbers": [],
+                "renamed_machine_numbers": [],
+                "has_changes": False,
+            },
+            "persistent_state": {
+                "status": "BLOCKED",
+                "change_date": "2026-09-08",
+                "detected_at": "2026-09-09T08:01:00+09:00",
+                "previous_machine_count": 514,
+                "current_machine_count": 514,
+                "added_machine_numbers": [],
+                "removed_machine_numbers": [],
+                "renamed_machine_numbers": [{
+                    "machine_no": 500,
+                    "previous_machine_name": "OLD",
+                    "current_machine_name": "NEW",
+                }],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            message = notification.build_notification_message(state, Path(directory))
+        self.assertIn("台構成変更による正式Forward停止中", message.plain)
+        self.assertIn("未承認のため停止継続", message.plain)
+        self.assertIn("renamed: 500 OLD -> NEW", message.plain)
+        self.assertNotIn("FORWARD_VALID (formal)", message.plain)
+
     def test_maruhan_formal_valid_uses_verified_metadata_and_rankings(self):
         metadata = [{
             "forward_valid": "True", "target_date": "2026-09-04",

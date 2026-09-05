@@ -22,6 +22,7 @@ from ana_slo_prediction_v4_2_forward_guard import (
     validate_forward_time,
     validate_target_actual_absent,
 )
+from slotanalyzer_inventory_guard import enforce_inventory_guard
 
 
 # ============================================================
@@ -1228,6 +1229,15 @@ def main() -> None:
     )
     print(
         "forward validity      : OK"
+    )
+
+    # Inventory continuity is independent of --allow-gap. Acquisition,
+    # conversion, and Freshness are retained, but no evaluation, Forward
+    # update, or formal ranking may proceed while this guard is blocked.
+    enforce_inventory_guard(
+        DATA_DIR,
+        prediction_target.date(),
+        source_date.date(),
     )
 
     # --------------------------------------------------------

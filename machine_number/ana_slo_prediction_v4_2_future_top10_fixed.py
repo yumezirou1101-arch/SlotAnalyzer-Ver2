@@ -16,6 +16,7 @@ from ana_slo_prediction_v4_2_forward_guard import (
     validate_not_frozen,
     validate_target_actual_absent,
 )
+from slotanalyzer_inventory_guard import enforce_inventory_guard
 
 
 # ============================================================
@@ -306,6 +307,14 @@ def main() -> None:
 
     header(
         "64 - V4.2_C Future TOP10 Prediction"
+    )
+
+    # This guard is deliberately independent of --allow-gap and runs before
+    # any formal output can be created or replaced.
+    enforce_inventory_guard(
+        DATA_DIR,
+        TARGET_DATE.date(),
+        EXPECTED_LATEST_DATA_DATE.date(),
     )
 
     # Final formal-output defense. These checks also apply when this

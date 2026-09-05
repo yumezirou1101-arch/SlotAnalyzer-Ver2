@@ -271,13 +271,31 @@ def _maruhan_content(state: dict, root: Path, operation_date: date) -> tuple[Sto
     ymd = operation_date.strftime("%Y%m%d")
     metadata_rows = _read_rows(base / "64_Ver4_2_future_top10" / f"64_prediction_{ymd}_metadata.csv")
     metadata = metadata_rows[0] if len(metadata_rows) == 1 else {}
-    formal = verification.ok and metadata.get("forward_valid", "").lower() in {"true", "1", "yes"}
+    inventory_guard = item.get("inventory_guard") or {}
+    inventory_blocked = bool(inventory_guard.get("blocked"))
+    formal = (
+        not inventory_blocked
+        and verification.ok
+        and metadata.get("forward_valid", "").lower() in {"true", "1", "yes"}
+    )
     warnings = [] if formal else [f"Maruhan: 非valid ({verification.status})"]
+    if inventory_blocked:
+        warnings.extend([
+            "Maruhan: 台構成変更を検知",
+            "Maruhan: 正式Forward停止",
+            "Maruhan: MANUAL_REVIEW",
+        ])
+        persistent_state = inventory_guard.get("persistent_state") or {}
+        if persistent_state.get("status") == "BLOCKED":
+            warnings.extend([
+                "Maruhan: 台構成変更による正式Forward停止中",
+                "Maruhan: 未承認のため停止継続",
+            ])
     summary_lines = [
         f"status: {item.get('status', 'UNKNOWN')}",
         f"target_date: {metadata.get('target_date', operation_date.isoformat())}",
         f"latest_data_date: {metadata.get('latest_data_date', item.get('latest_data_date', ''))}",
-        f"Forward: {'FORWARD_VALID (formal)' if formal else '非valid / formal表示不可'}",
+        f"Forward: {'正式Forward停止 (inventory guard)' if inventory_blocked else ('FORWARD_VALID (formal)' if formal else '非valid / formal表示不可')}",
     ]
     specs = [
         ("NORMAL Top10", base / "64_Ver4_2_future_top10" / f"64_prediction_{ymd}_top10.csv", ("prediction_rank",)),
@@ -295,6 +313,30 @@ def _maruhan_content(state: dict, root: Path, operation_date: date) -> tuple[Sto
         f"model: {metadata.get('model', '-')}",
         f"fingerprint: {metadata.get('weight_fingerprint', '-')}",
     ]
+    if inventory_blocked:
+        comparison = inventory_guard.get("comparison") or {}
+        persistent_state = inventory_guard.get("persistent_state") or {}
+        if not comparison.get("has_changes") and persistent_state:
+            comparison = persistent_state
+        details.append(f"inventory_guard: {inventory_guard.get('reason', 'blocked')}")
+        if persistent_state:
+            details.extend([
+                f"persistent status: {persistent_state.get('status', '-')}",
+                f"change date: {persistent_state.get('change_date', '-')}",
+                f"detected at: {persistent_state.get('detected_at', '-')}",
+            ])
+        if comparison:
+            details.extend([
+                f"inventory previous/current: {comparison.get('previous_machine_count', '-')} / {comparison.get('current_machine_count', '-')}",
+                f"added machine numbers: {comparison.get('added_machine_numbers', [])}",
+                f"removed machine numbers: {comparison.get('removed_machine_numbers', [])}",
+            ])
+            for changed in comparison.get("renamed_machine_numbers", [])[:10]:
+                details.append(
+                    "renamed: "
+                    f"{changed.get('machine_no')} "
+                    f"{changed.get('previous_machine_name')} -> {changed.get('current_machine_name')}"
+                )
     return StoreSection("【Maruhan 前橋インター】", summary_lines, rankings, details), warnings
 
 
