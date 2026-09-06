@@ -23,6 +23,7 @@ from slotanalyzer_morning_automation_support import (
     append_history_csv,
     now_jst,
     verify_big_march_completion,
+    verify_big_march_provisional_completion,
     verify_maruhan_completion,
     verify_yasuda_completion,
 )
@@ -164,6 +165,12 @@ def determine_overall_status(state: dict) -> str:
     statuses = [str(item.get("status", "")) for item in state.get("stores", {}).values()]
     success = {"SUCCESS", "ALREADY_COMPLETE"}
     manual = {"NEEDS_MANUAL_REVIEW", "MANUAL_REVIEW"}
+    if "PROVISIONAL" in statuses:
+        if any(value in manual for value in statuses):
+            return "MANUAL_REVIEW"
+        if "FAILED_FINAL" in statuses:
+            return "FAILED"
+        return "PARTIAL"
     if statuses and all(value in success for value in statuses):
         return "SUCCESS"
     if any(value in success for value in statuses):
@@ -614,6 +621,61 @@ def _bigmarch_content(state: dict, root: Path, operation_date: date) -> tuple[St
     verification = verify_big_march_completion(root, operation_date)
     base = root / "data/bigmarch_takasaki_oyagi/machine_number"
     analysis = base / "analysis_31days_deep"
+    if item.get("status") == "PROVISIONAL":
+        provisional = verify_big_march_provisional_completion(root, operation_date)
+        expected_latest = expected - timedelta(days=1)
+        warnings = [
+            "Big March: PROVISIONAL / 前日データ未反映のため正式ランキングではありません"
+        ]
+        if not provisional.ok:
+            return (
+                StoreSection(
+                    "【Big March 高崎おおやぎ】",
+                    [
+                        "⚠ PROVISIONAL成果物検証失敗",
+                        f"Target: {operation_date.isoformat()}",
+                        f"Expected: {expected.isoformat()}",
+                        f"Latest: {expected_latest.isoformat()}",
+                        "Forward VALID: False",
+                        "正式評価対象外",
+                    ],
+                    [],
+                    [],
+                ),
+                warnings + [f"Big March provisional verifier: {provisional.status} {provisional.error}"],
+            )
+        directory = (
+            analysis
+            / "90_provisional_future_ranking"
+            / operation_date.strftime("%Y%m%d")
+        )
+        prefix = f"90_provisional_{operation_date:%Y%m%d}"
+        juggler = _read_rows(directory / f"{prefix}_juggler_top10.csv")
+        nonjuggler = _read_rows(directory / f"{prefix}_nonjuggler_top10.csv")
+        for row in juggler:
+            row["score"] = row.get("recent7_win", "")
+        for row in nonjuggler:
+            row["score"] = row.get("weekday_avg", "")
+        return (
+            StoreSection(
+                "【Big March 高崎おおやぎ】",
+                [
+                    "⚠ PROVISIONAL / 暫定ランキング",
+                    "前日データ未反映のため正式ランキングではありません",
+                    f"Target: {operation_date.isoformat()}",
+                    f"Expected: {expected.isoformat()}",
+                    f"Latest: {expected_latest.isoformat()}",
+                    "Forward VALID: False",
+                    "正式Forward対象外 / 正式評価対象外",
+                ],
+                [
+                    RankingBlock("JUGGLER 暫定 Top10（recent7_win）", juggler, ("prediction_rank", "rank")),
+                    RankingBlock("NON_JUGGLER 暫定 Top10（weekday_avg）", nonjuggler, ("prediction_rank", "rank")),
+                ],
+                [],
+            ),
+            warnings,
+        )
     daily = base / f"ana_slo_bigmarch_oyagi_{expected:%Y%m%d}.csv"
     daily_rows = _read_rows(daily)
     fresh = bool(daily_rows) and all(row.get("date") == expected.isoformat() for row in daily_rows)

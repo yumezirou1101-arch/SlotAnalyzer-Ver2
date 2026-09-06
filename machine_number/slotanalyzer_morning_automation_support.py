@@ -28,6 +28,7 @@ CDP_PORT = 9222
 TERMINAL_STATES = {
     "SUCCESS",
     "ALREADY_COMPLETE",
+    "PROVISIONAL",
     "FAILED_FINAL",
     "NEEDS_MANUAL_REVIEW",
 }
@@ -456,6 +457,25 @@ def build_pipeline_command(
     return command
 
 
+def build_big_march_provisional_command(
+    project_root: Path,
+    python_executable: str,
+    operation_date: date,
+) -> list[str]:
+    command = [
+        python_executable,
+        str(
+            project_root
+            / "machine_number"
+            / "ana_slo_bigmarch_oyagi_provisional_future_ranking.py"
+        ),
+        "--operation-date",
+        operation_date.isoformat(),
+    ]
+    _assert_safe_command(command)
+    return command
+
+
 def _assert_safe_command(command: Iterable[str]) -> None:
     forbidden = {"--allow-gap", "--overwrite"}
     present = forbidden.intersection(command)
@@ -776,6 +796,97 @@ def verify_big_march_completion(project_root: Path, operation_date: date) -> Ver
     except Exception as exc:
         return VerificationResult("INVALID", False, f"{type(exc).__name__}: {exc}", [str(p) for p in files])
     return VerificationResult("COMPLETE", True, artifacts=[str(p) for p in files])
+
+
+def verify_big_march_provisional_completion(
+    project_root: Path, operation_date: date
+) -> VerificationResult:
+    compact = operation_date.strftime("%Y%m%d")
+    expected = operation_date - timedelta(days=1)
+    latest = expected - timedelta(days=1)
+    directory = (
+        project_root
+        / "data/bigmarch_takasaki_oyagi/machine_number"
+        / "analysis_31days_deep/90_provisional_future_ranking"
+        / compact
+    )
+    prefix = f"90_provisional_{compact}"
+    files = [
+        directory / f"{prefix}_juggler_all.csv",
+        directory / f"{prefix}_juggler_top10.csv",
+        directory / f"{prefix}_nonjuggler_all.csv",
+        directory / f"{prefix}_nonjuggler_top10.csv",
+        directory / f"{prefix}_metadata.csv",
+        directory / f"{prefix}_status.csv",
+    ]
+    if not any(path.exists() for path in files):
+        return VerificationResult("NONE", False)
+    if not _nonempty(files):
+        return VerificationResult(
+            "PARTIAL_PROVISIONAL",
+            False,
+            "Big March provisional artifacts are partial.",
+            [str(path) for path in files if path.exists()],
+        )
+    try:
+        expected_values = {
+            "target_date": operation_date.isoformat(),
+            "expected_data_date": expected.isoformat(),
+            "latest_data_date": latest.isoformat(),
+            "ranking_class": "PROVISIONAL",
+        }
+        for path in files[:4]:
+            frame = pd.read_csv(path, encoding="utf-8-sig")
+            required = set(expected_values) | {"provisional", "forward_valid"}
+            if frame.empty or not required.issubset(frame.columns):
+                raise RuntimeError(f"Invalid provisional ranking: {path.name}")
+            for key, value in expected_values.items():
+                if not (frame[key].astype(str) == value).all():
+                    raise RuntimeError(f"{key} mismatch: {path.name}")
+            if not frame["provisional"].map(_truthy).all():
+                raise RuntimeError(f"provisional flag mismatch: {path.name}")
+            if frame["forward_valid"].map(_truthy).any():
+                raise RuntimeError(f"forward_valid must be false: {path.name}")
+        metadata = pd.read_csv(files[4], encoding="utf-8-sig")
+        status = pd.read_csv(files[5], encoding="utf-8-sig")
+        if len(metadata) != 1 or len(status) != 1:
+            raise RuntimeError("Provisional metadata/status must contain one row.")
+        for frame, label in ((metadata, "metadata"), (status, "status")):
+            row = frame.iloc[0]
+            for key, value in expected_values.items():
+                if str(row.get(key, "")) != value:
+                    raise RuntimeError(f"{label} {key} mismatch.")
+            if not _truthy(row.get("provisional")):
+                raise RuntimeError(f"{label} provisional must be true.")
+            if _truthy(row.get("formal")) or _truthy(row.get("forward_valid")):
+                raise RuntimeError(f"{label} formal/forward_valid must be false.")
+            if _truthy(row.get("eligible_for_formal_evaluation")):
+                raise RuntimeError(f"{label} cannot be eligible for formal evaluation.")
+            if str(row.get("source_status", "")) != "EXPECTED_DATE_MISSING":
+                raise RuntimeError(f"{label} source_status mismatch.")
+            if int(row.get("expected_gap_days", -1)) != 1 or int(
+                row.get("target_to_latest_gap_days", -1)
+            ) != 2:
+                raise RuntimeError(f"{label} gap mismatch.")
+        if str(status.iloc[0].get("status", "")) != "PROVISIONAL":
+            raise RuntimeError("Provisional status is invalid.")
+    except Exception as exc:
+        return VerificationResult(
+            "INVALID_PROVISIONAL",
+            False,
+            f"{type(exc).__name__}: {exc}",
+            [str(path) for path in files],
+        )
+    return VerificationResult(
+        "PROVISIONAL",
+        True,
+        artifacts=[str(path) for path in files],
+        details={
+            "target_date": operation_date.isoformat(),
+            "expected_data_date": expected.isoformat(),
+            "latest_data_date": latest.isoformat(),
+        },
+    )
 
 
 def verify_yasuda_completion(project_root: Path, operation_date: date) -> VerificationResult:

@@ -388,12 +388,23 @@ def load_frozen_history() -> tuple[
 def build_future_ranking(
     history: pd.DataFrame,
     latest_date: pd.Timestamp,
+    target_date: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
 
-    target_date = (
-        latest_date
-        + pd.Timedelta(days=1)
-    ).normalize()
+    latest_date = pd.Timestamp(latest_date).normalize()
+
+    if target_date is None:
+        target_date = (
+            latest_date
+            + pd.Timedelta(days=1)
+        ).normalize()
+    else:
+        target_date = pd.Timestamp(target_date).normalize()
+
+    if target_date <= latest_date:
+        raise RuntimeError(
+            "target_date must be later than latest_data_date."
+        )
 
     latest_panel = history[
         history["date"] == latest_date

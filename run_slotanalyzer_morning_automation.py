@@ -27,6 +27,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     WindowsFileLock,
     append_history_csv,
     atomic_write_json,
+    build_big_march_provisional_command,
     build_fetch_command,
     build_pipeline_command,
     check_source_readiness,
@@ -39,6 +40,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     now_jst,
     other_store_retry_allowed,
     run_logged_subprocess,
+    verify_big_march_provisional_completion,
     verify_store_completion,
 )
 from slotanalyzer_morning_notification import send_notification_best_effort  # noqa: E402
@@ -134,6 +136,11 @@ def blank_store_state(store: str, operation_date: date) -> dict:
         "attempt_count": 0,
         "fetch_attempt_count": 0,
         "pipeline_attempt_count": 0,
+        "provisional_attempt_count": 0,
+        "provisional_status": "",
+        "provisional_reason": "",
+        "provisional_latest_data_date": "",
+        "provisional_artifacts": [],
         "current_stage": "",
         "last_readiness": {},
         "latest_data_date": "",
@@ -266,6 +273,52 @@ def reconcile_startup_state(
 ) -> None:
     for store in STORE_ORDER:
         store_state = state["stores"][store]
+        store_state.setdefault("provisional_attempt_count", 0)
+        store_state.setdefault("provisional_status", "")
+        store_state.setdefault("provisional_reason", "")
+        store_state.setdefault("provisional_latest_data_date", "")
+        store_state.setdefault("provisional_artifacts", [])
+        if store == STORE_BIGMARCH:
+            provisional = verify_big_march_provisional_completion(
+                project_root, operation_date
+            )
+            if provisional.status != "NONE":
+                formal = verify_store_completion(store, project_root, operation_date)
+                if formal.status != "NONE":
+                    store_state.update(
+                        status="NEEDS_MANUAL_REVIEW",
+                        current_stage="PROVISIONAL_RECONCILIATION",
+                        error_category="FORMAL_PROVISIONAL_CONFLICT",
+                        error="Formal and provisional artifacts both exist for this operation date.",
+                        last_completed_at_jst=current.isoformat(),
+                    )
+                elif provisional.ok:
+                    store_state.update(
+                        status="PROVISIONAL",
+                        current_stage="PROVISIONAL",
+                        provisional_status="ALREADY_PROVISIONAL",
+                        provisional_reason="Recovered verified provisional artifacts.",
+                        provisional_latest_data_date=provisional.details.get("latest_data_date", ""),
+                        provisional_artifacts=provisional.artifacts,
+                        verified_artifacts=[],
+                        error_category="",
+                        error="",
+                        next_retry_at_jst="",
+                        last_completed_at_jst=current.isoformat(),
+                    )
+                else:
+                    store_state.update(
+                        status="NEEDS_MANUAL_REVIEW",
+                        current_stage="PROVISIONAL_RECONCILIATION",
+                        provisional_status=provisional.status,
+                        provisional_reason=provisional.error,
+                        provisional_artifacts=provisional.artifacts,
+                        error_category=provisional.status,
+                        error=provisional.error,
+                        next_retry_at_jst="",
+                        last_completed_at_jst=current.isoformat(),
+                    )
+                continue
         if store == STORE_MARUHAN:
             inventory_guard = assess_inventory_guard(
                 project_root / "data/maruhan_maebashi/machine_number",
@@ -356,6 +409,109 @@ def reconcile_startup_state(
                 )
 
 
+def _run_big_march_provisional(
+    state: dict,
+    state_path: Path,
+    operation_date: date,
+    current: datetime,
+    clock=now_jst,
+) -> None:
+    store_state = state["stores"][STORE_BIGMARCH]
+    if store_state.get("pipeline_attempt_count", 0) > 0:
+        store_state.update(
+            status="FAILED_FINAL",
+            error_category="PROVISIONAL_FORBIDDEN_AFTER_FORMAL_PIPELINE",
+            error="Formal pipeline was already attempted; provisional is forbidden.",
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        save_state(state_path, state, current)
+        return
+    if store_state.get("provisional_attempt_count", 0) > 0:
+        verification = verify_big_march_provisional_completion(
+            PROJECT_ROOT, operation_date
+        )
+        store_state.update(
+            status="PROVISIONAL" if verification.ok else "NEEDS_MANUAL_REVIEW",
+            current_stage="PROVISIONAL",
+            provisional_status=("ALREADY_PROVISIONAL" if verification.ok else verification.status),
+            provisional_reason=("Verified existing provisional artifacts." if verification.ok else verification.error),
+            provisional_latest_data_date=verification.details.get("latest_data_date", ""),
+            provisional_artifacts=verification.artifacts,
+            error_category="" if verification.ok else verification.status,
+            error="" if verification.ok else verification.error,
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        save_state(state_path, state, current)
+        return
+    attempt = 1
+    store_state.update(
+        status="RUNNING",
+        current_stage="PROVISIONAL",
+        attempt_count=store_state.get("attempt_count", 0) + 1,
+        provisional_attempt_count=attempt,
+        provisional_status="RUNNING",
+        provisional_reason="Expected source remained missing at the 09:30 JST deadline.",
+        last_started_at_jst=current.isoformat(),
+        next_retry_at_jst="",
+        error_category="",
+        error="",
+    )
+    save_state(state_path, state, current)
+    command = build_big_march_provisional_command(
+        PROJECT_ROOT, sys.executable, operation_date
+    )
+    log_path = (
+        RUNS_DIR
+        / operation_date.strftime("%Y%m%d")
+        / state["automation_run_id"]
+        / "bigmarch_provisional_attempt01.log"
+    )
+    environment = {
+        **os.environ,
+        "SLOTANALYZER_MORNING_RUN_ID": state["automation_run_id"],
+    }
+    result = run_logged_subprocess(
+        command, PROJECT_ROOT, log_path, "PROVISIONAL", environment=environment, clock=clock
+    )
+    verification = verify_big_march_provisional_completion(
+        PROJECT_ROOT, operation_date
+    )
+    completed = clock().astimezone(JST)
+    if result.returncode == 0 and verification.ok:
+        status = "PROVISIONAL"
+        category = ""
+        error = ""
+    elif verification.status in {"PARTIAL_PROVISIONAL", "INVALID_PROVISIONAL"}:
+        status = "NEEDS_MANUAL_REVIEW"
+        category = verification.status
+        error = verification.error
+    else:
+        status = "FAILED_FINAL"
+        category = "PROVISIONAL_NOT_ELIGIBLE_OR_FAILED"
+        error = verification.error or "Provisional generator returned non-zero."
+    store_state.update(
+        status=status,
+        current_stage="PROVISIONAL",
+        returncode=result.returncode,
+        pipeline_attempt_count=0,
+        provisional_status=("PROVISIONAL" if status == "PROVISIONAL" else verification.status),
+        provisional_reason=("Expected source missing; isolated provisional ranking generated." if status == "PROVISIONAL" else error),
+        provisional_latest_data_date=verification.details.get("latest_data_date", ""),
+        provisional_artifacts=verification.artifacts,
+        verified_artifacts=[],
+        error_category=category,
+        error=error,
+        next_retry_at_jst="",
+        last_completed_at_jst=completed.isoformat(),
+    )
+    _record_history(
+        state, STORE_BIGMARCH, "PROVISIONAL", attempt, status, result, category, error
+    )
+    save_state(state_path, state, completed)
+
+
 def _process_store(
     store: str,
     state: dict,
@@ -373,6 +529,25 @@ def _process_store(
     if next_retry and current < datetime.fromisoformat(next_retry):
         return
     if not _deadline_open(store, current, operation_date):
+        if store == STORE_BIGMARCH:
+            readiness = check_source_readiness(store, PROJECT_ROOT, expected_data_date)
+            store_state["current_stage"] = "READINESS"
+            store_state["last_readiness"] = readiness.to_dict()
+            if readiness.source_exists and not readiness.ready:
+                store_state.update(
+                    status="NEEDS_MANUAL_REVIEW",
+                    error_category="SOURCE_INVALID",
+                    error=readiness.error,
+                    last_completed_at_jst=current.isoformat(),
+                    next_retry_at_jst="",
+                )
+                save_state(state_path, state, current)
+                return
+            if not readiness.ready:
+                _run_big_march_provisional(
+                    state, state_path, operation_date, current, clock
+                )
+                return
         _mark_deadline(store_state, store, current)
         save_state(state_path, state, current)
         return

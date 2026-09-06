@@ -574,5 +574,29 @@ class MorningNotificationTests(unittest.TestCase):
         self.assertIn("WARNING", stderr.getvalue())
 
 
+    def test_bigmarch_provisional_20260906_galaxy_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);directory=root/"data/bigmarch_takasaki_oyagi/machine_number/analysis_31days_deep/90_provisional_future_ranking/20260906";directory.mkdir(parents=True)
+            base={"target_date":"2026-09-06","expected_data_date":"2026-09-05","latest_data_date":"2026-09-04","ranking_class":"PROVISIONAL","provisional":True,"forward_valid":False,"prediction_rank":1,"machine_no":482,"machine_name":"TEST"}
+            write_csv_rows(directory/"90_provisional_20260906_juggler_all.csv",[{**base,"recent7_win":0.8}]);write_csv_rows(directory/"90_provisional_20260906_juggler_top10.csv",[{**base,"recent7_win":0.8}]);write_csv_rows(directory/"90_provisional_20260906_nonjuggler_all.csv",[{**base,"weekday_avg":1000}]);write_csv_rows(directory/"90_provisional_20260906_nonjuggler_top10.csv",[{**base,"weekday_avg":1000}])
+            meta={**base,"formal":False,"eligible_for_formal_evaluation":False,"source_status":"EXPECTED_DATE_MISSING","expected_gap_days":1,"target_to_latest_gap_days":2}
+            write_csv_rows(directory/"90_provisional_20260906_metadata.csv",[meta]);write_csv_rows(directory/"90_provisional_20260906_status.csv",[{**meta,"status":"PROVISIONAL"}])
+            state={"operation_date":"2026-09-06","stores":{automation.STORE_BIGMARCH:{"status":"PROVISIONAL"}}}
+            section,warnings=notification._bigmarch_content(state,root,date(2026,9,6));plain=notification._render_section_plain(section);body=notification._render_section_html(section)
+            for value in ("PROVISIONAL / 暫定ランキング","正式ランキングではありません","Target: 2026-09-06","Expected: 2026-09-05","Latest: 2026-09-04","Forward VALID: False","正式評価対象外","JUGGLER 暫定 Top10","NON_JUGGLER 暫定 Top10"):
+                self.assertIn(value,plain)
+            self.assertIn("table-layout:fixed",body);self.assertTrue(warnings);self.assertNotIn("Freshness OK",plain);self.assertNotIn("FORWARD_VALID",plain)
+
+    def test_provisional_overall_is_partial_and_fatal_states_win(self):
+        self.assertEqual(notification.determine_overall_status(state_with(["SUCCESS","PROVISIONAL","SUCCESS"])),"PARTIAL")
+        self.assertEqual(notification.determine_overall_status(state_with(["NEEDS_MANUAL_REVIEW","PROVISIONAL","SUCCESS"])),"MANUAL_REVIEW")
+        self.assertEqual(notification.determine_overall_status(state_with(["FAILED_FINAL","PROVISIONAL","SUCCESS"])),"FAILED")
+
+    def test_old_provisional_is_not_used_for_next_day(self):
+        state={"operation_date":"2026-09-07","stores":{automation.STORE_BIGMARCH:{"status":"PROVISIONAL"}}}
+        section,_=notification._bigmarch_content(state,ROOT,date(2026,9,7));plain=notification._render_section_plain(section)
+        self.assertIn("PROVISIONAL成果物検証失敗",plain);self.assertNotIn("482番台",plain)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ import unittest
 from contextlib import redirect_stderr
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -30,6 +31,7 @@ from slotanalyzer_morning_automation_support import (
     append_history_csv,
     atomic_write_json,
     build_fetch_command,
+    build_big_march_provisional_command,
     build_pipeline_command,
     check_source_readiness,
     classify_fetch_result,
@@ -41,6 +43,7 @@ from slotanalyzer_morning_automation_support import (
     other_store_retry_allowed,
     run_logged_subprocess,
     verify_big_march_completion,
+    verify_big_march_provisional_completion,
     verify_maruhan_completion,
     verify_yasuda_completion,
     VerificationResult,
@@ -824,6 +827,75 @@ class Phase2SupportTests(unittest.TestCase):
                 writer.writerow(row)
             result = verify_maruhan_completion(root, operation)
             self.assertEqual(result.status, "COMPLETE_64_INCOMPLETE_PIPELINE")
+
+
+    def test_provisional_command_is_separate_and_has_no_bypass(self):
+        command = build_big_march_provisional_command(PROJECT_ROOT, "python", date(2026, 9, 6))
+        self.assertIn("ana_slo_bigmarch_oyagi_provisional_future_ranking.py", command[1])
+        self.assertEqual(command[-2:], ["--operation-date", "2026-09-06"])
+        self.assertNotIn("--allow-gap", command)
+
+    def test_existing_20260906_provisional_verifies(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);directory=root/"data/bigmarch_takasaki_oyagi/machine_number/analysis_31days_deep/90_provisional_future_ranking/20260906";directory.mkdir(parents=True)
+            def write(path, row):
+                with path.open("w",encoding="utf-8-sig",newline="") as handle:
+                    writer=csv.DictWriter(handle,fieldnames=list(row));writer.writeheader();writer.writerow(row)
+            base={"target_date":"2026-09-06","expected_data_date":"2026-09-05","latest_data_date":"2026-09-04","ranking_class":"PROVISIONAL","provisional":True,"forward_valid":False}
+            for name in ("juggler_all","juggler_top10","nonjuggler_all","nonjuggler_top10"): write(directory/f"90_provisional_20260906_{name}.csv",{**base,"machine_no":1,"machine_name":"X"})
+            meta={**base,"formal":False,"eligible_for_formal_evaluation":False,"source_status":"EXPECTED_DATE_MISSING","expected_gap_days":1,"target_to_latest_gap_days":2}
+            write(directory/"90_provisional_20260906_metadata.csv",meta);write(directory/"90_provisional_20260906_status.csv",{**meta,"status":"PROVISIONAL"})
+            result = verify_big_march_provisional_completion(root, date(2026, 9, 6))
+            self.assertTrue(result.ok);self.assertEqual(result.status,"PROVISIONAL");self.assertEqual(result.details["latest_data_date"],"2026-09-04");self.assertEqual(len(result.artifacts),6)
+
+    def test_provisional_is_terminal_but_never_sleep_eligible(self):
+        state = automation.create_state(date(2026, 9, 6), "run", datetime(2026, 9, 6, 8, 0, tzinfo=JST))
+        for item in state["stores"].values(): item["status"] = "SUCCESS"
+        state["stores"][STORE_BIGMARCH]["status"] = "PROVISIONAL"
+        self.assertTrue(automation.all_terminal(state))
+        self.assertFalse(automation.should_sleep_on_success(True, state, 0))
+
+    def test_deadline_missing_source_routes_only_to_provisional(self):
+        operation=date(2026,9,6);state=automation.create_state(operation,"run",datetime(2026,9,6,8,0,tzinfo=JST));path=Path("unused")
+        missing=ReadinessResult(False,False,"missing", "2026-09-05","SOURCE_MISSING")
+        clock=lambda:datetime(2026,9,6,9,31,tzinfo=JST)
+        with patch.object(automation,"check_source_readiness",return_value=missing),patch.object(automation,"_run_big_march_provisional") as provisional_run,patch.object(automation,"save_state"):
+            automation._process_store(STORE_BIGMARCH,state,path,operation,date(2026,9,5),SimpleNamespace(max_fetch_attempts=20,retry_interval_sec=300,chrome_wait_sec=15),clock)
+        provisional_run.assert_called_once()
+        self.assertEqual(state["stores"][STORE_BIGMARCH]["pipeline_attempt_count"],0)
+
+    def test_deadline_invalid_existing_source_never_routes_to_provisional(self):
+        operation=date(2026,9,6);state=automation.create_state(operation,"run",datetime(2026,9,6,8,0,tzinfo=JST));invalid=ReadinessResult(False,True,"bad","2026-09-05","SOURCE_INVALID","invalid")
+        with patch.object(automation,"check_source_readiness",return_value=invalid),patch.object(automation,"_run_big_march_provisional") as provisional_run,patch.object(automation,"save_state"):
+            automation._process_store(STORE_BIGMARCH,state,Path("unused"),operation,date(2026,9,5),SimpleNamespace(max_fetch_attempts=20,retry_interval_sec=300,chrome_wait_sec=15),lambda:datetime(2026,9,6,9,31,tzinfo=JST))
+        provisional_run.assert_not_called();self.assertEqual(state["stores"][STORE_BIGMARCH]["status"],"NEEDS_MANUAL_REVIEW")
+
+    def test_reconciliation_restores_verified_provisional(self):
+        operation=date(2026,9,6);now=datetime(2026,9,6,9,35,tzinfo=JST);state=automation.create_state(operation,"run",now)
+        verified=VerificationResult("PROVISIONAL",True,artifacts=["a"],details={"latest_data_date":"2026-09-04"})
+        with patch.object(automation,"verify_big_march_provisional_completion",return_value=verified),patch.object(automation,"verify_store_completion",return_value=VerificationResult("NONE",False)),patch.object(automation,"assess_inventory_guard") as guard:
+            guard.return_value=SimpleNamespace(blocked=False,to_dict=lambda:{})
+            automation.reconcile_startup_state(state,PROJECT_ROOT,operation,now)
+        item=state["stores"][STORE_BIGMARCH];self.assertEqual(item["status"],"PROVISIONAL");self.assertEqual(item["provisional_attempt_count"],0);self.assertEqual(item["verified_artifacts"],[])
+
+    def test_provisional_success_keeps_formal_attempt_zero_and_records_state(self):
+        operation=date(2026,9,6);now=datetime(2026,9,6,9,31,tzinfo=JST);state=automation.create_state(operation,"run",now);item=state["stores"][STORE_BIGMARCH]
+        process=ProcessResult(0,now.isoformat(),now.isoformat(),0.1,"log")
+        verified=VerificationResult("PROVISIONAL",True,artifacts=["p"],details={"latest_data_date":"2026-09-04"})
+        with patch.object(automation,"save_state"),patch.object(automation,"run_logged_subprocess",return_value=process),patch.object(automation,"verify_big_march_provisional_completion",return_value=verified),patch.object(automation,"_record_history") as history:
+            automation._run_big_march_provisional(state,Path("unused"),operation,now,lambda:now)
+        self.assertEqual(item["status"],"PROVISIONAL");self.assertEqual(item["pipeline_attempt_count"],0);self.assertEqual(item["provisional_attempt_count"],1);self.assertEqual(item["provisional_latest_data_date"],"2026-09-04");self.assertEqual(item["provisional_artifacts"],["p"]);history.assert_called_once()
+
+    def test_formal_or_prior_provisional_attempt_prevents_new_provisional_run(self):
+        operation=date(2026,9,6);now=datetime(2026,9,6,9,31,tzinfo=JST)
+        state=automation.create_state(operation,"run",now);state["stores"][STORE_BIGMARCH]["pipeline_attempt_count"]=1
+        with patch.object(automation,"save_state"),patch.object(automation,"run_logged_subprocess") as run:
+            automation._run_big_march_provisional(state,Path("unused"),operation,now,lambda:now)
+        run.assert_not_called();self.assertEqual(state["stores"][STORE_BIGMARCH]["status"],"FAILED_FINAL")
+        state=automation.create_state(operation,"run",now);state["stores"][STORE_BIGMARCH]["provisional_attempt_count"]=1
+        with patch.object(automation,"save_state"),patch.object(automation,"verify_big_march_provisional_completion",return_value=VerificationResult("INVALID_PROVISIONAL",False,"bad")),patch.object(automation,"run_logged_subprocess") as run:
+            automation._run_big_march_provisional(state,Path("unused"),operation,now,lambda:now)
+        run.assert_not_called();self.assertEqual(state["stores"][STORE_BIGMARCH]["status"],"NEEDS_MANUAL_REVIEW")
 
 
 if __name__ == "__main__":
