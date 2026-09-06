@@ -6,6 +6,14 @@ import re
 
 import pandas as pd
 
+from slotanalyzer_derived_prediction_evidence import (
+    AlreadyFrozenError,
+    build_metadata,
+    exclusive_write_csv,
+    generation_preflight,
+    sha256_file,
+)
+
 
 # ============================================================
 # 74 - A-Type Separated Prediction
@@ -518,6 +526,19 @@ def main() -> None:
         )
     )
 
+    try:
+        source_evidence, _ = generation_preflight(
+            PROJECT_ROOT,
+            ANALYSIS_DIR.parent,
+            OUTPUT_DIR,
+            SOURCE_64_DIR,
+            target_date.date(),
+            "A_TYPE",
+        )
+    except AlreadyFrozenError:
+        print("74 A-TYPE            : ALREADY_FROZEN (strict verification passed)")
+        return
+
     print(
         f"source 64 file        : {source_path}"
     )
@@ -652,37 +673,44 @@ def main() -> None:
         / f"74_A_type_prediction_{ymd}_metadata.csv"
     )
 
-    a_type.to_csv(
+    # Re-check the formal window, target-data absence, source lineage, and
+    # frozen-set state immediately before the first exclusive write.
+    source_evidence, generated_at_jst = generation_preflight(
+        PROJECT_ROOT,
+        ANALYSIS_DIR.parent,
+        OUTPUT_DIR,
+        SOURCE_64_DIR,
+        target_date.date(),
+        "A_TYPE",
+    )
+
+    exclusive_write_csv(
+        a_type,
         all_a_path,
-        index=False,
-        encoding="utf-8-sig",
     )
 
-    top10.to_csv(
+    exclusive_write_csv(
+        top10,
         top10_path,
-        index=False,
-        encoding="utf-8-sig",
     )
 
-    review.to_csv(
+    exclusive_write_csv(
+        review,
         review_path,
-        index=False,
-        encoding="utf-8-sig",
     )
 
-    metadata = pd.DataFrame(
-        [
-            {
-                "target_date":
-                    target_date.date(),
-                "source_64_file":
-                    source_path.name,
-                "source_model":
-                    (
-                        source["tier"]
-                        .notna()
-                        .any()
-                    ),
+    metadata = pd.DataFrame([build_metadata(
+        source_evidence,
+        generated_at_jst,
+        {
+            "all_file": all_a_path.name,
+            "top10_file": top10_path.name,
+            "candidate_review_file": review_path.name,
+            "all_sha256": sha256_file(all_a_path),
+            "top10_sha256": sha256_file(top10_path),
+            "candidate_review_sha256": sha256_file(review_path),
+        },
+        {
                 "source_rows":
                     int(
                         len(source)
@@ -703,14 +731,12 @@ def main() -> None:
                     "conservative_name_whitelist",
                 "a_type_specific_bb_rb_model":
                     False,
-            }
-        ]
-    )
+        },
+    )])
 
-    metadata.to_csv(
+    exclusive_write_csv(
+        metadata,
         metadata_path,
-        index=False,
-        encoding="utf-8-sig",
     )
 
     header(

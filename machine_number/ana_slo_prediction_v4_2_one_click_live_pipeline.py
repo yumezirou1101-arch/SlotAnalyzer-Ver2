@@ -9,6 +9,15 @@ import re
 
 import pandas as pd
 
+from ana_slo_prediction_v4_2_forward_guard import (
+    validate_forward_time,
+    validate_target_actual_absent,
+)
+from slotanalyzer_derived_prediction_evidence import (
+    inspect_frozen_set,
+    verify_source_64,
+)
+
 
 # ============================================================
 # 79 - One-Click Live Prediction Pipeline
@@ -270,6 +279,49 @@ def require_file(
     )
 
 
+def run_or_reuse_derived(
+    stage_name: str,
+    stage_key: str,
+    script_path: Path,
+    output_dir: Path,
+    target_date: pd.Timestamp,
+    kind: str,
+) -> dict:
+    verification = inspect_frozen_set(
+        output_dir,
+        DIR_64,
+        target_date.date(),
+        kind,
+    )
+    if verification is None:
+        _, elapsed = run_stage(
+            stage_name,
+            script_path,
+            ["--target-date", target_date.strftime("%Y-%m-%d")],
+        )
+        verification = inspect_frozen_set(
+            output_dir,
+            DIR_64,
+            target_date.date(),
+            kind,
+        )
+        if verification is None:
+            raise RuntimeError(f"{stage_name}: formal frozen set was not produced")
+        stage_status = "OK"
+    else:
+        elapsed = 0.0
+        stage_status = "ALREADY_FROZEN"
+        print(f"{stage_name:<22}: ALREADY_FROZEN (strict verification passed)")
+    return {
+        "stage": stage_key,
+        "elapsed_sec": elapsed,
+        "status": stage_status,
+        "prediction_class": verification.prediction_class,
+        "metadata_sha256": verification.metadata_sha256,
+        "verified_artifacts": "|".join(str(path) for path in verification.paths),
+    }
+
+
 def main() -> None:
     args = parse_args()
 
@@ -309,17 +361,38 @@ def main() -> None:
             "--allow-gap"
         )
 
-    _, elapsed = run_stage(
-        "64 NORMAL",
-        SCRIPT_64,
-        args64,
+    requested_target = (
+        pd.Timestamp(pd.to_datetime(args.target_date, format="%Y-%m-%d", errors="raise")).normalize()
+        if args.target_date else None
     )
+    existing64 = []
+    if requested_target is not None:
+        existing64 = [
+            DIR_64 / f"64_prediction_{requested_target:%Y%m%d}_all514.csv",
+            DIR_64 / f"64_prediction_{requested_target:%Y%m%d}_top10.csv",
+            DIR_64 / f"64_prediction_{requested_target:%Y%m%d}_metadata.csv",
+        ]
+    existing64_count = sum(path.exists() for path in existing64)
+    if existing64 and existing64_count == len(existing64):
+        verify_source_64(DIR_64, requested_target.date())
+        validate_forward_time(requested_target)
+        validate_target_actual_absent(PROJECT_ROOT, ANALYSIS_DIR.parent, requested_target)
+        elapsed = 0.0
+        normal_status = "ALREADY_FROZEN"
+        print("64 NORMAL             : ALREADY_FROZEN (strict verification passed)")
+    elif existing64_count:
+        raise RuntimeError(
+            f"64 NORMAL PARTIAL_FROZEN_OUTPUT: {existing64_count}/{len(existing64)} files exist"
+        )
+    else:
+        _, elapsed = run_stage("64 NORMAL", SCRIPT_64, args64)
+        normal_status = "OK"
 
     stage_rows.append(
         {
             "stage": "64_NORMAL",
             "elapsed_sec": elapsed,
-            "status": "OK",
+            "status": normal_status,
         }
     )
 
@@ -378,23 +451,11 @@ def main() -> None:
     # 74
     # --------------------------------------------------------
 
-    _, elapsed = run_stage(
-        "74 A-TYPE",
-        SCRIPT_74,
-        [
-            "--target-date",
-            target_date.strftime(
-                "%Y-%m-%d"
-            ),
-        ],
-    )
-
     stage_rows.append(
-        {
-            "stage": "74_A_TYPE",
-            "elapsed_sec": elapsed,
-            "status": "OK",
-        }
+        run_or_reuse_derived(
+            "74 A-TYPE", "74_A_TYPE", SCRIPT_74,
+            DIR_74, target_date, "A_TYPE",
+        )
     )
 
     a_top10 = (
@@ -415,23 +476,11 @@ def main() -> None:
     # 75
     # --------------------------------------------------------
 
-    _, elapsed = run_stage(
-        "75 JUGGLER",
-        SCRIPT_75,
-        [
-            "--target-date",
-            target_date.strftime(
-                "%Y-%m-%d"
-            ),
-        ],
-    )
-
     stage_rows.append(
-        {
-            "stage": "75_JUGGLER",
-            "elapsed_sec": elapsed,
-            "status": "OK",
-        }
+        run_or_reuse_derived(
+            "75 JUGGLER", "75_JUGGLER", SCRIPT_75,
+            DIR_75, target_date, "JUGGLER",
+        )
     )
 
     j_top10 = (

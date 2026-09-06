@@ -6,6 +6,14 @@ import re
 
 import pandas as pd
 
+from slotanalyzer_derived_prediction_evidence import (
+    AlreadyFrozenError,
+    build_metadata,
+    exclusive_write_csv,
+    generation_preflight,
+    sha256_file,
+)
+
 
 # ============================================================
 # 75 - Juggler Separated Prediction
@@ -164,6 +172,19 @@ def main() -> None:
 
     target_date, source_path = resolve_source_file(requested_target)
 
+    try:
+        source_evidence, _ = generation_preflight(
+            PROJECT_ROOT,
+            ANALYSIS_DIR.parent,
+            OUTPUT_DIR,
+            SOURCE_64_DIR,
+            target_date.date(),
+            "JUGGLER",
+        )
+    except AlreadyFrozenError:
+        print("75 JUGGLER           : ALREADY_FROZEN (strict verification passed)")
+        return
+
     print(f"source 64 file        : {source_path}")
     print(f"prediction target     : {target_date.date()}")
 
@@ -241,14 +262,29 @@ def main() -> None:
     top10_path = OUTPUT_DIR / f"75_Juggler_prediction_{ymd}_top10.csv"
     metadata_path = OUTPUT_DIR / f"75_Juggler_prediction_{ymd}_metadata.csv"
 
-    juggler.to_csv(all_path, index=False, encoding="utf-8-sig")
-    top10.to_csv(top10_path, index=False, encoding="utf-8-sig")
+    # Repeat every mutable formal check immediately before exclusive save.
+    source_evidence, generated_at_jst = generation_preflight(
+        PROJECT_ROOT,
+        ANALYSIS_DIR.parent,
+        OUTPUT_DIR,
+        SOURCE_64_DIR,
+        target_date.date(),
+        "JUGGLER",
+    )
 
-    metadata = pd.DataFrame(
-        [
-            {
-                "target_date": target_date.date(),
-                "source_64_file": source_path.name,
+    exclusive_write_csv(juggler, all_path)
+    exclusive_write_csv(top10, top10_path)
+
+    metadata = pd.DataFrame([build_metadata(
+        source_evidence,
+        generated_at_jst,
+        {
+            "all_file": all_path.name,
+            "top10_file": top10_path.name,
+            "all_sha256": sha256_file(all_path),
+            "top10_sha256": sha256_file(top10_path),
+        },
+        {
                 "source_rows": len(source),
                 "juggler_machines": len(juggler),
                 "top_n": TOP_N,
@@ -258,11 +294,10 @@ def main() -> None:
                 "a_type_prediction_modified": False,
                 "classification_policy": "machine_name_contains_ジャグラー",
                 "juggler_specific_bb_rb_model": False,
-            }
-        ]
-    )
+        },
+    )])
 
-    metadata.to_csv(metadata_path, index=False, encoding="utf-8-sig")
+    exclusive_write_csv(metadata, metadata_path)
 
     header("FILES SAVED")
     for path in (all_path, top10_path, metadata_path):
