@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from slotanalyzer_derived_prediction_evidence import verify_derived_prediction
+
 
 JST = ZoneInfo("Asia/Tokyo")
 CDP_VERSION_URL = "http://127.0.0.1:9222/json/version"
@@ -740,7 +742,24 @@ def verify_maruhan_completion(project_root: Path, operation_date: date) -> Verif
         return VerificationResult(
             "COMPLETE_64_INCOMPLETE_PIPELINE", False, f"{type(exc).__name__}: {exc}", [str(p) for p in files64 + files77 + [status79]]
         )
-    artifacts = [str(path) for path in files64 + files77 + [status79]]
+    try:
+        derived74 = verify_derived_prediction(
+            analysis / "74_Ver4_2_A_type_prediction", dir64,
+            operation_date, "A_TYPE",
+        )
+        derived75 = verify_derived_prediction(
+            analysis / "75_Ver4_2_Juggler_prediction", dir64,
+            operation_date, "JUGGLER",
+        )
+    except Exception as exc:
+        return VerificationResult(
+            "INVALID_DERIVED_PREDICTION", False,
+            f"{type(exc).__name__}: {exc}", [str(p) for p in files64],
+        )
+    artifacts = [
+        str(path) for path in
+        files64 + list(derived74.paths) + list(derived75.paths) + files77 + [status79]
+    ]
     return VerificationResult("COMPLETE", True, artifacts=artifacts)
 
 

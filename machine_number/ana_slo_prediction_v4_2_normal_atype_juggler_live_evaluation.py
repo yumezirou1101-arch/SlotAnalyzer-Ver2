@@ -6,6 +6,8 @@ import re
 import numpy as np
 import pandas as pd
 
+from slotanalyzer_derived_prediction_evaluation import evaluate_formal_predictions
+
 
 # ============================================================
 # 76 - Normal / A-Type / Juggler Live Prediction Evaluation
@@ -959,6 +961,15 @@ def main():
     )
     print(
         "Normal / A-type / Juggler predictions were not modified."
+    )
+
+    # Phase 2-B formal outputs are additive. The four legacy 76 outputs above
+    # remain unchanged for backward compatibility.
+    evaluate_formal_predictions(
+        PROJECT_ROOT,
+        DATA_DIR,
+        ANALYSIS_DIR,
+        OUTPUT_DIR,
     )
 
 

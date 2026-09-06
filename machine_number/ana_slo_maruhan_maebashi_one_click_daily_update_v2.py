@@ -100,6 +100,11 @@ SCRIPT_69 = (
     / "ana_slo_prediction_v4_2_live_prediction_backtest.py"
 )
 
+SCRIPT_76 = (
+    MACHINE_DIR
+    / "ana_slo_prediction_v4_2_normal_atype_juggler_live_evaluation.py"
+)
+
 SCRIPT_FORWARD = (
     MACHINE_DIR
     / "ana_slo_prediction_v4_2_forward_champion_challenger.py"
@@ -1272,6 +1277,15 @@ def main() -> None:
     print(
         f"69 evaluation status : {backtest_69_summary}"
     )
+
+    # Evaluate the already-frozen 74/75 predictions after the corresponding
+    # actual daily data is available. This does not modify prediction files.
+    elapsed = run_stage(
+        "STEP 3B / 5 - A-TYPE / JUGGLER FORMAL EVALUATION 76",
+        SCRIPT_76,
+        history_stage="76_FORMAL_EVALUATION",
+    )
+    stage_rows.append(("76 FORMAL EVALUATION", elapsed))
 
     # --------------------------------------------------------
     # 4) 63 FORWARD TRACKING

@@ -27,6 +27,8 @@ from slotanalyzer_morning_automation_support import (
     verify_maruhan_completion,
     verify_yasuda_completion,
 )
+from slotanalyzer_derived_prediction_evidence import sha256_file, verify_derived_prediction
+from slotanalyzer_derived_prediction_evaluation import validate_actual_quality
 
 
 CREDENTIAL_TARGET = "SlotAnalyzer_Gmail_SMTP"
@@ -85,6 +87,20 @@ class StoreSection:
 @dataclass(frozen=True)
 class YesterdayNormalEvaluation:
     target_date: date
+    status: str
+    message: str
+    detail_rows: list[dict[str, str]]
+    summary_rows: list[dict[str, str]]
+
+    @property
+    def formal(self) -> bool:
+        return self.status == "EVALUATED_FORWARD_VALID"
+
+
+@dataclass(frozen=True)
+class YesterdayDerivedEvaluation:
+    target_date: date
+    category: str
     status: str
     message: str
     detail_rows: list[dict[str, str]]
@@ -415,6 +431,115 @@ def _signed_medals(value: str) -> str:
     return f"+{number:,.0f}" if number > 0 else f"{number:,.0f}"
 
 
+def _load_yesterday_derived_evaluation(
+    root: Path,
+    operation_date: date,
+    category: str,
+) -> YesterdayDerivedEvaluation:
+    target_date = operation_date - timedelta(days=1)
+    label = "A-TYPE" if category == "A_TYPE" else "JUGGLER"
+    base = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep"
+    eval_dir = base / "76_Normal_AType_Juggler_live_evaluation"
+    prefix = "74_A_type_prediction" if category == "A_TYPE" else "75_Juggler_prediction"
+    derived_dir_name = "74_Ver4_2_A_type_prediction" if category == "A_TYPE" else "75_Ver4_2_Juggler_prediction"
+    kind = category
+    try:
+        status_rows = [row for row in _exact_date_rows(_read_rows(eval_dir / "76_formal_status.csv"), target_date) if row.get("category") == category]
+        if len(status_rows) != 1:
+            return YesterdayDerivedEvaluation(target_date, label, "NOT_EVALUATED", f"{label} 前日正式結果: 未確定", [], [])
+        status = status_rows[0]
+        evaluation_status = status.get("status", "")
+        prediction_class = status.get("prediction_class", "")
+        if evaluation_status != "EVALUATED_FORWARD_VALID" or prediction_class != "FORWARD_VALID":
+            message = (
+                "Legacy predictionのため正式成績対象外"
+                if "LEGACY_UNVERIFIED" in evaluation_status or prediction_class == "LEGACY_UNVERIFIED"
+                else "Forward Guard不成立のため正式成績対象外"
+                if "FORWARD_GUARD_FAIL" in evaluation_status or prediction_class == "FORWARD_GUARD_FAIL"
+                else f"{label} 前日正式結果: 未確定"
+            )
+            return YesterdayDerivedEvaluation(target_date, label, evaluation_status or "NOT_EVALUATED", message, [], [])
+
+        coverage_rows = [row for row in _exact_date_rows(_read_rows(eval_dir / "76_formal_coverage.csv"), target_date) if row.get("category") == category]
+        if len(coverage_rows) != 1:
+            raise ValueError("derived coverage row is missing or duplicated")
+        coverage = coverage_rows[0]
+        required_true = (
+            "prediction_exists", "actual_exists", "prediction_quality_ok", "actual_quality_ok",
+            "formal_evidence_ok", "rank1_10_complete", "formal_evaluation_complete",
+            "actual_filename_date_ok", "actual_internal_date_ok",
+        )
+        if any(coverage.get(key, "").lower() != "true" for key in required_true):
+            raise ValueError("derived coverage is incomplete")
+        if coverage.get("prediction_class") != "FORWARD_VALID" or coverage.get("evaluation_status") != "EVALUATED_FORWARD_VALID":
+            raise ValueError("derived coverage class/status mismatch")
+        if int(coverage.get("detail_rank_count", "0")) != 10:
+            raise ValueError("derived coverage detail count mismatch")
+
+        detail_rows = [row for row in _exact_date_rows(_read_rows(eval_dir / "76_formal_detail.csv"), target_date) if row.get("category") == category]
+        daily_rows = [row for row in _exact_date_rows(_read_rows(eval_dir / "76_formal_daily.csv"), target_date) if row.get("category") == category]
+        ranks = {int(row.get("rank", "0")) for row in detail_rows}
+        machine_numbers = [row.get("machine_no", "") for row in detail_rows]
+        prediction_sha = status.get("prediction_sha256", "").lower()
+        metadata_sha = status.get("metadata_sha256", "").lower()
+        actual_sha = status.get("actual_sha256", "").lower()
+        if len(detail_rows) != 10 or ranks != set(range(1, 11)) or len(set(machine_numbers)) != 10:
+            raise ValueError("derived detail rank/machine completeness failure")
+        for row in detail_rows:
+            if row.get("prediction_class") != "FORWARD_VALID" or row.get("evaluation_status") != "EVALUATED_FORWARD_VALID":
+                raise ValueError("derived detail is not formal")
+            if row.get("actual_win") not in {"0", "1"}:
+                raise ValueError("derived actual_win is invalid")
+            float(row["score"]); float(row["actual_diff"])
+
+        required_bands = {"TOP3", "TOP5", "TOP10"}
+        summary_rows = [row for row in daily_rows if row.get("band") in required_bands]
+        if len(summary_rows) != 3 or {row.get("band") for row in summary_rows} != required_bands:
+            raise ValueError("derived daily summary is incomplete")
+        expected_n = {"TOP3": 3, "TOP5": 5, "TOP10": 10}
+        for row in summary_rows:
+            if row.get("prediction_class") != "FORWARD_VALID" or row.get("evaluation_status") != "EVALUATED_FORWARD_VALID":
+                raise ValueError("derived daily summary is not formal")
+            if int(row.get("n", "0")) != expected_n[row["band"]]:
+                raise ValueError("derived daily summary count mismatch")
+        all_evidence_rows = detail_rows + summary_rows + [coverage]
+        if not prediction_sha or {row.get("prediction_sha256", "").lower() for row in all_evidence_rows} != {prediction_sha}:
+            raise ValueError("derived prediction SHA differs across status/detail/daily/coverage")
+        if not metadata_sha or {row.get("metadata_sha256", "").lower() for row in all_evidence_rows} != {metadata_sha}:
+            raise ValueError("derived metadata SHA differs across status/detail/daily/coverage")
+        if not actual_sha or {row.get("actual_sha256", "").lower() for row in all_evidence_rows} != {actual_sha}:
+            raise ValueError("derived actual SHA differs across status/detail/daily/coverage")
+
+        verification = verify_derived_prediction(
+            base / derived_dir_name,
+            base / "64_Ver4_2_future_top10",
+            target_date,
+            kind,
+        )
+        expected_prediction = base / derived_dir_name / f"{prefix}_{target_date:%Y%m%d}_top10.csv"
+        if Path(status.get("prediction_path", "")) != expected_prediction:
+            raise ValueError("derived status prediction path mismatch")
+        if sha256_file(expected_prediction) != prediction_sha or verification.metadata_sha256 != metadata_sha:
+            raise ValueError("current derived artifact SHA mismatch")
+        actual_path = Path(status.get("actual_path", ""))
+        expected_actual = root / "data/maruhan_maebashi/machine_number" / f"ana_slo_{target_date:%Y%m%d}.csv"
+        if actual_path != expected_actual:
+            raise ValueError("derived actual filename mismatch")
+        validate_actual_quality(actual_path, target_date)
+        if sha256_file(actual_path) != actual_sha:
+            raise ValueError("current actual SHA mismatch")
+
+        detail_rows.sort(key=lambda row: int(row["rank"]))
+        order = {"TOP3": 3, "TOP5": 5, "TOP10": 10}
+        summary_rows.sort(key=lambda row: order[row["band"]])
+        return YesterdayDerivedEvaluation(target_date, label, evaluation_status, "", detail_rows, summary_rows)
+    except Exception as exc:
+        return YesterdayDerivedEvaluation(
+            target_date, label, "RESULT_READ_ERROR",
+            f"{label} 前日結果取得エラー（{type(exc).__name__}: {exc}）", [], [],
+        )
+
+
 def _rate(value: str) -> str:
     return f"{float(value):.1f}%"
 
@@ -489,6 +614,71 @@ def _render_yesterday_html(result: YesterdayNormalEvaluation) -> str:
             f'<div style="font-size:13px;white-space:nowrap">平均 {_signed_medals(row["avg_diff"])}枚 ｜ 勝率 {_rate(row["win_rate"])}</div>',
             f'<div style="font-size:13px;white-space:nowrap">+1,000 {_rate(row["plus1000_rate"])} ｜ '
             f'+2,000 {_rate(row["plus2000_rate"])} ｜ {html.escape(row["selected_n"])}台</div>',
+            '</div>',
+        ])
+    parts.append('</section>')
+    return "".join(parts)
+
+
+def _render_yesterday_derived_plain(result: YesterdayDerivedEvaluation) -> str:
+    lines = [f"【前日 {result.category} 正式結果】"]
+    if not result.formal:
+        lines.append(result.message)
+        return "\n".join(lines)
+    lines.append("EVALUATED_FORWARD_VALID")
+    for row in result.detail_rows:
+        outcome = "WIN" if row["actual_win"] == "1" else "LOSE"
+        lines.append(
+            f"{int(row['rank'])}. {row['machine_no']}番台　{row['machine_name']}　"
+            f"{_signed_medals(row['actual_diff'])}枚　{outcome} Score {float(row['score']):.2f}"
+        )
+    lines.append("集計（76 formal計算済み）:")
+    for row in result.summary_rows:
+        lines.append(
+            f"{row['band']}　{row['wins']}/{row['n']}勝　勝率 {_rate(row['win_rate'])}　"
+            f"平均 {_signed_medals(row['avg_diff'])}枚　合計 {_signed_medals(row['sum_diff'])}枚"
+        )
+    return "\n".join(lines)
+
+
+def _render_yesterday_derived_html(result: YesterdayDerivedEvaluation) -> str:
+    heading = html.escape(f"【前日 {result.category} 正式結果】")
+    if not result.formal:
+        return (
+            '<section style="margin:20px 0">'
+            f'<h3 style="margin:0 0 6px">{heading}</h3>'
+            f'<div style="color:#666">{html.escape(result.message)}</div></section>'
+        )
+    cell_style = "padding:7px 4px;vertical-align:top;font-size:13px"
+    parts = [
+        '<section style="margin:20px 0">',
+        f'<h3 style="margin:0 0 6px">{heading}</h3>',
+        '<div style="font-weight:bold;color:#176b32">EVALUATED_FORWARD_VALID</div>',
+    ]
+    for row in result.detail_rows:
+        outcome = "WIN" if row["actual_win"] == "1" else "LOSE"
+        color = "#176b32" if outcome == "WIN" else "#a33"
+        parts.extend([
+            '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;'
+            'border-collapse:collapse;margin-top:7px;border-bottom:1px solid #ddd">',
+            '<tr>',
+            f'<td width="9%" style="{cell_style};text-align:center;font-weight:bold;white-space:nowrap">{int(row["rank"])}</td>',
+            f'<td width="18%" style="{cell_style};text-align:center;white-space:nowrap">{html.escape(row["machine_no"])}</td>',
+            f'<td width="73%" style="{cell_style};overflow-wrap:anywhere;word-break:break-word">{html.escape(row["machine_name"])}</td>',
+            '</tr><tr><td colspan="3" style="padding:0 4px 8px">',
+            '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse"><tr>',
+            f'<td width="34%" style="font-size:13px;text-align:right;white-space:nowrap">{html.escape(_signed_medals(row["actual_diff"]))}枚</td>',
+            f'<td width="24%" style="font-size:13px;text-align:center;font-weight:bold;color:{color};white-space:nowrap">{outcome}</td>',
+            f'<td width="42%" style="font-size:12px;color:#666;white-space:nowrap">Score {float(row["score"]):.2f}</td>',
+            '</tr></table></td></tr></table>',
+        ])
+    parts.append('<h4 style="margin:16px 0 4px">集計（76 formal計算済み）</h4>')
+    for row in result.summary_rows:
+        parts.extend([
+            '<div style="margin:7px 0;padding:8px 10px;background:#f6f7f8;border-left:3px solid #777">',
+            f'<div style="font-weight:bold;white-space:nowrap">{html.escape(row["band"])}</div>',
+            f'<div style="font-size:13px;white-space:nowrap">{html.escape(row["wins"])}/{html.escape(row["n"])}勝 ｜ 勝率 {_rate(row["win_rate"])}</div>',
+            f'<div style="font-size:13px;white-space:nowrap">平均 {_signed_medals(row["avg_diff"])}枚 ｜ 合計 {_signed_medals(row["sum_diff"])}枚</div>',
             '</div>',
         ])
     parts.append('</section>')
@@ -751,6 +941,12 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
     yesterday = _load_yesterday_normal_evaluation(
         state, project_root, operation_date
     )
+    yesterday_atype = _load_yesterday_derived_evaluation(
+        project_root, operation_date, "A_TYPE"
+    )
+    yesterday_juggler = _load_yesterday_derived_evaluation(
+        project_root, operation_date, "JUGGLER"
+    )
     warning_text = "\n".join(f"⚠ {value}" for value in dict.fromkeys(warnings)) or "異常警告: なし"
     today_plain = "\n\n".join(
         _render_section_plain(section, include_details=False) for section in sections
@@ -761,6 +957,8 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
         f"overall status: {overall}\n" + "\n".join(summaries) + "\n\n" + warning_text
         + "\n\n" + today_plain
         + "\n\n" + _render_yesterday_plain(yesterday)
+        + "\n\n" + _render_yesterday_derived_plain(yesterday_atype)
+        + "\n\n" + _render_yesterday_derived_plain(yesterday_juggler)
         + (("\n\n" + detail_plain) if detail_plain else "")
     )
     summary_html = "".join(f"<div>{html.escape(value)}</div>" for value in summaries)
@@ -775,6 +973,8 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
         _render_section_html(section, include_details=False) for section in sections
     )
     yesterday_html = _render_yesterday_html(yesterday)
+    yesterday_atype_html = _render_yesterday_derived_html(yesterday_atype)
+    yesterday_juggler_html = _render_yesterday_derived_html(yesterday_juggler)
     details_html = _render_details_html(sections)
     html_body = (
         '<html><body style="margin:0;padding:12px;font-family:sans-serif;line-height:1.45;color:#222">'
@@ -785,6 +985,8 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
         f'<div style="margin:12px 0;padding:9px;background:#fff4e5;border-left:4px solid #e67e22">{warnings_html}</div>'
         f'{sections_html}'
         f'{yesterday_html}'
+        f'{yesterday_atype_html}'
+        f'{yesterday_juggler_html}'
         f'{details_html}'
         "</body></html>"
     )
