@@ -48,7 +48,14 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     verify_store_completion,
 )
 from slotanalyzer_morning_notification import send_notification_best_effort  # noqa: E402
-from slotanalyzer_inventory_guard import assess_inventory_guard  # noqa: E402
+from slotanalyzer_inventory_guard import (  # noqa: E402
+    assess_inventory_guard,
+    assess_yasuda_inventory_guard,
+)
+from slotanalyzer_inventory_monitor import (  # noqa: E402
+    load_inventory_monitor_evidence,
+    observe_big_march_inventory_best_effort,
+)
 
 
 LOG_ROOT = PROJECT_ROOT / "logs" / "morning_automation"
@@ -167,6 +174,7 @@ def blank_store_state(store: str, operation_date: date) -> dict:
         "error_category": "",
         "error": "",
         "inventory_guard": {},
+        "inventory_monitor": {},
         "verified_artifacts": [],
     }
 
@@ -304,7 +312,15 @@ def reconcile_startup_state(
         store_state.setdefault("catchup_daily_path", "")
         store_state.setdefault("catchup_source_sha256", "")
         store_state.setdefault("catchup_daily_sha256", "")
+        store_state.setdefault("inventory_guard", {})
+        store_state.setdefault("inventory_monitor", {})
         if store == STORE_BIGMARCH:
+            recovered_monitor = load_inventory_monitor_evidence(
+                project_root / "data/bigmarch_takasaki_oyagi/machine_number",
+                operation_date,
+            )
+            if recovered_monitor:
+                store_state["inventory_monitor"] = recovered_monitor
             provisional = verify_big_march_provisional_completion(
                 project_root, operation_date
             )
@@ -345,6 +361,31 @@ def reconcile_startup_state(
                         last_completed_at_jst=current.isoformat(),
                     )
                 continue
+        if store == STORE_YASUDA:
+            yasuda_verification = verify_store_completion(
+                store, project_root, operation_date
+            )
+            if (
+                yasuda_verification.ok
+                and store_state["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
+            ):
+                inventory_guard = assess_yasuda_inventory_guard(
+                    project_root / "data/yasuda_maebashi/machine_number",
+                    operation_date,
+                    operation_date - timedelta(days=1),
+                )
+                store_state["inventory_guard"] = inventory_guard.to_dict()
+                if inventory_guard.blocked:
+                    store_state.update(
+                        status="NEEDS_MANUAL_REVIEW",
+                        current_stage="INVENTORY_GUARD",
+                        error_category="INVENTORY_GUARD_BLOCKED",
+                        error=inventory_guard.summary(),
+                        verified_artifacts=yasuda_verification.artifacts,
+                        last_completed_at_jst=current.isoformat(),
+                        next_retry_at_jst="",
+                    )
+                    continue
         if store == STORE_MARUHAN:
             inventory_guard = assess_inventory_guard(
                 project_root / "data/maruhan_maebashi/machine_number",
@@ -439,6 +480,26 @@ def reconcile_startup_state(
                 )
 
 
+def _observe_big_march_inventory(
+    project_root: Path, operation_date: date, current: datetime
+) -> dict:
+    """Observe inventory without allowing monitor status to affect control flow."""
+    result = observe_big_march_inventory_best_effort(
+        project_root / "data/bigmarch_takasaki_oyagi/machine_number",
+        operation_date,
+        generated_at_jst=current.astimezone(JST),
+    )
+    if result.get("status") in {
+        "ERROR", "SOURCE_CHANGED_AFTER_OBSERVATION", "COMPARISON_UNAVAILABLE"
+    }:
+        print(
+            "WARNING: Big March inventory monitor: "
+            f"{result.get('status')}: {result.get('error', '')}",
+            file=sys.stderr,
+        )
+    return result
+
+
 def _run_big_march_provisional(
     state: dict,
     state_path: Path,
@@ -510,6 +571,9 @@ def _run_big_march_provisional(
     )
     completed = clock().astimezone(JST)
     if result.returncode == 0 and verification.ok:
+        store_state["inventory_monitor"] = _observe_big_march_inventory(
+            PROJECT_ROOT, operation_date, completed
+        )
         status = "PROVISIONAL"
         category = ""
         error = ""
@@ -610,6 +674,9 @@ def _run_big_march_catchup(
                 catchup_daily_path=verification.artifacts[0],
                 catchup_daily_sha256=verification.details.get("sha256", ""),
             )
+            store_state["inventory_monitor"] = _observe_big_march_inventory(
+                PROJECT_ROOT, operation_date, current
+            )
         return True
 
     for candidate_text in assessment.candidate_dates:
@@ -691,6 +758,10 @@ def _run_big_march_catchup(
             )
             save_state(state_path, state, completed)
             return False
+
+        store_state["inventory_monitor"] = _observe_big_march_inventory(
+            PROJECT_ROOT, operation_date, completed
+        )
 
         converted_dates = list(store_state.get("catchup_converted_dates", []))
         if candidate_text not in converted_dates:
@@ -966,6 +1037,19 @@ def _process_store(
         store_state["inventory_guard"] = inventory_guard.to_dict()
         if inventory_guard.blocked:
             classification = "NEEDS_MANUAL_REVIEW"
+    elif store == STORE_YASUDA and verification.ok:
+        inventory_guard = assess_yasuda_inventory_guard(
+            PROJECT_ROOT / "data/yasuda_maebashi/machine_number",
+            operation_date,
+            expected_data_date,
+        )
+        store_state["inventory_guard"] = inventory_guard.to_dict()
+        if inventory_guard.blocked:
+            classification = "NEEDS_MANUAL_REVIEW"
+    elif store == STORE_BIGMARCH and verification.ok:
+        store_state["inventory_monitor"] = _observe_big_march_inventory(
+            PROJECT_ROOT, operation_date, clock().astimezone(JST)
+        )
     completed = clock().astimezone(JST)
     store_state.update(
         status=classification,

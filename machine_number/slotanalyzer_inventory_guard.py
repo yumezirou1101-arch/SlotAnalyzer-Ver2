@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -26,6 +28,10 @@ MARUHAN_MAEBASHI_POLICY = InventoryGuardPolicy(
     store="MARUHAN_MAEBASHI",
     known_change_dates=frozenset({date(2026, 9, 8)}),
     confirmed_inventory_prefix="maruhan_inventory",
+)
+YASUDA_MAEBASHI_POLICY = InventoryGuardPolicy(
+    store="YASUDA_MAEBASHI",
+    daily_inventory_pattern="ana_slo_{ymd}.csv",
 )
 KNOWN_INVENTORY_CHANGE_DATES = MARUHAN_MAEBASHI_POLICY.known_change_dates
 
@@ -65,6 +71,39 @@ class InventoryDiff:
         value = asdict(self)
         value["has_changes"] = self.has_changes
         return value
+
+
+@dataclass(frozen=True)
+class InventoryComparisonEvidence:
+    schema_version: int
+    policy_version: str
+    mode: str
+    store: str
+    previous_date: str
+    current_date: str
+    calendar_gap_days: int
+    comparison_performed: bool
+    comparison_status: str
+    previous_machine_count: int | None
+    current_machine_count: int | None
+    added_machine_numbers: list[int] | None
+    removed_machine_numbers: list[int] | None
+    renamed_machine_numbers: list[RenamedMachine] | None
+    added_count: int | None
+    removed_count: int | None
+    renamed_count: int | None
+    changed_machine_count: int | None
+    change_rate: float | None
+    has_changes: bool | None
+    previous_daily_path: str
+    current_daily_path: str
+    previous_daily_sha256: str
+    current_daily_sha256: str
+    machine_name_comparison: str = "EXACT_STRING"
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -183,6 +222,143 @@ def compare_inventory_files(
         added_machine_numbers=sorted(current_numbers - previous_numbers),
         removed_machine_numbers=sorted(previous_numbers - current_numbers),
         renamed_machine_numbers=renamed,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _inventory_file_date(path: Path) -> date | None:
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = set(reader.fieldnames or [])
+        date_column = "date" if "date" in fields else "日付" if "日付" in fields else None
+        if date_column is None:
+            return None
+        values = {str(row.get(date_column, "")).strip() for row in reader}
+    if len(values) != 1 or "" in values:
+        raise RuntimeError(f"Inventory contains invalid dates: {path}")
+    try:
+        return date.fromisoformat(values.pop())
+    except ValueError as exc:
+        raise RuntimeError(f"Inventory contains an invalid date: {path}") from exc
+
+
+def inspect_inventory_transition(
+    store: str,
+    previous_path: Path,
+    current_path: Path,
+    previous_date: date,
+    current_date: date,
+    *,
+    policy_version: str = "INVENTORY_DIFF_V1",
+    mode: str = "READ_ONLY",
+) -> InventoryComparisonEvidence:
+    """Read and compare two inventories without writing files or state."""
+    previous_path = Path(previous_path)
+    current_path = Path(current_path)
+    previous_date = date.fromisoformat(str(previous_date))
+    current_date = date.fromisoformat(str(current_date))
+    gap = (current_date - previous_date).days
+    base = {
+        "schema_version": 1,
+        "policy_version": policy_version,
+        "mode": mode,
+        "store": store,
+        "previous_date": previous_date.isoformat(),
+        "current_date": current_date.isoformat(),
+        "calendar_gap_days": gap,
+        "previous_daily_path": str(previous_path),
+        "current_daily_path": str(current_path),
+        "previous_daily_sha256": "",
+        "current_daily_sha256": "",
+    }
+    empty = {
+        "comparison_performed": False,
+        "previous_machine_count": None,
+        "current_machine_count": None,
+        "added_machine_numbers": None,
+        "removed_machine_numbers": None,
+        "renamed_machine_numbers": None,
+        "added_count": None,
+        "removed_count": None,
+        "renamed_count": None,
+        "changed_machine_count": None,
+        "change_rate": None,
+        "has_changes": None,
+    }
+    if gap != 1:
+        return InventoryComparisonEvidence(
+            **base, **empty, comparison_status="NON_CONSECUTIVE"
+        )
+    if not previous_path.is_file() or previous_path.stat().st_size <= 0:
+        return InventoryComparisonEvidence(
+            **base, **empty, comparison_status="PREVIOUS_MISSING",
+            error=f"Previous inventory is missing or empty: {previous_path}",
+        )
+    if not current_path.is_file() or current_path.stat().st_size <= 0:
+        return InventoryComparisonEvidence(
+            **base, **empty, comparison_status="CURRENT_MISSING",
+            error=f"Current inventory is missing or empty: {current_path}",
+        )
+    try:
+        previous_sha = _sha256_file(previous_path)
+        previous_inventory = _load_inventory(previous_path)
+        embedded = _inventory_file_date(previous_path)
+        if embedded is not None and embedded != previous_date:
+            raise RuntimeError("Previous inventory date does not match the requested date.")
+    except Exception as exc:
+        return InventoryComparisonEvidence(
+            **base, **empty, comparison_status="PREVIOUS_INVALID",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    try:
+        current_sha = _sha256_file(current_path)
+        current_inventory = _load_inventory(current_path)
+        embedded = _inventory_file_date(current_path)
+        if embedded is not None and embedded != current_date:
+            raise RuntimeError("Current inventory date does not match the requested date.")
+    except Exception as exc:
+        return InventoryComparisonEvidence(
+            **{**base, "previous_daily_sha256": previous_sha}, **empty,
+            comparison_status="CURRENT_INVALID",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    previous_numbers = set(previous_inventory)
+    current_numbers = set(current_inventory)
+    added = sorted(current_numbers - previous_numbers)
+    removed = sorted(previous_numbers - current_numbers)
+    renamed = [
+        RenamedMachine(number, previous_inventory[number], current_inventory[number])
+        for number in sorted(previous_numbers & current_numbers)
+        if previous_inventory[number] != current_inventory[number]
+    ]
+    changed = len(added) + len(removed) + len(renamed)
+    has_changes = changed > 0
+    return InventoryComparisonEvidence(
+        **{
+            **base,
+            "previous_daily_sha256": previous_sha,
+            "current_daily_sha256": current_sha,
+        },
+        comparison_performed=True,
+        comparison_status="COMPARED_CHANGE" if has_changes else "COMPARED_NO_CHANGE",
+        previous_machine_count=len(previous_inventory),
+        current_machine_count=len(current_inventory),
+        added_machine_numbers=added,
+        removed_machine_numbers=removed,
+        renamed_machine_numbers=renamed,
+        added_count=len(added),
+        removed_count=len(removed),
+        renamed_count=len(renamed),
+        changed_machine_count=changed,
+        change_rate=changed / max(len(previous_inventory), len(current_inventory)),
+        has_changes=has_changes,
     )
 
 
@@ -354,3 +530,114 @@ def enforce_inventory_guard(
     if result.blocked:
         raise InventoryGuardBlockedError(result)
     return result
+
+
+def assess_yasuda_inventory_guard(
+    data_dir: Path,
+    target_date: date,
+    latest_data_date: date,
+) -> InventoryGuardResult:
+    """Y1 guard: enforce continuity only for validated 320-machine dailies."""
+    data_dir = Path(data_dir)
+    target_date = date.fromisoformat(str(target_date))
+    latest_data_date = date.fromisoformat(str(latest_data_date))
+    available_previous = []
+    for path in data_dir.glob("ana_slo_????????.csv"):
+        match = re.fullmatch(r"ana_slo_(\d{8})\.csv", path.name)
+        if match:
+            candidate = datetime.strptime(match.group(1), "%Y%m%d").date()
+            if candidate < latest_data_date:
+                available_previous.append((candidate, path))
+    if available_previous:
+        previous_date, previous_path = max(available_previous)
+    else:
+        previous_date = latest_data_date - timedelta(days=1)
+        previous_path = daily_inventory_path(
+            data_dir, previous_date, YASUDA_MAEBASHI_POLICY
+        )
+    current_path = daily_inventory_path(data_dir, latest_data_date, YASUDA_MAEBASHI_POLICY)
+    state_path = inventory_guard_state_path(data_dir)
+    persistent_state = _read_persistent_state(state_path, YASUDA_MAEBASHI_POLICY)
+    evidence = inspect_inventory_transition(
+        YASUDA_MAEBASHI_POLICY.store,
+        previous_path,
+        current_path,
+        previous_date,
+        latest_data_date,
+        policy_version="YASUDA_Y1_V1",
+        mode="ENFORCE",
+    )
+    comparison = None
+    if evidence.comparison_performed:
+        comparison = InventoryDiff(
+            previous_date=evidence.previous_date,
+            current_date=evidence.current_date,
+            previous_machine_count=int(evidence.previous_machine_count),
+            current_machine_count=int(evidence.current_machine_count),
+            added_machine_numbers=list(evidence.added_machine_numbers or []),
+            removed_machine_numbers=list(evidence.removed_machine_numbers or []),
+            renamed_machine_numbers=list(evidence.renamed_machine_numbers or []),
+        )
+    if (
+        not evidence.comparison_performed
+        or evidence.previous_machine_count != 320
+        or evidence.current_machine_count != 320
+    ):
+        reason = (
+            "Inventory comparison is non-consecutive."
+            if evidence.comparison_status == "NON_CONSECUTIVE"
+            else "Inventory comparison is unavailable or outside the validated 320-machine baseline."
+        )
+        return InventoryGuardResult(
+            status="MANUAL_REVIEW", blocked=True,
+            reason=f"{reason} comparison_status={evidence.comparison_status}",
+            target_date=target_date.isoformat(),
+            latest_data_date=latest_data_date.isoformat(),
+            known_change_date=False,
+            confirmed_target_inventory_path="",
+            confirmed_target_inventory_exists=False,
+            comparison=comparison,
+            persistent_state=persistent_state,
+        )
+    if comparison is not None and comparison.has_changes:
+        if not (_is_explicitly_approved(persistent_state) and _same_change(persistent_state, comparison)):
+            if not (
+                persistent_state.get("status") == "BLOCKED"
+                and _same_change(persistent_state, comparison)
+            ):
+                persistent_state = _state_for_change(YASUDA_MAEBASHI_POLICY, comparison)
+                _atomic_write_state(state_path, persistent_state)
+            return InventoryGuardResult(
+                status="MANUAL_REVIEW", blocked=True,
+                reason="Inventory change detected; explicit safety approval is required.",
+                target_date=target_date.isoformat(),
+                latest_data_date=latest_data_date.isoformat(),
+                known_change_date=False,
+                confirmed_target_inventory_path="",
+                confirmed_target_inventory_exists=False,
+                comparison=comparison,
+                persistent_state=persistent_state,
+            )
+    if persistent_state and not _is_explicitly_approved(persistent_state):
+        return InventoryGuardResult(
+            status="MANUAL_REVIEW", blocked=True,
+            reason="Inventory change remains blocked because explicit approval has not been recorded.",
+            target_date=target_date.isoformat(),
+            latest_data_date=latest_data_date.isoformat(),
+            known_change_date=False,
+            confirmed_target_inventory_path="",
+            confirmed_target_inventory_exists=False,
+            comparison=comparison,
+            persistent_state=persistent_state,
+        )
+    return InventoryGuardResult(
+        status="PASS", blocked=False,
+        reason="Validated consecutive 320-machine inventories have no unapproved change.",
+        target_date=target_date.isoformat(),
+        latest_data_date=latest_data_date.isoformat(),
+        known_change_date=False,
+        confirmed_target_inventory_path="",
+        confirmed_target_inventory_exists=False,
+        comparison=comparison,
+        persistent_state=persistent_state,
+    )

@@ -805,9 +805,39 @@ def _forward_summary(path: Path) -> str:
     )
 
 
+def _inventory_monitor_lines(item: dict) -> list[str]:
+    monitor = item.get("inventory_monitor") or {}
+    status = str(monitor.get("status", ""))
+    if not status or status == "NO_CHANGE":
+        return []
+    if status in {"CHANGE_OBSERVED", "ALREADY_OBSERVED"} and monitor.get("has_changes"):
+        return [
+            "Inventory monitor: CHANGE_OBSERVED",
+            "added={added} / removed={removed} / renamed={renamed}".format(
+                added=monitor.get("added_count", 0),
+                removed=monitor.get("removed_count", 0),
+                renamed=monitor.get("renamed_count", 0),
+            ),
+            "※監視情報。正式/暫定ランキング判定には影響しません。",
+        ]
+    if status == "NON_CONSECUTIVE":
+        return [
+            "Inventory monitor: NON_CONSECUTIVE",
+            "日次変更として未評価",
+            "※監視情報。正式/暫定ランキング判定には影響しません。",
+        ]
+    if status in {"ERROR", "SOURCE_CHANGED_AFTER_OBSERVATION", "COMPARISON_UNAVAILABLE"}:
+        return [
+            f"Inventory monitor取得エラー: {status}",
+            "正式/暫定ランキング判定には影響しません。",
+        ]
+    return []
+
+
 def _bigmarch_content(state: dict, root: Path, operation_date: date) -> tuple[StoreSection, list[str]]:
     expected = operation_date - timedelta(days=1)
     item = _store_state(state, STORE_BIGMARCH)
+    monitor_lines = _inventory_monitor_lines(item)
     verification = verify_big_march_completion(root, operation_date)
     base = root / "data/bigmarch_takasaki_oyagi/machine_number"
     analysis = base / "analysis_31days_deep"
@@ -862,7 +892,7 @@ def _bigmarch_content(state: dict, root: Path, operation_date: date) -> tuple[St
                     RankingBlock("JUGGLER 暫定 Top10（recent7_win）", juggler, ("prediction_rank", "rank")),
                     RankingBlock("NON_JUGGLER 暫定 Top10（weekday_avg）", nonjuggler, ("prediction_rank", "rank")),
                 ],
-                [],
+                monitor_lines,
             ),
             warnings,
         )
@@ -890,7 +920,7 @@ def _bigmarch_content(state: dict, root: Path, operation_date: date) -> tuple[St
             rankings.append(RankingBlock(label, rows, keys))
         else:
             rankings.append(RankingBlock(label, [], keys, "本日ランキング未生成（古い生成分は本日分として表示しません）"))
-    return StoreSection("【Big March 高崎おおやぎ】", summary_lines, rankings, []), warnings
+    return StoreSection("【Big March 高崎おおやぎ】", summary_lines, rankings, monitor_lines), warnings
 
 
 def _bigmarch_section(state: dict, root: Path, operation_date: date) -> tuple[list[str], list[str]]:
@@ -904,15 +934,35 @@ def _yasuda_section(state: dict, root: Path, operation_date: date) -> tuple[list
     verification = verify_yasuda_completion(root, operation_date)
     daily = root / "data/yasuda_maebashi/machine_number" / f"ana_slo_{expected:%Y%m%d}.csv"
     records = len(_read_rows(daily))
-    warnings = [] if verification.ok else [f"Yasuda: Freshness/quality失敗 ({verification.status})"]
-    return [
+    guard = item.get("inventory_guard") or {}
+    blocked = bool(guard.get("blocked"))
+    warnings = [] if verification.ok and not blocked else [
+        "Yasuda: 台構成変更/比較不成立のためMANUAL_REVIEW"
+        if blocked else f"Yasuda: Freshness/quality失敗 ({verification.status})"
+    ]
+    lines = [
         "【Yasuda 前橋】",
         f"status: {item.get('status', 'UNKNOWN')}",
         f"expected/latest data date: {expected.isoformat()} / {item.get('latest_data_date') or ('確認済み' if verification.ok else '-')}",
         f"records: {records}",
         f"Freshness/quality: {'OK' if verification.ok else 'FAILED: ' + verification.status}",
         "ランキング機能: 未実装",
-    ], warnings
+    ]
+    if blocked:
+        comparison = guard.get("comparison") or {}
+        lines.extend([
+            "⚠ 台構成変更またはinventory比較不成立を検知",
+            "正式daily completion: MANUAL_REVIEW",
+            f"reason: {guard.get('reason', 'INVENTORY_GUARD_BLOCKED')}",
+        ])
+        if comparison:
+            lines.extend([
+                f"previous/current: {comparison.get('previous_machine_count', '-')} / {comparison.get('current_machine_count', '-')}",
+                f"added: {comparison.get('added_machine_numbers', [])}",
+                f"removed: {comparison.get('removed_machine_numbers', [])}",
+                f"renamed: {len(comparison.get('renamed_machine_numbers', []))}",
+            ])
+    return lines, warnings
 
 
 def build_notification_message(state: dict, project_root: Path) -> NotificationMessage:

@@ -597,6 +597,33 @@ class MorningNotificationTests(unittest.TestCase):
         section,_=notification._bigmarch_content(state,ROOT,date(2026,9,7));plain=notification._render_section_plain(section)
         self.assertIn("PROVISIONAL成果物検証失敗",plain);self.assertNotIn("482番台",plain)
 
+    def test_big_march_monitor_change_is_clearly_non_blocking(self):
+        lines = notification._inventory_monitor_lines({"inventory_monitor": {
+            "status": "CHANGE_OBSERVED", "has_changes": True,
+            "added_count": 1, "removed_count": 2, "renamed_count": 3,
+        }})
+        text = "\n".join(lines)
+        self.assertIn("CHANGE_OBSERVED", text)
+        self.assertIn("added=1 / removed=2 / renamed=3", text)
+        self.assertIn("判定には影響しません", text)
+
+    def test_yasuda_inventory_block_keeps_ranking_unimplemented_message(self):
+        state = state_with(["SUCCESS", "SUCCESS", "NEEDS_MANUAL_REVIEW"])
+        state["stores"][automation.STORE_YASUDA]["inventory_guard"] = {
+            "blocked": True,
+            "reason": "comparison_status=NON_CONSECUTIVE",
+            "comparison": None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            lines, warnings = notification._yasuda_section(
+                state, Path(directory), date(2026, 9, 4)
+            )
+        text = "\n".join(lines)
+        self.assertIn("正式daily completion: MANUAL_REVIEW", text)
+        self.assertIn("NON_CONSECUTIVE", text)
+        self.assertIn("ランキング機能: 未実装", text)
+        self.assertTrue(warnings)
+
 
 if __name__ == "__main__":
     unittest.main()

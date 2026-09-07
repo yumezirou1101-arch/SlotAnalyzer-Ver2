@@ -141,7 +141,9 @@ def write_big_march_target_artifacts(root: Path, operation: date) -> list[Path]:
     return paths
 
 
-def write_yasuda_daily(root: Path, operation: date) -> Path:
+def write_yasuda_daily(
+    root: Path, operation: date, renamed_no: int | None = None, count: int = 320
+) -> Path:
     expected = operation - timedelta(days=1)
     path = (
         root
@@ -164,12 +166,14 @@ def write_yasuda_daily(root: Path, operation: date) -> Path:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
-        for number in range(1, 321):
+        for number in range(1, count + 1):
             writer.writerow(
                 {
                     "日付": expected.isoformat(),
                     "台番号": number,
-                    "機種名": f"Machine {number}",
+                    "機種名": (
+                        "Replacement" if number == renamed_no else f"Machine {number}"
+                    ),
                     "G数": 1000,
                     "差枚": number,
                     "BB": 1,
@@ -755,6 +759,84 @@ class Phase2SupportTests(unittest.TestCase):
             self.assertEqual(
                 item["error_category"], "PREEXISTING_COMPLETION_ARTIFACT"
             )
+
+    def test_yasuda_existing_success_is_guarded_before_reconciliation(self):
+        operation = date(2026, 9, 3)
+        current = datetime(2026, 9, 3, 8, 0, tzinfo=JST)
+        for renamed, expected_status in ((None, "SUCCESS"), (100, "NEEDS_MANUAL_REVIEW")):
+            with self.subTest(renamed=renamed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_yasuda_daily(root, date(2026, 9, 2))
+                write_yasuda_daily(root, operation, renamed_no=renamed)
+                state = automation.create_state(operation, "automation_test", current)
+                state["stores"][STORE_YASUDA]["status"] = "SUCCESS"
+                automation.reconcile_startup_state(state, root, operation, current)
+                item = state["stores"][STORE_YASUDA]
+                self.assertEqual(item["status"], expected_status)
+                if renamed is not None:
+                    self.assertEqual(item["current_stage"], "INVENTORY_GUARD")
+                    self.assertFalse(automation.should_sleep_on_success(True, state, 0))
+
+    def test_old_state_without_inventory_monitor_remains_compatible(self):
+        operation = date(2026, 9, 3)
+        current = datetime(2026, 9, 3, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "old_state", current)
+        state["stores"][STORE_BIGMARCH].pop("inventory_monitor")
+        with tempfile.TemporaryDirectory() as directory:
+            automation.reconcile_startup_state(state, Path(directory), operation, current)
+        self.assertIn("inventory_monitor", state["stores"][STORE_BIGMARCH])
+        self.assertNotEqual(state["stores"][STORE_BIGMARCH]["status"], "NEEDS_MANUAL_REVIEW")
+
+    def test_yasuda_319_and_321_remain_invalid(self):
+        operation = date(2026, 9, 3)
+        for count in (319, 321):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_yasuda_daily(root, operation, count=count)
+                result = verify_yasuda_completion(root, operation)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.status, "INVALID")
+
+    def test_big_march_monitor_error_does_not_change_success_or_sleep(self):
+        operation = date(2026, 9, 3)
+        current = datetime(2026, 9, 3, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "monitor_error", current)
+        args = automation.argparse.Namespace(
+            retry_interval_sec=1, max_fetch_attempts=1,
+            chrome_wait_sec=1, sleep_on_success=True,
+        )
+        ready = ReadinessResult(
+            ready=True, source_exists=True, source_path="fixture",
+            expected_data_date="2026-09-02", category="READY",
+        )
+        process = ProcessResult(
+            0, current.isoformat(), current.isoformat(), 0.1, "fixture.log"
+        )
+        complete = VerificationResult("COMPLETE", True, artifacts=["formal"])
+        monitor_error = {
+            "mode": "MONITOR_ONLY", "status": "ERROR",
+            "affects_morning_status": False, "affects_sleep": False,
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(automation, "PROJECT_ROOT", Path(directory)), \
+                patch.object(automation, "check_source_readiness", return_value=ready), \
+                patch.object(automation, "run_logged_subprocess", return_value=process), \
+                patch.object(automation, "verify_store_completion", return_value=complete), \
+                patch.object(automation, "_observe_big_march_inventory", return_value=monitor_error), \
+                patch.object(automation, "save_state"), \
+                patch.object(automation, "_record_history"):
+            automation._process_store(
+                STORE_BIGMARCH, state, Path(directory) / "state.json",
+                operation, operation - timedelta(days=1), args,
+                clock=lambda: current,
+            )
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["status"], "SUCCESS")
+        self.assertEqual(item["error_category"], "")
+        self.assertEqual(item["inventory_monitor"]["status"], "ERROR")
+        for store in (STORE_MARUHAN, STORE_YASUDA):
+            state["stores"][store]["status"] = "SUCCESS"
+        self.assertTrue(automation.should_sleep_on_success(True, state, 0))
 
     def test_maruhan_partial_64_requires_manual_review(self):
         operation = date(2026, 9, 2)

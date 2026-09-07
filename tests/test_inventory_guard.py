@@ -20,17 +20,21 @@ from slotanalyzer_inventory_guard import (
     assess_inventory_guard,
     compare_inventory_files,
     enforce_inventory_guard,
+    inspect_inventory_transition,
     inventory_guard_state_path,
+    assess_yasuda_inventory_guard,
 )
 
 
-def write_inventory(path: Path, rows: list[tuple[int, str]]) -> None:
+def write_inventory(
+    path: Path, rows: list[tuple[int, str]], day: str = "2026-09-01"
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["日付", "台番号", "機種名"])
         for machine_no, machine_name in rows:
-            writer.writerow(["2026-09-01", machine_no, machine_name])
+            writer.writerow([day, machine_no, machine_name])
 
 
 def machines(count: int = 514) -> list[tuple[int, str]]:
@@ -38,6 +42,105 @@ def machines(count: int = 514) -> list[tuple[int, str]]:
 
 
 class InventoryGuardTests(unittest.TestCase):
+    def test_pure_comparison_reports_change_counts_sha_and_exact_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            previous = data / "previous.csv"
+            current = data / "current.csv"
+            previous.write_text(
+                "date,machine_no,machine_name\n2026-09-01,1,A\n2026-09-01,2,B\n",
+                encoding="utf-8-sig",
+            )
+            current.write_text(
+                "date,machine_no,machine_name\n2026-09-02,2,B2\n2026-09-02,3,C\n",
+                encoding="utf-8-sig",
+            )
+            result = inspect_inventory_transition(
+                "TEST", previous, current, date(2026, 9, 1), date(2026, 9, 2)
+            )
+            self.assertFalse((data / "inventory_guard_state.json").exists())
+        self.assertEqual(result.comparison_status, "COMPARED_CHANGE")
+        self.assertEqual(result.added_machine_numbers, [3])
+        self.assertEqual(result.removed_machine_numbers, [1])
+        self.assertEqual(result.renamed_count, 1)
+        self.assertEqual(result.changed_machine_count, 3)
+        self.assertEqual(result.change_rate, 1.5)
+        self.assertEqual(result.machine_name_comparison, "EXACT_STRING")
+        self.assertEqual(len(result.previous_daily_sha256), 64)
+        self.assertEqual(len(result.current_daily_sha256), 64)
+
+    def test_pure_comparison_non_consecutive_is_not_no_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            result = inspect_inventory_transition(
+                "TEST", data / "missing1.csv", data / "missing2.csv",
+                date(2026, 9, 1), date(2026, 9, 3),
+            )
+        self.assertEqual(result.comparison_status, "NON_CONSECUTIVE")
+        self.assertFalse(result.comparison_performed)
+        self.assertIsNone(result.has_changes)
+        self.assertIsNone(result.added_count)
+
+    def test_pure_comparison_rejects_duplicate_and_missing_values(self):
+        cases = {
+            "duplicate": "date,machine_no,machine_name\n2026-09-01,1,A\n2026-09-01,1,B\n",
+            "missing_no": "date,machine_no,machine_name\n2026-09-01,,A\n",
+            "missing_name": "date,machine_no,machine_name\n2026-09-01,1,\n",
+        }
+        for label, content in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                data = Path(directory)
+                previous = data / "previous.csv"
+                current = data / "current.csv"
+                previous.write_text(content, encoding="utf-8-sig")
+                current.write_text(
+                    "date,machine_no,machine_name\n2026-09-02,1,A\n",
+                    encoding="utf-8-sig",
+                )
+                result = inspect_inventory_transition(
+                    "TEST", previous, current, date(2026, 9, 1), date(2026, 9, 2)
+                )
+                self.assertEqual(result.comparison_status, "PREVIOUS_INVALID")
+
+    def test_yasuda_320_no_change_passes_and_rename_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            previous = machines(320)
+            current = machines(320)
+            write_inventory(data / "ana_slo_20260901.csv", previous)
+            write_inventory(data / "ana_slo_20260902.csv", current, "2026-09-02")
+            passed = assess_yasuda_inventory_guard(
+                data, date(2026, 9, 3), date(2026, 9, 2)
+            )
+            current[99] = (100, "replacement")
+            write_inventory(data / "ana_slo_20260902.csv", current, "2026-09-02")
+            blocked = assess_yasuda_inventory_guard(
+                data, date(2026, 9, 3), date(2026, 9, 2)
+            )
+        self.assertFalse(passed.blocked)
+        self.assertTrue(blocked.blocked)
+        self.assertEqual(blocked.comparison.renamed_machine_numbers[0].machine_no, 100)
+
+    def test_yasuda_missing_comparison_never_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            result = assess_yasuda_inventory_guard(
+                data, date(2026, 9, 3), date(2026, 9, 2)
+            )
+        self.assertTrue(result.blocked)
+        self.assertIn("PREVIOUS_MISSING", result.reason)
+
+    def test_yasuda_non_consecutive_never_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            write_inventory(data / "ana_slo_20260831.csv", machines(320), "2026-08-31")
+            write_inventory(data / "ana_slo_20260902.csv", machines(320), "2026-09-02")
+            result = assess_yasuda_inventory_guard(
+                data, date(2026, 9, 3), date(2026, 9, 2)
+            )
+        self.assertTrue(result.blocked)
+        self.assertIn("NON_CONSECUTIVE", result.reason)
+
     def test_normal_514_inventory_passes(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
