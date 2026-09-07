@@ -272,9 +272,10 @@ class DerivedPredictionFormalTests(unittest.TestCase):
                 mock.patch.object(pipeline79, "DIR_77", out77),
                 mock.patch.object(pipeline79, "LOG_DIR", log_dir),
                 mock.patch.object(pipeline79, "run_stage", side_effect=run77),
+                mock.patch.object(pipeline79, "validate_forward_time"),
                 mock.patch.object(sys, "argv", ["script", "--target-date", TARGET.isoformat()]),
             )
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9]:
                 pipeline79.main()
             status = pd.read_csv(log_dir / f"79_pipeline_{TARGET:%Y%m%d}_status.csv", encoding="utf-8-sig")
             mapped = status.set_index("stage")

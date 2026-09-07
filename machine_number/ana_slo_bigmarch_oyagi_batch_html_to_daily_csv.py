@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from io import StringIO
 import argparse
+import os
 import re
+import tempfile
 import pandas as pd
 
 PROJECT_ROOT = Path(r"C:\Users\user\Desktop\Documents\SlotAnalyzer")
@@ -50,6 +52,14 @@ def parse_args():
     parser.add_argument(
         "--overwrite",
         action="store_true",
+    )
+    parser.add_argument(
+        "--only-date",
+        type=lambda value: pd.Timestamp(value).normalize(),
+        help=(
+            "Convert only the specified YYYY-MM-DD source. This mode is used "
+            "by Morning Automation catch-up and fails non-zero on validation/error."
+        ),
     )
     return parser.parse_args()
 
@@ -197,6 +207,36 @@ def validate_daily(df: pd.DataFrame, min_machines: int) -> dict:
     }
 
 
+def write_daily_atomic(
+    daily: pd.DataFrame,
+    output_path: Path,
+    page_date: pd.Timestamp,
+    min_machines: int,
+) -> None:
+    """Write one validated daily without exposing a partially-written final file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.stem}_",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        daily.to_csv(temporary_path, index=False, encoding="utf-8-sig")
+        written = pd.read_csv(temporary_path, encoding="utf-8-sig")
+        written_quality = validate_daily(written, min_machines)
+        written_dates = pd.to_datetime(written["date"], errors="raise").dt.date.unique().tolist()
+        if not written_quality["ok"] or written_dates != [page_date.date()]:
+            raise RuntimeError("Atomic daily re-validation failed.")
+        if output_path.exists():
+            raise FileExistsError(f"Daily CSV appeared during conversion: {output_path}")
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -205,7 +245,13 @@ def main() -> None:
 
     header("Big March Takasaki Oyagi - Batch HTML -> Daily CSV")
 
-    sources = sorted(PROJECT_ROOT.glob(SOURCE_GLOB))
+    if args.only_date is not None:
+        only_source = PROJECT_ROOT / (
+            f"ana_slo_bigmarch_oyagi_{args.only_date:%Y%m%d}_source.html"
+        )
+        sources = [only_source] if only_source.is_file() else []
+    else:
+        sources = sorted(PROJECT_ROOT.glob(SOURCE_GLOB))
 
     if not sources:
         raise FileNotFoundError("No Big March Oyagi source HTML files found.")
@@ -213,6 +259,7 @@ def main() -> None:
     print(f"source files found    : {len(sources)}")
     print(f"min machines          : {args.min_machines}")
     print(f"overwrite             : {args.overwrite}")
+    print(f"only date             : {args.only_date.date() if args.only_date is not None else '-'}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
@@ -278,11 +325,14 @@ def main() -> None:
                     daily["machine_no"], errors="raise"
                 ).astype(int)
 
-                daily.to_csv(
-                    out,
-                    index=False,
-                    encoding="utf-8-sig",
-                )
+                if args.only_date is not None:
+                    write_daily_atomic(daily, out, page_date, args.min_machines)
+                else:
+                    daily.to_csv(
+                        out,
+                        index=False,
+                        encoding="utf-8-sig",
+                    )
                 print(f"saved                 : {out}")
                 print("RESULT                : OK")
 
@@ -357,6 +407,13 @@ def main() -> None:
     print("Batch conversion complete.")
     print("Historical machine-count changes are allowed.")
     print("No Maruhan Maebashi files were modified.")
+
+    if args.only_date is not None:
+        statuses = set(summary["status"].astype(str))
+        if not statuses.issubset({"OK", "SKIPPED_EXISTING"}):
+            raise RuntimeError(
+                "Targeted catch-up conversion failed: " + ", ".join(sorted(statuses))
+            )
 
 
 if __name__ == "__main__":

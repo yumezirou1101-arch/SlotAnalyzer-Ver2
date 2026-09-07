@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -83,6 +84,16 @@ class VerificationResult:
     error: str = ""
     artifacts: list[str] = field(default_factory=list)
     details: dict = field(default_factory=dict)
+
+
+@dataclass
+class BigMarchCatchupAssessment:
+    ok: bool
+    status: str
+    expected_data_date: str
+    latest_daily_date: str = ""
+    candidate_dates: list[str] = field(default_factory=list)
+    error: str = ""
 
 
 @dataclass
@@ -400,6 +411,135 @@ def check_source_readiness(
     raise ValueError(f"Unknown store: {store}")
 
 
+BIGMARCH_SOURCE_RE = re.compile(
+    r"^ana_slo_bigmarch_oyagi_(\d{8})_source\.html$", re.IGNORECASE
+)
+BIGMARCH_DAILY_RE = re.compile(
+    r"^ana_slo_bigmarch_oyagi_(\d{8})\.csv$", re.IGNORECASE
+)
+
+
+def discover_big_march_source_dates(project_root: Path) -> list[tuple[date, Path]]:
+    found = []
+    for path in Path(project_root).glob("ana_slo_bigmarch_oyagi_????????_source.html"):
+        match = BIGMARCH_SOURCE_RE.fullmatch(path.name)
+        if match:
+            found.append((datetime.strptime(match.group(1), "%Y%m%d").date(), path))
+    return sorted(found)
+
+
+def discover_big_march_daily_dates(project_root: Path) -> list[tuple[date, Path]]:
+    data_dir = Path(project_root) / "data/bigmarch_takasaki_oyagi/machine_number"
+    found = []
+    for path in data_dir.glob("ana_slo_bigmarch_oyagi_????????.csv"):
+        match = BIGMARCH_DAILY_RE.fullmatch(path.name)
+        if match:
+            found.append((datetime.strptime(match.group(1), "%Y%m%d").date(), path))
+    return sorted(found)
+
+
+def verify_big_march_daily_for_date(
+    project_root: Path,
+    target_date: date,
+    min_machines: int = 200,
+) -> VerificationResult:
+    path = (
+        Path(project_root)
+        / "data/bigmarch_takasaki_oyagi/machine_number"
+        / f"ana_slo_bigmarch_oyagi_{target_date:%Y%m%d}.csv"
+    )
+    if not path.is_file() or path.stat().st_size <= 0:
+        return VerificationResult("MISSING_CATCHUP_DAILY", False, artifacts=[str(path)])
+    try:
+        frame = pd.read_csv(path, encoding="utf-8-sig")
+        required = {"date", "machine_name", "machine_no", "G", "diff"}
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise RuntimeError(f"required columns missing: {missing}")
+        dates = pd.to_datetime(frame["date"], errors="raise").dt.date.unique().tolist()
+        machine_no = pd.to_numeric(frame["machine_no"], errors="coerce")
+        names = frame["machine_name"].astype("string").str.strip()
+        games = pd.to_numeric(frame["G"], errors="coerce")
+        differences = pd.to_numeric(frame["diff"], errors="coerce")
+        if dates != [target_date]:
+            raise RuntimeError("internal date mismatch")
+        if len(frame) < min_machines:
+            raise RuntimeError(f"machine rows below minimum: {len(frame)} < {min_machines}")
+        if machine_no.isna().any() or machine_no.duplicated().any() or machine_no.nunique() != len(frame):
+            raise RuntimeError("machine_no missing or duplicated")
+        if names.isna().any() or names.isin(["", "nan", "None"]).any():
+            raise RuntimeError("machine_name missing or empty")
+        if games.isna().any() or differences.isna().any() or (games < 0).any():
+            raise RuntimeError("G/diff missing, non-numeric, or negative G")
+    except Exception as exc:
+        return VerificationResult(
+            "INVALID_CATCHUP_DAILY", False, f"{type(exc).__name__}: {exc}", [str(path)]
+        )
+    return VerificationResult(
+        "VALID_CATCHUP_DAILY", True, artifacts=[str(path)],
+        details={"date": target_date.isoformat(), "rows": len(frame), "sha256": sha256_file(path)},
+    )
+
+
+def assess_big_march_catchup(
+    project_root: Path,
+    operation_date: date,
+    expected_data_date: date,
+    min_machines: int = 200,
+) -> BigMarchCatchupAssessment:
+    if expected_data_date != operation_date - timedelta(days=1):
+        return BigMarchCatchupAssessment(
+            False, "CATCHUP_DATE_CONTRACT_INVALID", expected_data_date.isoformat(),
+            error="expected_data_date must equal operation_date - 1 day",
+        )
+    daily_files = discover_big_march_daily_dates(project_root)
+    if not daily_files:
+        return BigMarchCatchupAssessment(
+            False, "CATCHUP_NO_DAILY_BASELINE", expected_data_date.isoformat(),
+            error="No existing Big March daily CSV is available as a contiguous baseline.",
+        )
+    latest_date, _ = daily_files[-1]
+    latest_verification = verify_big_march_daily_for_date(
+        project_root, latest_date, min_machines
+    )
+    if not latest_verification.ok:
+        return BigMarchCatchupAssessment(
+            False, latest_verification.status, expected_data_date.isoformat(),
+            latest_date.isoformat(), error=latest_verification.error,
+        )
+    if latest_date >= expected_data_date:
+        return BigMarchCatchupAssessment(
+            False, "CATCHUP_DAILY_NOT_BEFORE_EXPECTED", expected_data_date.isoformat(),
+            latest_date.isoformat(), error="Latest daily is not before expected_data_date.",
+        )
+
+    candidates = []
+    candidate = latest_date + timedelta(days=1)
+    last_allowed = expected_data_date - timedelta(days=1)
+    while candidate <= last_allowed:
+        readiness = check_source_readiness(STORE_BIGMARCH, project_root, candidate)
+        if readiness.ready:
+            candidates.append(candidate.isoformat())
+            candidate += timedelta(days=1)
+            continue
+        if readiness.source_exists:
+            if candidates:
+                return BigMarchCatchupAssessment(
+                    True, "CATCHUP_READY_THEN_SOURCE_INVALID",
+                    expected_data_date.isoformat(), latest_date.isoformat(),
+                    candidates, readiness.error,
+                )
+            return BigMarchCatchupAssessment(
+                False, "CATCHUP_SOURCE_INVALID", expected_data_date.isoformat(),
+                latest_date.isoformat(), candidates, readiness.error,
+            )
+        break
+    return BigMarchCatchupAssessment(
+        True, "CATCHUP_READY", expected_data_date.isoformat(),
+        latest_date.isoformat(), candidates,
+    )
+
+
 def build_fetch_command(store: str, project_root: Path, python_executable: str) -> list[str]:
     scripts = {
         STORE_MARUHAN: "ana_slo_maruhan_maebashi_click_fetch_v3.py",
@@ -473,6 +613,28 @@ def build_big_march_provisional_command(
         ),
         "--operation-date",
         operation_date.isoformat(),
+    ]
+    _assert_safe_command(command)
+    return command
+
+
+def build_big_march_catchup_command(
+    project_root: Path,
+    python_executable: str,
+    target_date: date,
+    min_machines: int = 200,
+) -> list[str]:
+    command = [
+        python_executable,
+        str(
+            Path(project_root)
+            / "machine_number"
+            / "ana_slo_bigmarch_oyagi_batch_html_to_daily_csv.py"
+        ),
+        "--only-date",
+        target_date.isoformat(),
+        "--min-machines",
+        str(min_machines),
     ]
     _assert_safe_command(command)
     return command

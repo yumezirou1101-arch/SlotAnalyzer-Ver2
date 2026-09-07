@@ -27,6 +27,8 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     WindowsFileLock,
     append_history_csv,
     atomic_write_json,
+    assess_big_march_catchup,
+    build_big_march_catchup_command,
     build_big_march_provisional_command,
     build_fetch_command,
     build_pipeline_command,
@@ -40,6 +42,8 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     now_jst,
     other_store_retry_allowed,
     run_logged_subprocess,
+    sha256_file,
+    verify_big_march_daily_for_date,
     verify_big_march_provisional_completion,
     verify_store_completion,
 )
@@ -141,6 +145,17 @@ def blank_store_state(store: str, operation_date: date) -> dict:
         "provisional_reason": "",
         "provisional_latest_data_date": "",
         "provisional_artifacts": [],
+        "catchup_attempt_count": 0,
+        "catchup_status": "",
+        "catchup_reason": "",
+        "catchup_target_date": "",
+        "catchup_latest_data_date": "",
+        "catchup_attempted_dates": [],
+        "catchup_converted_dates": [],
+        "catchup_source_path": "",
+        "catchup_daily_path": "",
+        "catchup_source_sha256": "",
+        "catchup_daily_sha256": "",
         "current_stage": "",
         "last_readiness": {},
         "latest_data_date": "",
@@ -278,6 +293,17 @@ def reconcile_startup_state(
         store_state.setdefault("provisional_reason", "")
         store_state.setdefault("provisional_latest_data_date", "")
         store_state.setdefault("provisional_artifacts", [])
+        store_state.setdefault("catchup_attempt_count", 0)
+        store_state.setdefault("catchup_status", "")
+        store_state.setdefault("catchup_reason", "")
+        store_state.setdefault("catchup_target_date", "")
+        store_state.setdefault("catchup_latest_data_date", "")
+        store_state.setdefault("catchup_attempted_dates", [])
+        store_state.setdefault("catchup_converted_dates", [])
+        store_state.setdefault("catchup_source_path", "")
+        store_state.setdefault("catchup_daily_path", "")
+        store_state.setdefault("catchup_source_sha256", "")
+        store_state.setdefault("catchup_daily_sha256", "")
         if store == STORE_BIGMARCH:
             provisional = verify_big_march_provisional_completion(
                 project_root, operation_date
@@ -394,11 +420,15 @@ def reconcile_startup_state(
             )
             continue
         if store_state["status"] == "RUNNING":
-            if store_state.get("current_stage") in {"FETCH", "CDP_PREFLIGHT", "READINESS"}:
+            if store_state.get("current_stage") in {"FETCH", "CDP_PREFLIGHT", "READINESS", "CATCHUP_CONVERT"}:
                 store_state.update(
                     status="FAILED_RETRYABLE",
-                    error_category="RECOVERED_PRE_PIPELINE_INTERRUPTION",
-                    error="Previous process ended before pipeline start.",
+                    error_category=(
+                        "RECOVERED_CATCHUP_INTERRUPTION"
+                        if store_state.get("current_stage") == "CATCHUP_CONVERT"
+                        else "RECOVERED_PRE_PIPELINE_INTERRUPTION"
+                    ),
+                    error="Previous process ended before formal pipeline start.",
                 )
             else:
                 store_state.update(
@@ -512,6 +542,201 @@ def _run_big_march_provisional(
     save_state(state_path, state, completed)
 
 
+def _run_big_march_catchup(
+    state: dict,
+    state_path: Path,
+    operation_date: date,
+    expected_data_date: date,
+    current: datetime,
+    clock=now_jst,
+) -> bool:
+    """Convert only contiguous pre-expected sources; never run a formal stage."""
+    store_state = state["stores"][STORE_BIGMARCH]
+    assessment = assess_big_march_catchup(
+        PROJECT_ROOT, operation_date, expected_data_date, 200
+    )
+    if not assessment.ok:
+        if assessment.status == "CATCHUP_NO_DAILY_BASELINE":
+            return True
+        store_state.update(
+            status="NEEDS_MANUAL_REVIEW",
+            current_stage="CATCHUP_CONVERT",
+            catchup_status=assessment.status,
+            catchup_reason=assessment.error,
+            catchup_latest_data_date=assessment.latest_daily_date,
+            error_category=assessment.status,
+            error=assessment.error,
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        _record_history(
+            state, STORE_BIGMARCH, "CATCHUP_CONVERT",
+            store_state.get("catchup_attempt_count", 0),
+            "NEEDS_MANUAL_REVIEW", error_category=assessment.status,
+            error=assessment.error,
+        )
+        save_state(state_path, state, current)
+        return False
+
+    store_state["catchup_latest_data_date"] = assessment.latest_daily_date
+    if not assessment.candidate_dates:
+        if assessment.latest_daily_date == (
+            expected_data_date - timedelta(days=1)
+        ).isoformat():
+            verification = verify_big_march_daily_for_date(
+                PROJECT_ROOT, date.fromisoformat(assessment.latest_daily_date), 200
+            )
+            if not verification.ok:
+                store_state.update(
+                    status="NEEDS_MANUAL_REVIEW",
+                    current_stage="CATCHUP_CONVERT",
+                    catchup_status=verification.status,
+                    catchup_reason=verification.error,
+                    error_category=verification.status,
+                    error=verification.error,
+                    last_completed_at_jst=current.isoformat(),
+                    next_retry_at_jst="",
+                )
+                save_state(state_path, state, current)
+                return False
+            store_state.update(
+                catchup_status="RECOVERED_CATCHUP",
+                catchup_reason="Latest contiguous pre-expected daily is already valid.",
+                catchup_target_date=assessment.latest_daily_date,
+                catchup_converted_dates=list(dict.fromkeys([
+                    *store_state.get("catchup_converted_dates", []),
+                    assessment.latest_daily_date,
+                ])),
+                catchup_daily_path=verification.artifacts[0],
+                catchup_daily_sha256=verification.details.get("sha256", ""),
+            )
+        return True
+
+    for candidate_text in assessment.candidate_dates:
+        candidate = date.fromisoformat(candidate_text)
+        readiness = check_source_readiness(STORE_BIGMARCH, PROJECT_ROOT, candidate)
+        if not readiness.ready:
+            store_state.update(
+                status="NEEDS_MANUAL_REVIEW",
+                current_stage="CATCHUP_CONVERT",
+                catchup_status="CATCHUP_SOURCE_INVALID",
+                catchup_reason=readiness.error or "Catch-up source became unavailable.",
+                error_category="CATCHUP_SOURCE_INVALID",
+                error=readiness.error or "Catch-up source became unavailable.",
+                last_completed_at_jst=current.isoformat(),
+                next_retry_at_jst="",
+            )
+            save_state(state_path, state, current)
+            return False
+
+        attempt = store_state.get("catchup_attempt_count", 0) + 1
+        attempted_dates = list(store_state.get("catchup_attempted_dates", []))
+        if candidate_text not in attempted_dates:
+            attempted_dates.append(candidate_text)
+        source_path = Path(readiness.source_path)
+        store_state.update(
+            status="RUNNING",
+            current_stage="CATCHUP_CONVERT",
+            attempt_count=store_state.get("attempt_count", 0) + 1,
+            catchup_attempt_count=attempt,
+            catchup_status="RUNNING",
+            catchup_reason="",
+            catchup_target_date=candidate_text,
+            catchup_attempted_dates=attempted_dates,
+            catchup_source_path=str(source_path),
+            catchup_source_sha256=sha256_file(source_path),
+            error_category="",
+            error="",
+            last_started_at_jst=current.isoformat(),
+        )
+        save_state(state_path, state, current)
+        command = build_big_march_catchup_command(
+            PROJECT_ROOT, sys.executable, candidate, 200
+        )
+        log_path = (
+            RUNS_DIR
+            / operation_date.strftime("%Y%m%d")
+            / state["automation_run_id"]
+            / f"bigmarch_catchup_{candidate:%Y%m%d}_attempt{attempt:02d}.log"
+        )
+        environment = {
+            **os.environ,
+            "SLOTANALYZER_MORNING_RUN_ID": state["automation_run_id"],
+        }
+        result = run_logged_subprocess(
+            command, PROJECT_ROOT, log_path, "CATCHUP_CONVERT",
+            environment=environment, clock=clock,
+        )
+        verification = verify_big_march_daily_for_date(
+            PROJECT_ROOT, candidate, 200
+        )
+        completed = clock().astimezone(JST)
+        if result.returncode != 0 or not verification.ok:
+            category = verification.status if not verification.ok else "CATCHUP_CONVERTER_NONZERO"
+            error = verification.error or f"Catch-up converter returned {result.returncode}."
+            store_state.update(
+                status="NEEDS_MANUAL_REVIEW",
+                current_stage="CATCHUP_CONVERT",
+                catchup_status=category,
+                catchup_reason=error,
+                returncode=result.returncode,
+                error_category=category,
+                error=error,
+                last_completed_at_jst=completed.isoformat(),
+                next_retry_at_jst="",
+            )
+            _record_history(
+                state, STORE_BIGMARCH, "CATCHUP_CONVERT", attempt,
+                "NEEDS_MANUAL_REVIEW", result, category, error,
+            )
+            save_state(state_path, state, completed)
+            return False
+
+        converted_dates = list(store_state.get("catchup_converted_dates", []))
+        if candidate_text not in converted_dates:
+            converted_dates.append(candidate_text)
+        store_state.update(
+            status="WAITING_FOR_DATA",
+            current_stage="CATCHUP_CONVERT",
+            catchup_status="CATCHUP_SUCCESS",
+            catchup_reason="Catch-up daily validated; expected source wait continues.",
+            catchup_latest_data_date=candidate_text,
+            catchup_converted_dates=converted_dates,
+            catchup_daily_path=verification.artifacts[0],
+            catchup_daily_sha256=verification.details.get("sha256", ""),
+            returncode=result.returncode,
+            error_category="EXPECTED_SOURCE_NOT_READY",
+            error="Expected source is still not ready.",
+            last_completed_at_jst=completed.isoformat(),
+        )
+        _record_history(
+            state, STORE_BIGMARCH, "CATCHUP_CONVERT", attempt,
+            "CATCHUP_SUCCESS", result,
+        )
+        save_state(state_path, state, completed)
+        current = completed
+    if assessment.status == "CATCHUP_READY_THEN_SOURCE_INVALID":
+        store_state.update(
+            status="NEEDS_MANUAL_REVIEW",
+            current_stage="CATCHUP_CONVERT",
+            catchup_status="CATCHUP_SOURCE_INVALID",
+            catchup_reason=assessment.error,
+            error_category="CATCHUP_SOURCE_INVALID",
+            error=assessment.error,
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        _record_history(
+            state, STORE_BIGMARCH, "CATCHUP_CONVERT",
+            store_state.get("catchup_attempt_count", 0),
+            "NEEDS_MANUAL_REVIEW",
+            error_category="CATCHUP_SOURCE_INVALID", error=assessment.error,
+        )
+        save_state(state_path, state, current)
+        return False
+    return True
+
+
 def _process_store(
     store: str,
     state: dict,
@@ -544,6 +769,11 @@ def _process_store(
                 save_state(state_path, state, current)
                 return
             if not readiness.ready:
+                if not _run_big_march_catchup(
+                    state, state_path, operation_date, expected_data_date,
+                    current, clock,
+                ):
+                    return
                 _run_big_march_provisional(
                     state, state_path, operation_date, current, clock
                 )
@@ -569,6 +799,11 @@ def _process_store(
         return
 
     if not readiness.ready:
+        if store == STORE_BIGMARCH and not _run_big_march_catchup(
+            state, state_path, operation_date, expected_data_date,
+            current, clock,
+        ):
+            return
         if store_state["fetch_attempt_count"] >= args.max_fetch_attempts:
             store_state.update(
                 status="FAILED_FINAL",
@@ -642,6 +877,12 @@ def _process_store(
             "" if classification == "READY" else readiness.error,
         )
         if classification != "READY":
+            if store == STORE_BIGMARCH and not readiness.source_exists:
+                if not _run_big_march_catchup(
+                    state, state_path, operation_date, expected_data_date,
+                    current, clock,
+                ):
+                    return
             store_state.update(
                 status=classification,
                 current_stage="FETCH",
