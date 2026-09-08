@@ -26,7 +26,7 @@ class InventoryGuardPolicy:
 # Store policy is separate from reusable inventory comparison/state logic.
 MARUHAN_MAEBASHI_POLICY = InventoryGuardPolicy(
     store="MARUHAN_MAEBASHI",
-    known_change_dates=frozenset({date(2026, 9, 8)}),
+    known_change_dates=frozenset(),
     confirmed_inventory_prefix="maruhan_inventory",
 )
 YASUDA_MAEBASHI_POLICY = InventoryGuardPolicy(

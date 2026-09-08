@@ -26,6 +26,13 @@ from slotanalyzer_inventory_guard import (
 )
 
 
+TEST_KNOWN_CHANGE_POLICY = InventoryGuardPolicy(
+    store="TEST_MARUHAN_KNOWN_CHANGE",
+    known_change_dates=frozenset({date(2026, 9, 8)}),
+    confirmed_inventory_prefix="test_maruhan_inventory",
+)
+
+
 def write_inventory(
     path: Path, rows: list[tuple[int, str]], day: str = "2026-09-01"
 ) -> None:
@@ -154,7 +161,12 @@ class InventoryGuardTests(unittest.TestCase):
 
     def test_known_change_date_without_confirmed_inventory_blocks(self):
         with tempfile.TemporaryDirectory() as directory:
-            result = assess_inventory_guard(Path(directory), date(2026, 9, 8), date(2026, 9, 7))
+            result = assess_inventory_guard(
+                Path(directory),
+                date(2026, 9, 8),
+                date(2026, 9, 7),
+                TEST_KNOWN_CHANGE_POLICY,
+            )
         self.assertTrue(result.blocked)
         self.assertEqual(result.status, "MANUAL_REVIEW")
         self.assertTrue(result.known_change_date)
@@ -196,7 +208,12 @@ class InventoryGuardTests(unittest.TestCase):
     def test_enforcement_has_no_allow_gap_bypass(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(InventoryGuardBlockedError):
-                enforce_inventory_guard(Path(directory), date(2026, 9, 8), date(2026, 9, 7))
+                enforce_inventory_guard(
+                    Path(directory),
+                    date(2026, 9, 8),
+                    date(2026, 9, 7),
+                    TEST_KNOWN_CHANGE_POLICY,
+                )
 
     def test_detected_rename_creates_persistent_block_state(self):
         with tempfile.TemporaryDirectory() as directory:

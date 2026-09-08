@@ -585,7 +585,7 @@ class Phase2SupportTests(unittest.TestCase):
             item["status"] = "SUCCESS"
         self.assertTrue(automation.all_terminal(state))
 
-    def test_known_inventory_change_date_stops_maruhan_and_disables_sleep(self):
+    def test_inventory_guard_block_stops_maruhan_and_disables_sleep(self):
         operation = date(2026, 9, 8)
         current = datetime(2026, 9, 8, 8, 0, tzinfo=JST)
         state = automation.create_state(operation, "automation_inventory_guard", current)
@@ -602,8 +602,18 @@ class Phase2SupportTests(unittest.TestCase):
             expected_data_date="2026-09-07",
             category="READY",
         )
+        blocked_guard = SimpleNamespace(
+            blocked=True,
+            to_dict=lambda: {"blocked": True, "status": "MANUAL_REVIEW"},
+            summary=lambda: "fixture inventory guard block",
+        )
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(automation, "check_source_readiness", return_value=ready), \
+                patch.object(
+                    automation,
+                    "assess_inventory_guard",
+                    return_value=blocked_guard,
+                ), \
                 patch.object(automation, "PROJECT_ROOT", Path(directory)), \
                 patch.object(
                     automation,
@@ -643,7 +653,16 @@ class Phase2SupportTests(unittest.TestCase):
         current = datetime(2026, 9, 8, 8, 0, tzinfo=JST)
         state = automation.create_state(operation, "automation_existing_output", current)
         state["stores"][STORE_MARUHAN]["status"] = "SUCCESS"
-        with tempfile.TemporaryDirectory() as directory:
+        blocked_guard = SimpleNamespace(
+            blocked=True,
+            to_dict=lambda: {"blocked": True, "status": "MANUAL_REVIEW"},
+            summary=lambda: "fixture inventory guard block",
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            automation,
+            "assess_inventory_guard",
+            return_value=blocked_guard,
+        ):
             automation.reconcile_startup_state(
                 state, Path(directory), operation, current
             )
@@ -941,8 +960,9 @@ class Phase2SupportTests(unittest.TestCase):
         operation=date(2026,9,6);state=automation.create_state(operation,"run",datetime(2026,9,6,8,0,tzinfo=JST));path=Path("unused")
         missing=ReadinessResult(False,False,"missing", "2026-09-05","SOURCE_MISSING")
         clock=lambda:datetime(2026,9,6,9,31,tzinfo=JST)
-        with patch.object(automation,"check_source_readiness",return_value=missing),patch.object(automation,"_run_big_march_provisional") as provisional_run,patch.object(automation,"save_state"):
+        with patch.object(automation,"check_source_readiness",return_value=missing),patch.object(automation,"_run_big_march_catchup",return_value=True) as catchup_run,patch.object(automation,"_run_big_march_provisional") as provisional_run,patch.object(automation,"save_state"):
             automation._process_store(STORE_BIGMARCH,state,path,operation,date(2026,9,5),SimpleNamespace(max_fetch_attempts=20,retry_interval_sec=300,chrome_wait_sec=15),clock)
+        catchup_run.assert_called_once()
         provisional_run.assert_called_once()
         self.assertEqual(state["stores"][STORE_BIGMARCH]["pipeline_attempt_count"],0)
 
