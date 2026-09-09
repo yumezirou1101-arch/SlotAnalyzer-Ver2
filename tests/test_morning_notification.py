@@ -236,6 +236,32 @@ class MorningNotificationTests(unittest.TestCase):
             )
         self.assertIn("昨日実績未取得", result.message)
 
+    def test_quarantined_yesterday_is_an_explicit_exclusion_not_read_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            normal_dir = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/69_Ver4_2_live_prediction_backtest"
+            write_csv_rows(normal_dir / "69_live_prediction_status.csv", [{
+                "target_date": "2026-09-05", "status": "SKIPPED_INVENTORY_GUARD_INCIDENT",
+                "prediction_class": "FORWARD_VALID",
+            }])
+            normal = notification._load_yesterday_normal_evaluation(
+                state_with(["SUCCESS"] * 3), root, date(2026, 9, 6)
+            )
+            formal_dir = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/76_Normal_AType_Juggler_live_evaluation"
+            write_csv_rows(formal_dir / "76_formal_status.csv", [
+                {"target_date": "2026-09-05", "category": category,
+                 "status": "SKIPPED_INVENTORY_GUARD_INCIDENT", "prediction_class": "FORWARD_VALID"}
+                for category in ("A_TYPE", "JUGGLER")
+            ])
+            derived = [notification._load_yesterday_derived_evaluation(root, date(2026, 9, 6), category)
+                       for category in ("A_TYPE", "JUGGLER")]
+        self.assertEqual(normal.status, "SKIPPED_INVENTORY_GUARD_INCIDENT")
+        self.assertIn("正式評価から除外", normal.message)
+        self.assertNotEqual(normal.status, "RESULT_READ_ERROR")
+        for result in derived:
+            self.assertEqual(result.status, "SKIPPED_INVENTORY_GUARD_INCIDENT")
+            self.assertIn("正式評価から除外", result.message)
+
     def test_yesterday_inventory_block_only_explains_missing_prediction(self):
         state = state_with(["NEEDS_MANUAL_REVIEW", "SUCCESS", "SUCCESS"])
         state["stores"][automation.STORE_MARUHAN]["inventory_guard"] = {"blocked": True}

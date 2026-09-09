@@ -12,6 +12,7 @@ from slotanalyzer_derived_prediction_evidence import (
     sha256_file,
     verify_derived_prediction,
 )
+from slotanalyzer_evaluation_quarantine import assess_evaluation_quarantine
 
 
 PREDICTION_CLASS_FORWARD_VALID = "FORWARD_VALID"
@@ -37,6 +38,7 @@ CATEGORIES = {
 STATUS_COLUMNS = [
     "target_date", "category", "status", "prediction_class", "reason",
     "prediction_path", "metadata_path", "actual_path", "prediction_sha256", "metadata_sha256", "actual_sha256",
+    "evaluation_eligible", "quarantine_reason_code",
 ]
 DETAIL_COLUMNS = [
     "target_date", "category", "rank", "machine_no", "machine_name", "score",
@@ -54,6 +56,7 @@ COVERAGE_COLUMNS = [
     "actual_quality_ok", "formal_evidence_ok", "prediction_class", "evaluation_status",
     "detail_rank_count", "rank1_10_complete", "formal_evaluation_complete",
     "prediction_sha256", "metadata_sha256", "actual_sha256", "actual_filename_date_ok", "actual_internal_date_ok",
+    "evaluation_eligible", "quarantine_reason_code",
 ]
 
 
@@ -209,6 +212,18 @@ def evaluate_formal_predictions(project_root: Path, data_dir: Path, analysis_dir
         )
         prediction_sha = sha256_file(prediction_path)
         metadata_sha = sha256_file(metadata_path) if metadata_path.exists() else ""
+        source64_dir = analysis_dir / "64_Ver4_2_future_top10"
+        ymd = target_date.strftime("%Y%m%d")
+        quarantine = assess_evaluation_quarantine(
+            project_root,
+            "MARUHAN_MAEBASHI",
+            target_date,
+            category,
+            prediction_path,
+            metadata_path,
+            source64_dir / f"64_prediction_{ymd}_all514.csv",
+            source64_dir / f"64_prediction_{ymd}_metadata.csv",
+        )
         latest_date = target_date - pd.Timedelta(days=1)
         latest_date = latest_date.date() if hasattr(latest_date, "date") else latest_date
         prediction_ok = False
@@ -257,16 +272,21 @@ def evaluate_formal_predictions(project_root: Path, data_dir: Path, analysis_dir
                 "EVALUATED_FORWARD_VALID" if prediction_class == PREDICTION_CLASS_FORWARD_VALID
                 else "EVALUATED_LEGACY_UNVERIFIED"
             )
+        if quarantine.quarantined:
+            prediction_class = PREDICTION_CLASS_FORWARD_VALID
+            evaluation_status = quarantine.status
 
         status_rows.append({
             "target_date": target_date, "category": category,
             "status": evaluation_status, "prediction_class": prediction_class,
-            "reason": reason or prediction_error or actual_error,
+            "reason": quarantine.reason or reason or prediction_error or actual_error,
             "prediction_path": str(prediction_path),
             "metadata_path": str(metadata_path) if metadata_path.exists() else "",
             "actual_path": str(actual_path) if actual_path else "",
             "prediction_sha256": prediction_sha, "metadata_sha256": metadata_sha,
             "actual_sha256": actual_sha,
+            "evaluation_eligible": quarantine.evaluation_eligible,
+            "quarantine_reason_code": quarantine.reason_code,
         })
 
         formal_complete = evaluation_status == "EVALUATED_FORWARD_VALID"
@@ -325,6 +345,8 @@ def evaluate_formal_predictions(project_root: Path, data_dir: Path, analysis_dir
             "prediction_sha256": prediction_sha, "metadata_sha256": metadata_sha,
             "actual_sha256": actual_sha,
             "actual_filename_date_ok": actual_ok, "actual_internal_date_ok": actual_ok,
+            "evaluation_eligible": quarantine.evaluation_eligible,
+            "quarantine_reason_code": quarantine.reason_code,
         })
 
     status = pd.DataFrame(status_rows, columns=STATUS_COLUMNS)

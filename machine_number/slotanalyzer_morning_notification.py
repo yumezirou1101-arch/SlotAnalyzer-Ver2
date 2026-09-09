@@ -338,6 +338,18 @@ def _load_yesterday_normal_evaluation(
 
         evaluation_status = status.get("status", "")
         prediction_class = status.get("prediction_class", "")
+        if evaluation_status in {
+            "SKIPPED_INVENTORY_GUARD_INCIDENT",
+            "MANUAL_REVIEW_QUARANTINE_SHA_MISMATCH",
+        }:
+            message = (
+                "Inventory Guard incidentのため正式評価から除外"
+                if evaluation_status == "SKIPPED_INVENTORY_GUARD_INCIDENT"
+                else "Quarantine証跡不整合のため正式評価を安全停止"
+            )
+            return YesterdayNormalEvaluation(
+                target_date, evaluation_status, message, [], []
+            )
         if evaluation_status in {"PENDING_FORWARD_VALID", "SKIPPED_ACTUAL_QUALITY_FAIL"}:
             return YesterdayNormalEvaluation(
                 target_date, evaluation_status,
@@ -450,6 +462,18 @@ def _load_yesterday_derived_evaluation(
         status = status_rows[0]
         evaluation_status = status.get("status", "")
         prediction_class = status.get("prediction_class", "")
+        if evaluation_status in {
+            "SKIPPED_INVENTORY_GUARD_INCIDENT",
+            "MANUAL_REVIEW_QUARANTINE_SHA_MISMATCH",
+        }:
+            message = (
+                "Inventory Guard incidentのため正式評価から除外"
+                if evaluation_status == "SKIPPED_INVENTORY_GUARD_INCIDENT"
+                else "Quarantine証跡不整合のため正式評価を安全停止"
+            )
+            return YesterdayDerivedEvaluation(
+                target_date, label, evaluation_status, message, [], []
+            )
         if evaluation_status != "EVALUATED_FORWARD_VALID" or prediction_class != "FORWARD_VALID":
             message = (
                 "Legacy predictionのため正式成績対象外"

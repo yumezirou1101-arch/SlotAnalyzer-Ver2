@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from slotanalyzer_evaluation_quarantine import assess_evaluation_quarantine
+
 
 # ============================================================
 # 69 - V4.2 Live Prediction Backtest
@@ -1835,6 +1837,7 @@ def build_forward_coverage(
         "prediction_exists",
         "prediction_class",
         "evaluation_status",
+        "evaluation_eligible",
     ]
     if status_df.empty:
         return pd.DataFrame(
@@ -1893,14 +1896,19 @@ def build_forward_coverage(
             evaluation_status = status_row[
                 "status"
             ]
+            evaluation_eligible = status_row.get(
+                "evaluation_eligible", True
+            )
         elif actual_exists:
             prediction_class = "MISSING"
             evaluation_status = (
                 "MISSING_FROZEN_PREDICTION"
             )
+            evaluation_eligible = False
         else:
             prediction_class = ""
             evaluation_status = "NO_DATA"
+            evaluation_eligible = False
 
         rows.append(
             {
@@ -1909,6 +1917,7 @@ def build_forward_coverage(
                 "prediction_exists": prediction_exists,
                 "prediction_class": prediction_class,
                 "evaluation_status": evaluation_status,
+                "evaluation_eligible": evaluation_eligible,
             }
         )
 
@@ -2102,6 +2111,24 @@ def main() -> None:
             actual_ok,
         )
 
+        metadata_path = Path(metadata["metadata_path"])
+        all514_path = PREDICTION_DIR / (
+            f"64_prediction_{filename_target_date.strftime('%Y%m%d')}_all514.csv"
+        )
+        quarantine = assess_evaluation_quarantine(
+            PROJECT_ROOT,
+            "MARUHAN_MAEBASHI",
+            filename_target_date.date(),
+            "NORMAL",
+            prediction_path,
+            metadata_path,
+            all514_path,
+            metadata_path,
+        )
+        if quarantine.quarantined:
+            prediction_class = PREDICTION_CLASS_FORWARD_VALID
+            status = quarantine.status
+
         status_rows.append(
             {
                 "target_date":
@@ -2139,6 +2166,9 @@ def main() -> None:
                     metadata[
                         "metadata_weight_fingerprint"
                     ],
+                "evaluation_eligible": quarantine.evaluation_eligible,
+                "quarantine_reason_code": quarantine.reason_code,
+                "quarantine_reason": quarantine.reason,
             }
         )
 

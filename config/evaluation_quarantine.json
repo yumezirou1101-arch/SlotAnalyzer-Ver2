@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "status": "ACTIVE",
+      "store": "MARUHAN_MAEBASHI",
+      "target_date": "2026-09-09",
+      "category": "NORMAL",
+      "prediction_path": "data/maruhan_maebashi/machine_number/analysis_31days_deep/64_Ver4_2_future_top10/64_prediction_20260909_top10.csv",
+      "prediction_sha256": "4eb38ca779ef32b0e0af542eaed37b4b4fff68bf235d232eb5730d617d144122",
+      "metadata_path": "data/maruhan_maebashi/machine_number/analysis_31days_deep/64_Ver4_2_future_top10/64_prediction_20260909_metadata.csv",
+      "metadata_sha256": "2cecd8fe95973b2bd19f01b6de0eeb631d73b94b6a05c7ddcb1096cace920f34",
+      "source_64_all514_sha256": "655f08bf21b1e527f36283f915dd9d36f756e4eda7f49e9274edd9200c67d6d1",
+      "source_64_metadata_sha256": "2cecd8fe95973b2bd19f01b6de0eeb631d73b94b6a05c7ddcb1096cace920f34",
+      "reason_code": "INVENTORY_GUARD_INCIDENT",
+      "reason": "The 2026-09-07 inventory transition renamed 121 machine identities before production epoch handling was adopted.",
+      "incident_date": "2026-09-07",
+      "created_at_jst": "2026-09-09T18:30:00+09:00"
+    },
+    {
+      "status": "ACTIVE",
+      "store": "MARUHAN_MAEBASHI",
+      "target_date": "2026-09-09",
+      "category": "A_TYPE",
+      "prediction_path": "data/maruhan_maebashi/machine_number/analysis_31days_deep/74_Ver4_2_A_type_prediction/74_A_type_prediction_20260909_top10.csv",
+      "prediction_sha256": "27f4e15fff620284f0cb08beba17b95400f78497b0c2780a15fe2ea0e72f58f5",
+      "metadata_path": "data/maruhan_maebashi/machine_number/analysis_31days_deep/74_Ver4_2_A_type_prediction/74_A_type_prediction_20260909_metadata.csv",
+      "metadata_sha256": "4d54441e102841e7b47d52cbc53549d30eeaedefada7bedb75f705ce979d20a9",
+      "source_64_all514_sha256": "655f08bf21b1e527f36283f915dd9d36f756e4eda7f49e9274edd9200c67d6d1",
+      "source_64_metadata_sha256": "2cecd8fe95973b2bd19f01b6de0eeb631d73b94b6a05c7ddcb1096cace920f34",
+      "reason_code": "INVENTORY_GUARD_INCIDENT",
+      "reason": "The 2026-09-07 inventory transition renamed 121 machine identities before production epoch handling was adopted.",
+      "incident_date": "2026-09-07",
+      "created_at_jst": "2026-09-09T18:30:00+09:00"
+    },
+    {
+      "status": "ACTIVE",
+      "store": "MARUHAN_MAEBASHI",
+      "target_date": "2026-09-09",
+      "category": "JUGGLER",
+      "prediction_path": "data/maruhan_maebashi/machine_number/analysis_31days_deep/75_Ver4_2_Juggler_prediction/75_Juggler_prediction_20260909_top10.csv",
+      "prediction_sha256": "44d41a00687c6fb672a4517e97573493a5d04fad21cb5a0196440e661aca8fea",
+      "metadata_path": "data/maruhan_maebashi/machine_number/analysis_31days_deep/75_Ver4_2_Juggler_prediction/75_Juggler_prediction_20260909_metadata.csv",
+      "metadata_sha256": "59b55ec3510b4af5e0db54dacf1276eab4332bb5098948669acca633066c835a",
+      "source_64_all514_sha256": "655f08bf21b1e527f36283f915dd9d36f756e4eda7f49e9274edd9200c67d6d1",
+      "source_64_metadata_sha256": "2cecd8fe95973b2bd19f01b6de0eeb631d73b94b6a05c7ddcb1096cace920f34",
+      "reason_code": "INVENTORY_GUARD_INCIDENT",
+      "reason": "The 2026-09-07 inventory transition renamed 121 machine identities before production epoch handling was adopted.",
+      "incident_date": "2026-09-07",
+      "created_at_jst": "2026-09-09T18:30:00+09:00"
+    }
+  ]
+}

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from slotanalyzer_derived_prediction_evaluation import evaluate_formal_predictions
+from slotanalyzer_evaluation_quarantine import assess_evaluation_quarantine
 
 
 # ============================================================
@@ -741,6 +742,35 @@ def main():
         target_date,
         prediction_path,
     ) in predictions:
+
+        ymd = target_date.strftime("%Y%m%d")
+        metadata_path = {
+            "NORMAL": NORMAL_DIR / f"64_prediction_{ymd}_metadata.csv",
+            "A_TYPE": A_TYPE_DIR / f"74_A_type_prediction_{ymd}_metadata.csv",
+            "JUGGLER": JUGGLER_DIR / f"75_Juggler_prediction_{ymd}_metadata.csv",
+        }[prediction_type]
+        quarantine = assess_evaluation_quarantine(
+            PROJECT_ROOT,
+            "MARUHAN_MAEBASHI",
+            target_date.date(),
+            prediction_type,
+            prediction_path,
+            metadata_path,
+            NORMAL_DIR / f"64_prediction_{ymd}_all514.csv",
+            NORMAL_DIR / f"64_prediction_{ymd}_metadata.csv",
+        )
+
+        if quarantine.quarantined:
+            status_rows.append(
+                {
+                    "prediction_type": prediction_type,
+                    "target_date": target_date,
+                    "status": quarantine.status,
+                    "prediction_file": str(prediction_path),
+                    "actual_file": "",
+                }
+            )
+            continue
 
         actual_path = actual_map.get(
             target_date

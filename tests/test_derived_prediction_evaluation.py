@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ if str(MACHINE) not in sys.path:
     sys.path.insert(0, str(MACHINE))
 
 import slotanalyzer_derived_prediction_evaluation as evaluation
+import slotanalyzer_evaluation_quarantine as quarantine
 import slotanalyzer_morning_notification as notification
 import slotanalyzer_morning_automation_support as support
 
@@ -30,6 +32,11 @@ class DerivedPredictionEvaluationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        config = self.root / "config"
+        config.mkdir()
+        (config / "evaluation_quarantine.json").write_text(
+            json.dumps({"schema_version": 1, "entries": []}), encoding="utf-8"
+        )
         self.analysis = self.root / "analysis"
         self.source = phase2a.write_source64(self.root)
         self.data = self.root / "data"
@@ -119,6 +126,48 @@ class DerivedPredictionEvaluationTests(unittest.TestCase):
             "76_formal_daily.csv", "76_formal_coverage.csv",
         ):
             self.assertTrue((self.output / filename).is_file())
+
+    def test_quarantined_formal_predictions_are_not_evaluated(self):
+        directories = self._formal_fixture()
+        entries = []
+        ymd = TARGET.strftime("%Y%m%d")
+        source_all = self.source / f"64_prediction_{ymd}_all514.csv"
+        source_meta = self.source / f"64_prediction_{ymd}_metadata.csv"
+        for category, directory in directories.items():
+            prefix = "74_A_type_prediction" if category == "A_TYPE" else "75_Juggler_prediction"
+            prediction = directory / f"{prefix}_{ymd}_top10.csv"
+            metadata = directory / f"{prefix}_{ymd}_metadata.csv"
+            entries.append({
+                "status": "ACTIVE", "store": "MARUHAN_MAEBASHI",
+                "target_date": TARGET.isoformat(), "category": category,
+                "prediction_path": prediction.relative_to(self.root).as_posix(),
+                "prediction_sha256": quarantine.sha256_file(prediction),
+                "metadata_path": metadata.relative_to(self.root).as_posix(),
+                "metadata_sha256": quarantine.sha256_file(metadata),
+                "source_64_all514_sha256": quarantine.sha256_file(source_all),
+                "source_64_metadata_sha256": quarantine.sha256_file(source_meta),
+                "reason_code": "INVENTORY_GUARD_INCIDENT", "reason": "test incident",
+                "incident_date": "2026-09-06", "created_at_jst": "2026-09-07T08:30:00+09:00",
+            })
+        registry = self.root / "config/evaluation_quarantine.json"
+        registry.write_text(json.dumps({"schema_version": 1, "entries": entries}), encoding="utf-8")
+        status, detail, daily, coverage = self._evaluate()
+        self.assertEqual(set(status["prediction_class"]), {"FORWARD_VALID"})
+        self.assertEqual(set(status["status"]), {"SKIPPED_INVENTORY_GUARD_INCIDENT"})
+        self.assertTrue(detail.empty)
+        self.assertTrue(daily.empty)
+        self.assertFalse(coverage["formal_evaluation_complete"].any())
+        self.assertFalse(coverage["evaluation_eligible"].any())
+        atype_top10 = directories["A_TYPE"] / f"74_A_type_prediction_{ymd}_top10.csv"
+        atype_top10.write_bytes(atype_top10.read_bytes() + b"\n")
+        mismatch_status, mismatch_detail, mismatch_daily, _ = self._evaluate()
+        atype_row = mismatch_status[mismatch_status["category"] == "A_TYPE"].iloc[0]
+        self.assertEqual(
+            atype_row["status"], "MANUAL_REVIEW_QUARANTINE_SHA_MISMATCH"
+        )
+        self.assertEqual(atype_row["prediction_class"], "FORWARD_VALID")
+        self.assertTrue(mismatch_detail.empty)
+        self.assertTrue(mismatch_daily.empty)
 
     def test_formal_prediction_without_actual_is_pending(self):
         self._formal_fixture(actual=False)
