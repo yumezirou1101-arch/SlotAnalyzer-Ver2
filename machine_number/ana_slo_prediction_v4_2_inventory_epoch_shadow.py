@@ -207,6 +207,51 @@ def compare_inventories(previous: pd.DataFrame, current: pd.DataFrame) -> Invent
     )
 
 
+def build_persistent_inventory_diff(observations: pd.DataFrame, as_of_date) -> InventoryDiff:
+    """Return the active rename epoch at *as_of_date* as an InventoryDiff.
+
+    Unlike a one-day inventory comparison, a renamed machine remains classified
+    as ``renamed`` until its current continuous epoch ends.  First appearances
+    (added machines) are deliberately not promoted to renamed machines; Stage E
+    records those as event evidence but does not apply the rename policy to them.
+    """
+    as_of = normalize_day(as_of_date)
+    epochs = build_continuous_epochs(observations, as_of)
+    if epochs.rows.empty:
+        return InventoryDiff(
+            pd.DataFrame(columns=(
+                "machine_no", "old_machine_name", "new_machine_name", "classification"
+            )), 0, 0, 0, 0, 0, 0,
+        )
+    current = epochs.current.set_index("machine_no")
+    rows = []
+    for machine_no in sorted(current.index):
+        summary = current.loc[machine_no]
+        sequence = int(summary.epoch_sequence)
+        old_name = ""
+        classification = "unchanged"
+        if sequence > 1:
+            prior = epochs.rows[
+                (epochs.rows.machine_no == int(machine_no))
+                & (epochs.rows.epoch_sequence == sequence - 1)
+            ].sort_values("date")
+            if prior.empty:
+                raise AssertionError(f"Missing predecessor epoch for machine_no={machine_no}")
+            old_name = str(prior.iloc[-1].machine_name)
+            classification = "renamed"
+        rows.append({
+            "machine_no": int(machine_no),
+            "old_machine_name": old_name,
+            "new_machine_name": str(summary.machine_name),
+            "classification": classification,
+        })
+    detail = pd.DataFrame(rows)
+    renamed = int(detail.classification.eq("renamed").sum())
+    unchanged = int(detail.classification.eq("unchanged").sum())
+    count = int(len(detail))
+    return InventoryDiff(detail, count, count, unchanged, renamed, 0, 0)
+
+
 def build_continuous_epochs(observations: pd.DataFrame, as_of_date) -> EpochBuildResult:
     """Build machine-level epochs from observations no later than as-of."""
     required = {"date", "machine_no", "machine_name", "games", "diff"}
