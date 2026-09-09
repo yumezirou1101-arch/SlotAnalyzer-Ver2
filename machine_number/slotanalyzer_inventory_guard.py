@@ -397,6 +397,7 @@ def _atomic_write_state(path: Path, value: dict) -> None:
 def _state_for_change(policy: InventoryGuardPolicy, diff: InventoryDiff) -> dict:
     return {
         "version": 1,
+        "incident_kind": "ACTUAL_CHANGE",
         "store": policy.store,
         "detected_at": datetime.now(timezone.utc).astimezone().isoformat(),
         "change_date": diff.current_date,
@@ -412,8 +413,30 @@ def _state_for_change(policy: InventoryGuardPolicy, diff: InventoryDiff) -> dict
     }
 
 
+def _state_for_unconfirmed_known_change(
+    policy: InventoryGuardPolicy,
+    target_date: date,
+    latest_data_date: date,
+) -> dict:
+    return {
+        "version": 1,
+        "incident_kind": "KNOWN_CHANGE_UNCONFIRMED",
+        "store": policy.store,
+        "detected_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "change_date": target_date.isoformat(),
+        "target_date": target_date.isoformat(),
+        "latest_data_date": latest_data_date.isoformat(),
+        "reason": "Known inventory change date has no confirmed target inventory.",
+        "status": "BLOCKED",
+        "approved_at": "",
+        "approved_reason": "",
+    }
+
+
 def _diff_from_state(state: dict) -> InventoryDiff | None:
     if not state:
+        return None
+    if state.get("incident_kind") == "KNOWN_CHANGE_UNCONFIRMED":
         return None
     try:
         return InventoryDiff(
@@ -435,6 +458,8 @@ def _same_change(state: dict, diff: InventoryDiff) -> bool:
 
 
 def _is_explicitly_approved(state: dict) -> bool:
+    if state.get("incident_kind") == "KNOWN_CHANGE_UNCONFIRMED":
+        return False
     approved = (
         state.get("status") == "APPROVED"
         and bool(str(state.get("approved_at", "")).strip())
@@ -462,39 +487,105 @@ def assess_inventory_guard(
     state_path = inventory_guard_state_path(data_dir)
     persistent_state = _read_persistent_state(state_path, policy)
 
-    if known_change and not confirmed_exists:
+    def blocked_result(reason: str, comparison: InventoryDiff | None) -> InventoryGuardResult:
         return InventoryGuardResult(
-            status="MANUAL_REVIEW", blocked=True,
-            reason="Known inventory change date has no confirmed target inventory.",
+            status="MANUAL_REVIEW", blocked=True, reason=reason,
             target_date=target_date.isoformat(), latest_data_date=latest_data_date.isoformat(),
-            known_change_date=True, confirmed_target_inventory_path=str(confirmed_path),
-            confirmed_target_inventory_exists=False, persistent_state=persistent_state,
+            known_change_date=known_change, confirmed_target_inventory_path=str(confirmed_path),
+            confirmed_target_inventory_exists=confirmed_exists, comparison=comparison,
+            persistent_state=persistent_state,
         )
 
-    current_path = confirmed_path if known_change else daily_inventory_path(data_dir, latest_data_date, policy)
-    current_date = target_date if known_change else latest_data_date
-    previous_date = current_date - timedelta(days=1)
-    previous_path = daily_inventory_path(data_dir, previous_date, policy)
+    def block_for_change(comparison: InventoryDiff, reason: str) -> InventoryGuardResult | None:
+        nonlocal persistent_state
+        if _is_explicitly_approved(persistent_state) and _same_change(persistent_state, comparison):
+            return None
+        same_blocked_change = (
+            persistent_state.get("status") == "BLOCKED"
+            and _same_change(persistent_state, comparison)
+        )
+        if same_blocked_change:
+            return blocked_result(reason, comparison)
+        planned_incident_now_confirmed_by_actual = (
+            persistent_state.get("status") == "BLOCKED"
+            and persistent_state.get("incident_kind") == "KNOWN_CHANGE_UNCONFIRMED"
+            and persistent_state.get("change_date") == comparison.current_date
+        )
+        if planned_incident_now_confirmed_by_actual:
+            persistent_state = _state_for_change(policy, comparison)
+            _atomic_write_state(state_path, persistent_state)
+            return blocked_result(reason, comparison)
+        if persistent_state and not _is_explicitly_approved(persistent_state):
+            return blocked_result(
+                "A different unapproved inventory incident is already persisted; formal Forward remains stopped.",
+                comparison,
+            )
+        persistent_state = _state_for_change(policy, comparison)
+        _atomic_write_state(state_path, persistent_state)
+        return blocked_result(reason, comparison)
+
+    # Always inspect the latest available actual transition first.  This must
+    # precede the known-change confirmed-inventory gate so actual evidence is
+    # never lost by an early return.
+    actual_current_date = latest_data_date
+    actual_previous_date = actual_current_date - timedelta(days=1)
+    actual_previous_path = daily_inventory_path(data_dir, actual_previous_date, policy)
+    actual_current_path = daily_inventory_path(data_dir, actual_current_date, policy)
     comparison = None
-    if previous_path.is_file() and current_path.is_file():
-        comparison = compare_inventory_files(previous_path, current_path, previous_date, current_date)
+    if actual_previous_path.is_file() and actual_current_path.is_file():
+        comparison = compare_inventory_files(
+            actual_previous_path,
+            actual_current_path,
+            actual_previous_date,
+            actual_current_date,
+        )
         if comparison.has_changes:
-            if not (_is_explicitly_approved(persistent_state) and _same_change(persistent_state, comparison)):
-                same_blocked_change = (
-                    persistent_state.get("status") == "BLOCKED"
-                    and _same_change(persistent_state, comparison)
+            blocked = block_for_change(
+                comparison,
+                "Actual inventory change detected; explicit safety approval is required.",
+            )
+            if blocked is not None:
+                return blocked
+
+    if known_change and not confirmed_exists:
+        same_planned_block = (
+            persistent_state.get("status") == "BLOCKED"
+            and persistent_state.get("incident_kind") == "KNOWN_CHANGE_UNCONFIRMED"
+            and persistent_state.get("change_date") == target_date.isoformat()
+        )
+        if not same_planned_block and not (
+            persistent_state and not _is_explicitly_approved(persistent_state)
+        ):
+            persistent_state = _state_for_unconfirmed_known_change(
+                policy, target_date, latest_data_date
+            )
+            _atomic_write_state(state_path, persistent_state)
+        return blocked_result(
+            "Known inventory change date has no confirmed target inventory.",
+            comparison,
+        )
+
+    # A confirmed target inventory remains an additional, separate transition.
+    if known_change:
+        confirmed_previous_date = target_date - timedelta(days=1)
+        confirmed_previous_path = daily_inventory_path(
+            data_dir, confirmed_previous_date, policy
+        )
+        if confirmed_previous_path.is_file() and confirmed_path.is_file():
+            confirmed_comparison = compare_inventory_files(
+                confirmed_previous_path,
+                confirmed_path,
+                confirmed_previous_date,
+                target_date,
+            )
+            comparison = confirmed_comparison
+            if confirmed_comparison.has_changes:
+                blocked = block_for_change(
+                    confirmed_comparison,
+                    "Confirmed target inventory change detected; explicit safety approval is required.",
                 )
-                if not same_blocked_change:
-                    persistent_state = _state_for_change(policy, comparison)
-                    _atomic_write_state(state_path, persistent_state)
-                return InventoryGuardResult(
-                    status="MANUAL_REVIEW", blocked=True,
-                    reason="Inventory change detected; explicit safety approval is required.",
-                    target_date=target_date.isoformat(), latest_data_date=latest_data_date.isoformat(),
-                    known_change_date=known_change, confirmed_target_inventory_path=str(confirmed_path),
-                    confirmed_target_inventory_exists=confirmed_exists, comparison=comparison,
-                    persistent_state=persistent_state,
-                )
+                if blocked is not None:
+                    return blocked
 
     if persistent_state and not _is_explicitly_approved(persistent_state):
         reason = (
