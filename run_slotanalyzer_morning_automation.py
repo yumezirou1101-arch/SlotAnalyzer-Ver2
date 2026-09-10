@@ -47,7 +47,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     verify_big_march_provisional_completion,
     verify_store_completion,
 )
-from slotanalyzer_morning_notification import send_notification_best_effort  # noqa: E402
+from slotanalyzer_morning_notification import notify_terminal_stores_best_effort  # noqa: E402
 from slotanalyzer_inventory_guard import (  # noqa: E402
     assess_inventory_guard,
     assess_yasuda_inventory_guard,
@@ -1222,7 +1222,7 @@ def finalize_automation_run(
     if clock is None:
         clock = now_jst
     if notification_function is None:
-        notification_function = send_notification_best_effort
+        notification_function = notify_terminal_stores_best_effort
 
     save_function(state_path, state, clock())
     summary_function(state)
@@ -1274,6 +1274,9 @@ def main() -> int:
                 return 2
             reconcile_startup_state(state, PROJECT_ROOT, operation_date, now_jst())
             save_state(state_path, state)
+            # Notification attempts are process-local, never part of store/run state.
+            notification_attempts = set()
+            notify_terminal_stores_best_effort(state, PROJECT_ROOT, notification_attempts)
             while not all_terminal(state):
                 for store in STORE_ORDER:
                     try:
@@ -1304,6 +1307,8 @@ def main() -> int:
                         item["last_completed_at_jst"] = current.isoformat()
                         save_state(state_path, state, current)
                         print(f"{store}: {item['status']}: {item['error']}", file=sys.stderr)
+                    # Dispatch before processing the next store or waiting for data.
+                    notify_terminal_stores_best_effort(state, PROJECT_ROOT, notification_attempts)
                 if all_terminal(state):
                     break
                 current = now_jst()
@@ -1320,6 +1325,9 @@ def main() -> int:
                 state_path,
                 state,
                 args.sleep_on_success,
+                notification_function=lambda value, root: notify_terminal_stores_best_effort(
+                    value, root, notification_attempts
+                ),
             )
     except LockUnavailableError as exc:
         print(f"ALREADY RUNNING: {exc}")

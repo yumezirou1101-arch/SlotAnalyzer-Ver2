@@ -270,7 +270,8 @@ class MorningNotificationTests(unittest.TestCase):
                 state, Path(directory), date(2026, 9, 6)
             )
         self.assertFalse(result.formal)
-        self.assertEqual(result.message, "Inventory Guardにより正式予測なし")
+        self.assertIn("Inventory Guardにより正式予測なし", result.message)
+        self.assertIn("前日予想なし", result.message)
 
     def test_yesterday_existing_formal_result_wins_over_current_inventory_block(self):
         state = state_with(["NEEDS_MANUAL_REVIEW", "SUCCESS", "SUCCESS"])

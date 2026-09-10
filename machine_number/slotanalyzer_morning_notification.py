@@ -9,7 +9,7 @@ import smtplib
 import ssl
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -20,6 +20,8 @@ from slotanalyzer_morning_automation_support import (
     STORE_BIGMARCH,
     STORE_MARUHAN,
     STORE_YASUDA,
+    STORE_ORDER,
+    TERMINAL_STATES,
     append_history_csv,
     now_jst,
     verify_big_march_completion,
@@ -29,6 +31,7 @@ from slotanalyzer_morning_automation_support import (
 )
 from slotanalyzer_derived_prediction_evidence import sha256_file, verify_derived_prediction
 from slotanalyzer_derived_prediction_evaluation import validate_actual_quality
+from slotanalyzer_notification_reference import has_quarantine, load_reference_result
 
 
 CREDENTIAL_TARGET = "SlotAnalyzer_Gmail_SMTP"
@@ -305,7 +308,7 @@ def _inventory_blocks_missing_prediction(state: dict) -> bool:
     return bool(guard.get("blocked"))
 
 
-def _load_yesterday_normal_evaluation(
+def _load_yesterday_normal_formal_evaluation(
     state: dict,
     root: Path,
     operation_date: date,
@@ -443,7 +446,7 @@ def _signed_medals(value: str) -> str:
     return f"+{number:,.0f}" if number > 0 else f"{number:,.0f}"
 
 
-def _load_yesterday_derived_evaluation(
+def _load_yesterday_derived_formal_evaluation(
     root: Path,
     operation_date: date,
     category: str,
@@ -564,16 +567,60 @@ def _load_yesterday_derived_evaluation(
         )
 
 
+def _with_reference(result, root: Path, category: str):
+    try:
+        quarantined = (
+            (root / "config/evaluation_quarantine.json").is_file()
+            and has_quarantine(root, result.target_date, category)
+        )
+    except Exception as exc:
+        return replace(result, status="RESULT_READ_ERROR", message=f"Quarantine確認エラー: {exc}",
+                       detail_rows=[], summary_rows=[])
+    if result.formal and not quarantined:
+        return result
+    if result.status in {"RESULT_READ_ERROR", "MANUAL_REVIEW_QUARANTINE_SHA_MISMATCH"} and not quarantined:
+        return result
+    status, message, details, summaries = load_reference_result(
+        root, result.target_date, category, result.message or result.status,
+    )
+    if details or quarantined:
+        return replace(result, status=status, message=message, detail_rows=details, summary_rows=summaries)
+    return replace(result, message=message)
+
+
+def _load_yesterday_normal_evaluation(state: dict, root: Path, operation_date: date):
+    return _with_reference(
+        _load_yesterday_normal_formal_evaluation(state, root, operation_date), root, "NORMAL"
+    )
+
+
+def _load_yesterday_derived_evaluation(root: Path, operation_date: date, category: str):
+    return _with_reference(
+        _load_yesterday_derived_formal_evaluation(root, operation_date, category), root, category
+    )
+
+
 def _rate(value: str) -> str:
     return f"{float(value):.1f}%"
 
 
+def _top10_summary_lines(result) -> list[str]:
+    total = sum(float(row["actual_diff"]) for row in result.detail_rows)
+    top10 = next(row for row in result.summary_rows if row["band"] == "TOP10")
+    return [
+        f"Top10実績合計：{_signed_medals(str(total))}枚（照合{len(result.detail_rows)}/10台）",
+        f"Top10平均：{float(top10['avg_diff']):+,.1f}枚",
+        f"勝率：{_rate(top10['win_rate'])}",
+    ]
+
+
 def _render_yesterday_plain(result: YesterdayNormalEvaluation) -> str:
     lines = [f"【昨日の予測結果 {result.target_date.isoformat()}】", "NORMAL"]
-    if not result.formal:
+    if not result.detail_rows:
         lines.extend([result.status, result.message])
         return "\n".join(lines)
-    lines.append("EVALUATED_FORWARD_VALID")
+    lines.extend([result.status, result.message])
+    lines.extend(_top10_summary_lines(result))
     for row in result.detail_rows:
         outcome = "WIN" if row.get("actual_win") == "1" else "LOSE"
         score = row.get("score", "")
@@ -582,7 +629,7 @@ def _render_yesterday_plain(result: YesterdayNormalEvaluation) -> str:
             f"{int(row['prediction_rank'])}. {row['machine_no']}番台　{row['machine_name']}"
             f"　{_signed_medals(row['actual_diff'])}枚　{outcome}{score_text}"
         )
-    lines.append("集計（69計算済み）:")
+    lines.append("集計（69計算済み）:" if result.formal else "集計（通知専用REFERENCE・正式集計対象外）:")
     for row in result.summary_rows:
         lines.append(
             f"{row['band']}　平均 {_signed_medals(row['avg_diff'])}枚　"
@@ -594,7 +641,7 @@ def _render_yesterday_plain(result: YesterdayNormalEvaluation) -> str:
 
 def _render_yesterday_html(result: YesterdayNormalEvaluation) -> str:
     heading = html.escape(f"【昨日の予測結果 {result.target_date.isoformat()}】")
-    if not result.formal:
+    if not result.detail_rows:
         return (
             '<section style="margin:20px 0">'
             f'<h3 style="margin:0 0 6px">{heading}</h3><div>NORMAL</div>'
@@ -605,7 +652,9 @@ def _render_yesterday_html(result: YesterdayNormalEvaluation) -> str:
     parts = [
         '<section style="margin:20px 0">',
         f'<h3 style="margin:0 0 6px">{heading}</h3>',
-        '<div>NORMAL</div><div style="font-weight:bold;color:#176b32">EVALUATED_FORWARD_VALID</div>',
+        f'<div>NORMAL</div><div style="font-weight:bold">{html.escape(result.status)}</div>',
+        f'<div>{html.escape(result.message)}</div>',
+        "".join(f'<div>{html.escape(line)}</div>' for line in _top10_summary_lines(result)),
     ]
     for row in result.detail_rows:
         outcome = "WIN" if row.get("actual_win") == "1" else "LOSE"
@@ -629,7 +678,7 @@ def _render_yesterday_html(result: YesterdayNormalEvaluation) -> str:
             '</tr></table>',
         ])
     parts.extend([
-        '<h4 style="margin:16px 0 4px">集計（69計算済み）</h4>',
+        '<h4 style="margin:16px 0 4px">' + ('集計（69計算済み）' if result.formal else '集計（通知専用REFERENCE・正式集計対象外）') + '</h4>',
     ])
     for row in result.summary_rows:
         parts.extend([
@@ -645,6 +694,10 @@ def _render_yesterday_html(result: YesterdayNormalEvaluation) -> str:
 
 
 def _render_yesterday_derived_plain(result: YesterdayDerivedEvaluation) -> str:
+    if not result.formal and result.detail_rows:
+        normal = YesterdayNormalEvaluation(result.target_date, result.status, result.message,
+                                           result.detail_rows, result.summary_rows)
+        return _render_yesterday_plain(normal).replace("\nNORMAL\n", f"\n{result.category}\n", 1)
     lines = [f"【前日 {result.category} 正式結果】"]
     if not result.formal:
         lines.append(result.message)
@@ -666,6 +719,10 @@ def _render_yesterday_derived_plain(result: YesterdayDerivedEvaluation) -> str:
 
 
 def _render_yesterday_derived_html(result: YesterdayDerivedEvaluation) -> str:
+    if not result.formal and result.detail_rows:
+        normal = YesterdayNormalEvaluation(result.target_date, result.status, result.message,
+                                           result.detail_rows, result.summary_rows)
+        return _render_yesterday_html(normal).replace('<div>NORMAL</div>', f'<div>{html.escape(result.category)}</div>', 1)
     heading = html.escape(f"【前日 {result.category} 正式結果】")
     if not result.formal:
         return (
@@ -989,7 +1046,9 @@ def _yasuda_section(state: dict, root: Path, operation_date: date) -> tuple[list
     return lines, warnings
 
 
-def build_notification_message(state: dict, project_root: Path) -> NotificationMessage:
+def build_notification_message(state: dict, project_root: Path, *, store: str | None = None) -> NotificationMessage:
+    if store is not None:
+        return build_store_notification_message(state, project_root, store)
     operation_date = date.fromisoformat(state["operation_date"])
     overall = determine_overall_status(state)
     sections: list[StoreSection] = []
@@ -1072,12 +1131,82 @@ def build_notification_message(state: dict, project_root: Path) -> NotificationM
     )
 
 
-def _already_sent(history_path: Path, state: dict) -> bool:
+def build_store_notification_message(state: dict, project_root: Path, store: str) -> NotificationMessage:
+    if store not in STORE_ORDER:
+        raise ValueError(f"Unknown notification store: {store}")
+    operation_date = date.fromisoformat(state["operation_date"])
+    item = _store_state(state, store)
+    status = str(item.get("status", "UNKNOWN"))
+    overall = (
+        "SUCCESS" if status in {"SUCCESS", "ALREADY_COMPLETE"}
+        else "MANUAL_REVIEW" if status in {"NEEDS_MANUAL_REVIEW", "MANUAL_REVIEW"}
+        else "PROVISIONAL" if status == "PROVISIONAL" else "FAILED"
+    )
+    if store == STORE_YASUDA:
+        lines, warnings = _yasuda_section(state, project_root, operation_date)
+        section = StoreSection(lines[0], lines[1:], [], [])
+    else:
+        builder = _maruhan_content if store == STORE_MARUHAN else _bigmarch_content
+        section, warnings = builder(state, project_root, operation_date)
+    yesterday_plain = yesterday_html = ""
+    if store == STORE_MARUHAN:
+        normal = _load_yesterday_normal_evaluation(state, project_root, operation_date)
+        derived = [_load_yesterday_derived_evaluation(project_root, operation_date, category)
+                   for category in ("A_TYPE", "JUGGLER")]
+        yesterday_plain = "\n\n".join([_render_yesterday_plain(normal)] + [
+            _render_yesterday_derived_plain(result) for result in derived])
+        yesterday_html = _render_yesterday_html(normal) + "".join(
+            _render_yesterday_derived_html(result) for result in derived)
+    if status not in {"SUCCESS", "ALREADY_COMPLETE"}:
+        warnings.append(f"{status} {item.get('error_category', '')} {item.get('error', '')}".strip())
+    warning_text = "\n".join(dict.fromkeys(warnings)) or "異常警告: なし"
+    heading = f"SlotAnalyzer {store.upper()} 朝結果 {operation_date.isoformat()}"
+    plain = "\n\n".join(filter(None, [heading, yesterday_plain,
+        _render_section_plain(section, include_details=False), warning_text,
+        _render_details_plain([section])]))
+    body = (
+        '<html><body style="margin:0;padding:12px;font-family:sans-serif;line-height:1.45;color:#222">'
+        f'<h2 style="margin:0 0 8px">{html.escape(heading)}</h2>'
+        f'{yesterday_html}{_render_section_html(section, include_details=False)}'
+        '<div style="margin:12px 0;padding:9px;background:#fff4e5;border-left:4px solid #e67e22">'
+        + "".join(f'<div>{html.escape(line)}</div>' for line in warning_text.splitlines())
+        + f'</div>{_render_details_html([section])}</body></html>'
+    )
+    return NotificationMessage(
+        f"[SlotAnalyzer][{store.upper()}][{overall}] {operation_date.isoformat()} 朝結果",
+        plain, body, overall,
+    )
+
+
+def notify_terminal_stores_best_effort(
+    state: dict, project_root: Path, attempted: set | None = None, *, sender=None,
+) -> None:
+    """One attempt per terminal store/process; persisted SENT rows deduplicate restarts.
+
+    A failure may retry on the next wrapper invocation, never each readiness pass.
+    This function must not mutate store state or participate in sleep decisions.
+    """
+    attempted = attempted if attempted is not None else set()
+    sender = sender or send_notification_best_effort
+    for store in STORE_ORDER:
+        if _store_state(state, store).get("status") not in TERMINAL_STATES:
+            continue
+        key = (state.get("automation_run_id"), state.get("operation_date"), store)
+        if key in attempted:
+            continue
+        attempted.add(key)
+        try:
+            sender(state, project_root, store=store)
+        except Exception as exc:
+            print(f"WARNING: {store} notification failed: {_safe_error(exc)}", file=sys.stderr)
+
+
+def _already_sent(history_path: Path, state: dict, notification_type: str = NOTIFICATION_TYPE) -> bool:
     for row in _read_rows(history_path):
         if (
             row.get("operation_date") == state.get("operation_date")
             and row.get("automation_run_id") == state.get("automation_run_id")
-            and row.get("notification_type") == NOTIFICATION_TYPE
+            and row.get("notification_type") in {NOTIFICATION_TYPE, notification_type}
             and row.get("status") == "SENT"
         ):
             return True
@@ -1097,26 +1226,30 @@ def send_notification_best_effort(
     project_root: Path,
     history_path: Path | None = None,
     *,
+    store: str | None = None,
     credential_reader: Callable[[], Credential] = read_windows_credential,
     smtp_factory=None,
     recipient: str | None = None,
     clock: Callable[[], datetime] = now_jst,
 ) -> bool:
     history_path = history_path or project_root / "logs/morning_automation/notification_history.csv"
-    if _already_sent(history_path, state):
-        return True
+    notification_type = NOTIFICATION_TYPE if store is None else f"{NOTIFICATION_TYPE}:{store.upper()}"
     attempted = clock().astimezone(JST)
-    message = build_notification_message(state, project_root)
     recipient = (recipient if recipient is not None else os.environ.get(RECIPIENT_ENV, "")).strip()
     masked = mask_recipient(recipient) if recipient else ""
-    message_hash = hashlib.sha256(
-        (message.subject + "\n" + message.plain + "\n" + message.html).encode("utf-8")
-    ).hexdigest()
+    message_hash = ""
+    message = None
     status = "FAILED"
     category = ""
     error = ""
     credential = None
     try:
+        if _already_sent(history_path, state, notification_type):
+            return True
+        message = build_notification_message(state, project_root, store=store)
+        message_hash = hashlib.sha256(
+            (message.subject + "\n" + message.plain + "\n" + message.html).encode("utf-8")
+        ).hexdigest()
         if not recipient or "@" not in recipient:
             raise NotificationConfigError(f"{RECIPIENT_ENV} is not configured with a valid address.")
         credential = credential_reader()
@@ -1140,10 +1273,10 @@ def send_notification_best_effort(
             "notification_id": f"notification_{uuid.uuid4().hex}",
             "automation_run_id": state.get("automation_run_id", ""),
             "operation_date": state.get("operation_date", ""),
-            "notification_type": NOTIFICATION_TYPE,
+            "notification_type": notification_type,
             "attempted_at_jst": attempted.isoformat(),
             "completed_at_jst": completed.isoformat(),
-            "overall_status": message.overall_status,
+            "overall_status": message.overall_status if message else "MESSAGE_BUILD_FAILED",
             "channel": "GMAIL_SMTP_SSL",
             "masked_recipient": masked,
             "status": status,
