@@ -82,6 +82,7 @@ SCHEMA_VERSION = 1
 DEFAULT_RETRY_INTERVAL_SEC = 300
 DEFAULT_MAX_FETCH_ATTEMPTS = 20
 DEFAULT_CHROME_WAIT_SEC = 15
+DEFAULT_FETCH_TIMEOUT_SEC = 120
 PROVISIONAL_MARUHAN_LAST_START = datetime_time(8, 30)
 OTHER_STORE_DEADLINE = datetime_time(9, 30)
 SLEEP_HELPER_PATH = PROJECT_ROOT / "sleep_windows_after_delay.py"
@@ -117,6 +118,12 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for common Chrome/CDP preflight. Default: 15.",
     )
     parser.add_argument(
+        "--fetch-timeout-sec",
+        type=int,
+        default=DEFAULT_FETCH_TIMEOUT_SEC,
+        help="Maximum seconds allowed for one Fetch child process. Default: 120.",
+    )
+    parser.add_argument(
         "--sleep-on-success",
         action="store_true",
         help="Request normal Windows sleep after all stores complete successfully.",
@@ -128,6 +135,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-fetch-attempts must be >= 1")
     if args.chrome_wait_sec < 1:
         parser.error("--chrome-wait-sec must be >= 1")
+    if args.fetch_timeout_sec < 1:
+        parser.error("--fetch-timeout-sec must be >= 1")
     return args
 
 
@@ -925,9 +934,16 @@ def _process_store(
         environment = {
             **os.environ,
             "SLOTANALYZER_MORNING_RUN_ID": state["automation_run_id"],
+            "PYTHONUNBUFFERED": "1",
         }
         result = run_logged_subprocess(
-            command, PROJECT_ROOT, log_path, "FETCH", environment=environment, clock=clock
+            command,
+            PROJECT_ROOT,
+            log_path,
+            "FETCH",
+            environment=environment,
+            clock=clock,
+            timeout_sec=args.fetch_timeout_sec,
         )
         readiness = check_source_readiness(store, PROJECT_ROOT, expected_data_date)
         current = clock().astimezone(JST)

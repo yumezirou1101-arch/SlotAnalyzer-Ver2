@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import csv
 import re
+from urllib.parse import unquote, urlsplit
 
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -68,6 +69,28 @@ def has_store_text(text: str) -> bool:
     return any(name in text for name in STORE_TEXTS)
 
 
+def is_store_list_url(url: str) -> bool:
+    try:
+        candidate = urlsplit(url)
+        expected = urlsplit(STORE_LIST_URL)
+    except ValueError:
+        return False
+
+    if candidate.scheme.lower() not in {"http", "https"}:
+        return False
+
+    candidate_host = (candidate.hostname or "").lower()
+    expected_host = (expected.hostname or "").lower()
+
+    candidate_path = unquote(candidate.path).rstrip("/")
+    expected_path = unquote(expected.path).rstrip("/")
+
+    return (
+        candidate_host == expected_host
+        and candidate_path == expected_path
+    )
+
+
 async def find_store_page(context):
     fallback = None
 
@@ -126,9 +149,14 @@ async def ensure_list_page(page):
     if LIST_TITLE_TEXT in title and has_store_text(title):
         return
 
-    print("returning to list page : browser back")
+    if is_store_list_url(page.url) and not title.strip():
+        print("list page URL confirmed : title temporarily blank")
+        return
 
-    await page.go_back(
+    print("returning to list page : explicit URL")
+
+    await page.goto(
+        STORE_LIST_URL,
         wait_until="domcontentloaded",
         timeout=30000,
     )
@@ -141,7 +169,6 @@ async def ensure_list_page(page):
         raise RuntimeError(
             "Could not return to the Big March Oyagi data-list page."
         )
-
 
 async def collect_date_links(page):
     anchor_rows = await page.locator("a").evaluate_all(

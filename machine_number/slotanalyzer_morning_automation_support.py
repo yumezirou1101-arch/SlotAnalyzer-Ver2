@@ -716,18 +716,28 @@ def run_logged_subprocess(
     stage: str,
     environment: dict[str, str] | None = None,
     clock: Callable[[], datetime] = now_jst,
+    timeout_sec: float | None = None,
 ) -> ProcessResult:
     _assert_safe_command(command)
+
+    if timeout_sec is not None and timeout_sec <= 0:
+        raise ValueError("timeout_sec must be greater than 0.")
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started_at = clock()
     started_perf = time.perf_counter()
+    timed_out = False
+
     with log_path.open("w", encoding="utf-8", newline="\n") as log:
         log.write(f"stage={stage}\n")
         log.write(f"started_at_jst={started_at.isoformat()}\n")
         log.write(f"cwd={cwd}\n")
         log.write(f"command={subprocess.list2cmdline(command)}\n")
+        if timeout_sec is not None:
+            log.write(f"timeout_sec={timeout_sec}\n")
         log.write("--- child output ---\n")
         log.flush()
+
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -736,15 +746,52 @@ def run_logged_subprocess(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        returncode = process.wait()
+
+        try:
+            returncode = process.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        [
+                            "taskkill",
+                            "/PID",
+                            str(process.pid),
+                            "/T",
+                            "/F",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=10,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            returncode = 124
+
         elapsed = time.perf_counter() - started_perf
         completed_at = clock()
+
         log.write("\n--- automation result ---\n")
         log.write(f"completed_at_jst={completed_at.isoformat()}\n")
         log.write(f"elapsed_sec={elapsed:.6f}\n")
+        log.write(f"timed_out={'true' if timed_out else 'false'}\n")
         log.write(f"returncode={returncode}\n")
         log.flush()
         os.fsync(log.fileno())
+
     return ProcessResult(
         returncode,
         started_at.isoformat(),
@@ -752,7 +799,6 @@ def run_logged_subprocess(
         elapsed,
         str(log_path),
     )
-
 
 def append_history_csv(path: Path, row: dict, fields: list[str]) -> None:
     lock_path = path.with_suffix(path.suffix + ".lock")

@@ -497,6 +497,29 @@ class Phase2SupportTests(unittest.TestCase):
             self.assertIn("safe child", text)
             self.assertIn("returncode=0", text)
 
+    def test_subprocess_timeout_returns_without_hanging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "timeout.log"
+            started = __import__("time").perf_counter()
+
+            result = run_logged_subprocess(
+                [sys.executable, "-c", "import time; print('child started', flush=True); time.sleep(30)"],
+                Path(directory),
+                log_path,
+                "UNIT_TEST_TIMEOUT",
+                timeout_sec=0.2,
+            )
+
+            elapsed = __import__("time").perf_counter() - started
+
+            self.assertEqual(result.returncode, 124)
+            self.assertLess(elapsed, 5.0)
+
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("stage=UNIT_TEST_TIMEOUT", text)
+            self.assertIn("child started", text)
+            self.assertIn("timed_out=true", text)
+            self.assertIn("returncode=124", text)
     def test_global_lock_rejects_second_process(self):
         with tempfile.TemporaryDirectory() as directory:
             lock_path = Path(directory) / "global.lock"
