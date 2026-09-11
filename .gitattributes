@@ -1,0 +1,2 @@
+# Keep the reviewed layout bytes in LF form for SHA-256 and whitespace checks.
+machine_number/maruhan_maebashi_floor_map_layout.csv text eol=lf

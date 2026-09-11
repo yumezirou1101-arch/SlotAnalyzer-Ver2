@@ -6,6 +6,7 @@ data/
 
 # Generated files
 *.csv
+!machine_number/maruhan_maebashi_floor_map_layout.csv
 *.xlsx
 *.xls
 *.pdf
@@ -39,3 +40,6 @@ minrepo_*_files/
 
 # Morning automation runtime files
 logs/morning_automation/
+
+# Reproducible floor-map PNG/metadata outputs
+outputs/floor_map/
