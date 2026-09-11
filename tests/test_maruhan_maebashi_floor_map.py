@@ -76,6 +76,37 @@ class FloorMapTests(unittest.TestCase):
         self.assertGreater(by_no[812].x,by_no[813].x)
         self.assertTrue(all(54 < math.hypot(s.x-744,s.y-416) < 61 for s in ring))
 
+    def test_v2_display_preserves_order_and_protected_gaps(self):
+        seats=floor.parse_layout(floor.DEFAULT_LAYOUT.read_bytes())
+        positions=floor.display_positions(seats)
+        by_no={s.machine_no:s for s in seats}
+        for a,b,c in [(842,843,841),(1015,1014,1016)]:
+            self.assertAlmostEqual(abs(positions[b][0]-positions[a][0]),2*abs(positions[a][0]-positions[c][0]))
+            self.assertEqual(positions[a][1],positions[b][1])
+        for a in seats:
+            for b in seats:
+                if (a.island_id,a.side)==(b.island_id,b.side):
+                    for axis,key in enumerate(('x','y')):
+                        original=getattr(a,key)-getattr(b,key)
+                        shown=positions[a.machine_no][axis]-positions[b.machine_no][axis]
+                        self.assertEqual(original>0,shown>0)
+                        self.assertEqual(original<0,shown<0)
+        for a,b in [(901,1114),(900,1113),(885,1112)]:
+            self.assertEqual(positions[a][0],positions[b][0])
+            self.assertLess(positions[a][1],positions[b][1])
+        self.assertEqual(len(positions),514)
+
+    def test_v2_exact_names_fit_or_fail_without_truncation(self):
+        font_path=floor.choose_font()
+        for name,width,height in [(' 長い機種名と半角 ABC  ',220,80),('マクロスフロンティア4',68,74)]:
+            font,lines,size=floor.fit_label(name,font_path,width,height)
+            self.assertEqual(''.join(lines),name)
+            self.assertLessEqual(len(lines),3)
+            self.assertGreaterEqual(size,12)
+            self.assertTrue(all(font.getlength(line)<=width-8 for line in lines))
+        with self.assertRaises(floor.FloorMapValidationError):
+            floor.fit_label('長'*300,font_path,68,74)
+
     def test_daily_validation_and_exact_name_join(self):
         seats = floor.parse_layout(floor.DEFAULT_LAYOUT.read_bytes())
         data_date,names = floor.parse_daily(self.daily.read_bytes(),self.daily.name)
@@ -176,8 +207,8 @@ class FloorMapTests(unittest.TestCase):
             self.assertEqual(image.format,'PNG')
             self.assertEqual(image.info['data_date'],'2026-09-09')
             self.assertEqual(image.info['machine_count'],'514')
-            self.assertEqual(image.width,4920)
-            self.assertGreater(image.height,3550)
+            self.assertEqual(image.width,4030)
+            self.assertEqual(image.height,3610)
             image.verify()
         self.assertEqual(metadata['matched'],514)
         self.assertEqual(metadata['missing'],0)
@@ -185,11 +216,31 @@ class FloorMapTests(unittest.TestCase):
         self.assertEqual(metadata['png_sha256'],floor.sha256_bytes(first))
         self.assertEqual(metadata['rendering']['text_overlap_count'],0)
         self.assertEqual(metadata['rendering']['text_clipping_count'],0)
+        self.assertFalse(metadata['rendering']['internal_island_labels_visible'])
+        self.assertFalse(metadata['rendering']['legend_visible'])
+        self.assertEqual(metadata['rendering']['number_font_size'],34)
+        self.assertTrue(all(''.join(g['lines'])==g['machine_name'] for g in metadata['rendering']['groups']))
         self.assertEqual(sum(len(g['machine_numbers']) for g in metadata['rendering']['groups']),514)
         self.assertTrue(all(g['machine_name']==' 同一機種A+ 半角　全角 ' for g in metadata['rendering']['groups']))
         floor.generate(self.daily,self.output)
         self.assertEqual(first,path.read_bytes())
         self.assertEqual(before,self.daily.read_bytes())
+
+    def test_v2_ring_multiple_names_use_local_callouts(self):
+        seats=floor.parse_layout(floor.DEFAULT_LAYOUT.read_bytes())
+        names={s.machine_no:'共通機種' for s in seats}
+        for number in range(797,814): names[number]='円形テスト機種'+str(number)
+        provenance=json.loads(floor.DEFAULT_LAYOUT.with_suffix('.json').read_bytes())
+        png,rendering=floor.render_png(seats,names,provenance,date(2026,9,9),'source','layout',floor.choose_font())
+        ring=[g for g in rendering['groups'] if g['side']=='RING']
+        self.assertEqual(len(ring),17)
+        self.assertEqual({g['machine_numbers'][0] for g in ring},set(range(797,814)))
+        for g in ring:
+            self.assertEqual(''.join(g['lines']),names[g['machine_numbers'][0]])
+            x0,y0,x1,y1=g['box']
+            self.assertTrue(0<=x0<x1<=rendering['width'])
+            self.assertTrue(0<=y0<y1<=rendering['height'])
+        self.assertEqual(rendering['label_overlap_count'],0)
 
     def test_newest_invalid_file_never_falls_back(self):
         new=self.root/'ana_slo_20260910.csv'

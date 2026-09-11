@@ -28,11 +28,8 @@ DEFAULT_DATA_DIR = ROOT / 'data/maruhan_maebashi/machine_number'
 DEFAULT_OUTPUT_DIR = ROOT / 'outputs/floor_map'
 EXPECTED_COUNT = 514
 PREFIX = 'maruhan_maebashi_floor_map'
-VERSION = '1.0'
+VERSION = '2.0'
 SIDE_ORDER = ('N', 'S', 'W', 'E', 'RING')
-SCALE = 4
-WIDTH = 4920
-MAP_BOTTOM = 3550
 PALETTE = ('#dcebf9', '#e2f1e8', '#f8ead5', '#ece4f6', '#f7e1e5', '#dff0f2')
 
 
@@ -223,131 +220,163 @@ def _number_ranges(numbers: tuple[int, ...]) -> str:
     return ', '.join(parts)
 
 
+def display_positions(seats: list[Seat]) -> dict[int, tuple[float, float]]:
+    """Schematic island translations; physical master and within-side order stay intact."""
+    east = {'E01': 2714, 'E02': 3094, 'E03': 3474, 'E04': 3840,
+            'E05': 2714, 'E06': 3094, 'E07': 3420}
+    horizontal_y = {'C01': 240, 'C02': 560, 'C03': 880, 'C04': 1200,
+                    'C08': 2970, 'C09': 3320}
+    result = {}
+    for seat in seats:
+        island = seat.island_id
+        if island in horizontal_y:
+            members = [s for s in seats if s.island_id == island]
+            x = 660 + (seat.x-550)*4
+            y = horizontal_y[island] + (seat.y-min(s.y for s in members))*4
+        elif island == 'C05':
+            x, y = 660+(seat.x-550)*4, 1680+(seat.y-416)*4
+        elif island in {'C06', 'C07'}:
+            x, y = 660+(seat.x-550)*4, 2110+(seat.y-520)*4.5
+        else:
+            members = [s for s in seats if s.island_id == island]
+            center = (min(s.x for s in members)+max(s.x for s in members))/2
+            anchor = east.get(island, 100 if island in {'W01','W03'} else 410)
+            x = anchor+(seat.x-center)*4
+            lower = island in {'W03','W04','E05','E06','E07'}
+            y = (2050 if lower else 288)+(seat.y-(507 if lower else 77))*4.5
+        result[seat.machine_no] = (x, y)
+    # The two protected holes must remain exactly two ordinary seat pitches apart.
+    for left, right, neighbor in [(842,843,841),(1015,1014,1016)]:
+        a,b,c = result[left],result[right],result[neighbor]
+        if abs(abs(b[0]-a[0])-2*abs(a[0]-c[0])) > .01 or a[1] != b[1]:
+            raise FloorMapValidationError('Protected one-seat gap changed')
+    return result
+
+
+def fit_label(value: str, font_path: Path, width: int, height: int):
+    """Prefer two lines; use three for narrow single seats, never truncate."""
+    for max_lines in (2, 3):
+        for size in range(28, 11, -1):
+            font = ImageFont.truetype(str(font_path), size)
+            lines = _wrap(value, font, width-8)
+            if len(lines) <= max_lines and len(lines)*(size+6) <= height-8:
+                return font, lines, size
+    raise FloorMapValidationError(f'Machine name cannot fit without clipping: {value!r}')
+
+
 def render_png(seats: list[Seat], names: dict[int, str], provenance: dict,
                target: date, source_sha: str, layout_sha: str, font_path: Path) -> tuple[bytes, dict]:
     groups = make_groups(seats, names)
-    group_by_no = {n: g for g in groups for n in g.machine_numbers}
+    group_by_no = {n:g for g in groups for n in g.machine_numbers}
     if len(group_by_no) != EXPECTED_COUNT:
         raise FloorMapValidationError('Label coverage must be 514/514')
-    fonts = {size: ImageFont.truetype(str(font_path), size) for size in (16, 24, 26, 28, 32, 42, 54)}
-    line_height = 46
-    card_width, margin, gap = 1170, 60, 40
-    cards = []
-    column_bottoms = [MAP_BOTTOM + 190] * 4
-    for island in sorted(provenance['islands']):
-        island_groups = [g for g in groups if g.island_id == island]
-        content = []
-        for group in island_groups:
-            name_lines = _wrap(f'{group.label_id}  {group.machine_name}', fonts[28], card_width - 64)
-            number_lines = _wrap(f'{group.side}  {_number_ranges(group.machine_numbers)}  ({len(group.machine_numbers)}台)', fonts[24], card_width - 64)
-            content.append((group, name_lines, number_lines))
-        height = 88 + sum((len(n) + len(m)) * line_height + 18 for _, n, m in content) + 24
-        column = min(range(4), key=lambda c: (column_bottoms[c], c))
-        x, y = margin + column * (card_width + gap), column_bottoms[column]
-        cards.append((island, x, y, height, content))
-        column_bottoms[column] += height + gap
-    image = Image.new('RGB', (WIDTH, max(column_bottoms) + 120), '#f4f6f8')
+    positions = display_positions(seats)
+    image = Image.new('RGB', (4030, 3610), '#ffffff')
     draw = ImageDraw.Draw(image)
-    text_boxes = []
-    def text(x, y, value, size=28, color='#182e42', centered=False):
-        font = fonts[size]
-        if centered:
-            x -= font.getlength(value) / 2
-        box = draw.textbbox((x, y), value, font=font, anchor='lt')
-        if min(box[0], box[1]) < 0 or box[2] > image.width or box[3] > image.height:
-            raise FloorMapValidationError(f'Text outside image: {value}')
-        draw.text((x, y), value, font=font, fill=color, anchor='lt')
-        if value.strip():
-            text_boxes.append(box)
-    draw.rectangle((0, 0, WIDTH, 175), fill='#173c61')
-    text(60, 32, 'マルハン メガシティ前橋インター  |  20スロ フロアマップ V1', 54, '#ffffff')
-    text(60, 112, f'データ日付 {target.isoformat()}  ・  514 / 514台照合済み  ・  5スロ581–620は正式対象外', 32, '#ffffff')
-    text(60, 202, '台番号の下のG番号 → 下段「島別 機種ラベル」の同じID。機種名はdaily CSV原文。配置は模式図です。', 28)
-    draw.rounded_rectangle((35, 262, WIDTH-35, MAP_BOTTOM), radius=16, fill='#ffffff', outline='#c8d1da', width=2)
-    def xy(x, y):
-        return (x - 350) * SCALE + 140, (y - 45) * SCALE + 330
-    seat_rects = []
+    text_boxes, seat_rects, label_boxes, rendered_labels = [], [], [], []
+    def intersects(a,b):
+        return min(a[2],b[2]) > max(a[0],b[0]) and min(a[3],b[3]) > max(a[1],b[1])
+    def ink(x,y,value,size,color='#162f44',center=False):
+        font = ImageFont.truetype(str(font_path),size)
+        if center: x -= font.getlength(value)/2
+        box = draw.textbbox((x,y),value,font=font,anchor='lt')
+        if box[0]<0 or box[1]<0 or box[2]>image.width or box[3]>image.height:
+            raise FloorMapValidationError('Text outside image')
+        draw.text((x,y),value,font=font,anchor='lt',fill=color)
+        text_boxes.append(box)
+    draw.rectangle((0,0,image.width,110),fill='#173c61')
+    ink(40,14,'マルハン メガシティ前橋インター  20スロ フロアマップ V2',42,'white')
+    ink(40,70,f'{target.isoformat()}  |  514台照合済み  |  機種名：daily CSV原文  |  配置は模式図',25,'white')
     for seat in seats:
+        cx,cy = positions[seat.machine_no]
         group = group_by_no[seat.machine_no]
-        fill = PALETTE[(int(group.label_id[1:])-1) % len(PALETTE)]
-        cx, cy = xy(seat.x, seat.y)
+        fill = PALETTE[(int(group.label_id[1:])-1)%len(PALETTE)]
         if seat.shape == 'rect':
-            # Dimensions fit both straight vertical and horizontal banks.
-            box = (cx-46, cy-29, cx+46, cy+29)
-            seat_rects.append((seat.machine_no, box))
-            draw.rectangle(box, fill=fill, outline='#42617a', width=2)
+            box = (cx-46,cy-29,cx+46,cy+29)
+            seat_rects.append((seat.machine_no,box))
+            draw.rectangle(box,fill=fill,outline='#42617a',width=2)
         else:
             ring = provenance['circular_island']
-            ring_seats = sorted((s for s in seats if s.shape == 'arc'), key=lambda s: s.rotation)
-            index = ring_seats.index(seat)
-            angle = seat.rotation
-            previous = ring_seats[index-1].rotation if index else ring_seats[-1].rotation - 360
-            following = ring_seats[index+1].rotation if index+1 < len(ring_seats) else ring_seats[0].rotation + 360
-            low, high = (previous+angle)/2, (angle+following)/2
-            polygon = []
-            # Widen the band inward for the second (G-ID) line, keeping seat centers
-            # and the outer footprint fixed to the original plan.
-            for radius, values in [(ring['outer_radius'], range(11)), (ring['inner_radius']-4, range(10,-1,-1))]:
-                for step in values:
-                    radians = math.radians(low + (high-low)*step/10)
-                    polygon.append(xy(ring['center_x'] + radius*math.cos(radians), ring['center_y'] + radius*math.sin(radians)))
-            draw.polygon(polygon, fill=fill, outline='#42617a', width=2)
-        text(cx, cy-24, str(seat.machine_no), 26, centered=True)
-        text(cx, cy+7, group.label_id, 16, centered=True)
-    for island in sorted(provenance['islands']):
-        members = [s for s in seats if s.island_id == island]
-        if island == 'C05':
-            x, y = xy(744, 411)
-            text(x, y-10, island, 32, centered=True)
-            text(x, y+37, '円形17台', 24, centered=True)
+            members = sorted((s for s in seats if s.shape=='arc'),key=lambda s:s.rotation)
+            i = members.index(seat)
+            before = members[i-1].rotation if i else members[-1].rotation-360
+            after = members[i+1].rotation if i+1<len(members) else members[0].rotation+360
+            lo,hi = (before+seat.rotation)/2,(seat.rotation+after)/2
+            polygon=[]
+            for radius,steps in [(ring['outer_radius'],range(11)),(ring['inner_radius']-4,range(10,-1,-1))]:
+                for step in steps:
+                    angle=math.radians(lo+(hi-lo)*step/10)
+                    polygon.append((660+(ring['center_x']-550+radius*math.cos(angle))*4,
+                                    1680+(ring['center_y']-416+radius*math.sin(angle))*4))
+            draw.polygon(polygon,fill=fill,outline='#42617a',width=2)
+        ink(cx,cy-20,str(seat.machine_no),34,center=True)
+    def label(group,box,rotate=False):
+        x0,y0,x1,y1 = [int(round(v)) for v in box]
+        if x0<0 or y0<0 or x1>image.width or y1>image.height or x1<=x0 or y1<=y0:
+            raise FloorMapValidationError('Machine label outside image')
+        width,height=x1-x0,y1-y0
+        tw,th = (height,width) if rotate else (width,height)
+        font,lines,size=fit_label(group.machine_name,font_path,tw,th)
+        tile=Image.new('RGB',(tw,th),PALETTE[(int(group.label_id[1:])-1)%len(PALETTE)])
+        td=ImageDraw.Draw(tile)
+        for i,line in enumerate(lines):
+            x=(tw-font.getlength(line))/2
+            y=(th-len(lines)*(size+6))/2+i*(size+6)
+            bounds=td.textbbox((x,y),line,font=font,anchor='lt')
+            if bounds[0]<0 or bounds[1]<0 or bounds[2]>tw or bounds[3]>th:
+                raise FloorMapValidationError('Machine name ink clipped')
+            td.text((x,y),line,font=font,anchor='lt',fill='#162f44')
+        if rotate: tile=tile.transpose(Image.Transpose.ROTATE_90)
+        image.paste(tile,(x0,y0))
+        label_boxes.append((x0,y0,x1,y1))
+        rendered_labels.append(dict(label_id=group.label_id,island_id=group.island_id,side=group.side,
+            machine_name=group.machine_name,machine_numbers=list(group.machine_numbers),
+            lines=lines,font_size=size,box=[x0,y0,x1,y1],rotated=rotate))
+    for group in groups:
+        if group.side=='RING': continue
+        points=[positions[n] for n in group.machine_numbers]
+        if group.side in {'N','S'}:
+            x0,x1=min(p[0] for p in points)-50,max(p[0] for p in points)+50
+            cy=points[0][1]
+            y0=cy-115 if group.side=='N' else cy+34
+            label(group,(x0,y0,x1,y0+80))
         else:
-            x, y = xy(min(s.x for s in members)-13, min(s.y for s in members)-21)
-            text(x, y-18, island, 24)
-    for x, label in [(1366, '601–620'), (1478, '581–600')]:
-        x1, y1 = xy(x-13, 495)
-        x2, y2 = xy(x+14, 830)
-        draw.rectangle((x1,y1,x2,y2), fill='#f1f1f1', outline='#aaaaaa', width=2)
-        for i, line in enumerate(['5スロ', '対象外']):
-            text((x1+x2)/2, y1+30+i*45, line, 24, '#666666', centered=True)
-        # Machine numbers of excluded slots are not added to the layout/join.
-        for i, character in enumerate(label):
-            text((x1+x2)/2, y1+155+i*35, character, 24, '#666666', centered=True)
-    text(60, MAP_BOTTOM+40, '島別 機種ラベル  |  G番号は配置図と一致・機種名を省略せず掲載', 42)
-    text(60, MAP_BOTTOM+110, 'N/S＝横島の上/下、W/E＝縦島の左/右、RING＝円形。空き位置・通路をまたぐ同一機種は別ラベル。', 26)
-    for island, x, y, height, content in cards:
-        draw.rounded_rectangle((x,y,x+card_width,y+height), radius=12, fill='#ffffff', outline='#c8d1da', width=2)
-        text(x+28, y+24, f'{island}  {provenance["islands"][island]}', 28)
-        cursor = y+88
-        for group, name_lines, number_lines in content:
-            fill = PALETTE[(int(group.label_id[1:])-1) % len(PALETTE)]
-            block_height = (len(name_lines)+len(number_lines))*line_height
-            draw.rectangle((x+14,cursor-6,x+card_width-14,cursor+block_height), fill=fill)
-            for line in name_lines:
-                text(x+30,cursor,line,28)
-                cursor += line_height
-            for line in number_lines:
-                text(x+30,cursor,line,24,'#425466')
-                cursor += line_height
-            cursor += 18
-    text(60, image.height-78, '位置マスターV1・現行機種はdaily CSVのみからJOIN / 予測・正式成績・Guard・朝自動化には接続していません。', 26)
-    # Check actual font ink bounds, not just string lengths. Fail rather than clip.
-    overlap_count = sum(1 for i,a in enumerate(text_boxes) for b in text_boxes[i+1:]
-                        if min(a[2],b[2]) > max(a[0],b[0]) and min(a[3],b[3]) > max(a[1],b[1]))
-    seat_overlaps = [(n,m) for i,(n,a) in enumerate(seat_rects) for m,b in seat_rects[i+1:]
-                     if min(a[2],b[2]) > max(a[0],b[0]) and min(a[3],b[3]) > max(a[1],b[1])]
-    if overlap_count or seat_overlaps:
-        raise FloorMapValidationError(f'Render overlap: text={overlap_count}, seats={seat_overlaps[:5]}')
-    info = PngImagePlugin.PngInfo()
-    for key, value in {'data_date': target.isoformat(), 'machine_count': '514',
-                       'source_sha256': source_sha, 'layout_sha256': layout_sha}.items():
-        info.add_text(key, value)
-    stream = io.BytesIO()
-    image.save(stream, format='PNG', pnginfo=info, optimize=False, compress_level=9)
-    return stream.getvalue(), dict(width=image.width,height=image.height,label_count=len(groups),
+            y0,y1=min(p[1] for p in points)-34,max(p[1] for p in points)+34
+            cx=points[0][0]
+            # Single west wall faces the floor, so its label goes on the right.
+            right=group.side=='E' or group.island_id in {'W01','W03'}
+            x0=cx+51 if right else cx-125
+            label(group,(x0,y0,x0+74,y1),rotate=True)
+    ring_groups=[g for g in groups if g.side=='RING']
+    if len(ring_groups)==1:
+        label(ring_groups[0],(1280,1630,1592,1730))
+    else:
+        # Local callouts beside the ring, ordered by the actual group centers.
+        ordered=sorted(ring_groups,key=lambda g:sum(positions[n][1] for n in g.machine_numbers)/len(g.machine_numbers))
+        for i,g in enumerate(ordered):
+            left=i%2==0; row=i//2
+            x0=650 if left else 1770; y0=1450+row*58
+            points=[positions[n] for n in g.machine_numbers]
+            point=min(points,key=lambda p:p[0]) if left else max(points,key=lambda p:p[0])
+            draw.line((point,(x0+470 if left else x0,y0+26)),fill='#60758a',width=2)
+            label(g,(x0,y0,x0+470,y0+52))
+    ink(40,3560,'5スロ581–620は対象外。空白842–843 / 1015–1014は1台分を保持。',25)
+    overlaps=sum(intersects(a,b) for i,a in enumerate(text_boxes) for b in text_boxes[i+1:])
+    seat_overlaps=sum(intersects(a,b) for i,(_,a) in enumerate(seat_rects) for _,b in seat_rects[i+1:])
+    label_overlaps=sum(intersects(a,b) for i,a in enumerate(label_boxes) for b in label_boxes[i+1:])
+    label_obstructions=sum(intersects(a,b) for a in label_boxes for b in text_boxes)
+    label_obstructions+=sum(intersects(a,b) for a in label_boxes for _,b in seat_rects)
+    if overlaps or seat_overlaps or label_overlaps or label_obstructions:
+        raise FloorMapValidationError(f'Render overlap: text={overlaps}, seats={seat_overlaps}, labels={label_overlaps}, obstruction={label_obstructions}')
+    info=PngImagePlugin.PngInfo()
+    for key,value in {'data_date':target.isoformat(),'machine_count':'514','source_sha256':source_sha,
+                      'layout_sha256':layout_sha,'generator_version':VERSION}.items():info.add_text(key,value)
+    stream=io.BytesIO();image.save(stream,format='PNG',pnginfo=info,optimize=False,compress_level=9)
+    return stream.getvalue(),dict(width=image.width,height=image.height,label_count=len(groups),
         labels_by_island=dict(sorted(Counter(g.island_id for g in groups).items())),
-        text_overlap_count=overlap_count,text_clipping_count=0,seat_overlap_count=0,
-        groups=[dict(label_id=g.label_id,island_id=g.island_id,side=g.side,machine_name=g.machine_name,
-                     machine_numbers=list(g.machine_numbers)) for g in groups])
+        text_overlap_count=0,text_clipping_count=0,seat_overlap_count=0,label_overlap_count=0,
+        internal_island_labels_visible=False,legend_visible=False,number_font_size=34,
+        groups=rendered_labels)
 
 
 def generate(daily_path: Path, output_dir: Path = DEFAULT_OUTPUT_DIR, layout_path: Path = DEFAULT_LAYOUT,
