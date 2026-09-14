@@ -87,6 +87,8 @@ PROVISIONAL_MARUHAN_LAST_START = datetime_time(8, 30)
 OTHER_STORE_DEADLINE = datetime_time(9, 30)
 SLEEP_HELPER_PATH = PROJECT_ROOT / "sleep_windows_after_delay.py"
 SLEEP_HELPER_DELAY_SEC = 10
+WRAPPER_SUCCESS_STATUSES = frozenset({"SUCCESS", "ALREADY_COMPLETE", "PROVISIONAL"})
+SLEEP_ELIGIBLE_STATUSES = frozenset({"SUCCESS", "ALREADY_COMPLETE"})
 
 STORE_LABELS = {
     STORE_MARUHAN: "Maruhan Mega City Maebashi Inter",
@@ -1139,10 +1141,21 @@ def should_sleep_on_success(
         and wrapper_returncode == 0
         and all_terminal(state)
         and all(
-            item["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
+            item["status"] in SLEEP_ELIGIBLE_STATUSES
             for item in required_store_states
         )
     )
+
+
+def wrapper_returncode_for(state: dict) -> int:
+    try:
+        required_store_states = [state["stores"][store] for store in STORE_ORDER]
+    except (KeyError, TypeError):
+        return 1
+    return 0 if all(
+        item.get("status") in WRAPPER_SUCCESS_STATUSES
+        for item in required_store_states
+    ) else 1
 
 
 def launch_sleep_helper(
@@ -1242,10 +1255,7 @@ def finalize_automation_run(
 
     save_function(state_path, state, clock())
     summary_function(state)
-    wrapper_returncode = 0 if all(
-        item["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
-        for item in state["stores"].values()
-    ) else 1
+    wrapper_returncode = wrapper_returncode_for(state)
     flush_function()
     try:
         notification_function(state, PROJECT_ROOT)

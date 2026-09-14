@@ -394,6 +394,71 @@ class Phase2SupportTests(unittest.TestCase):
         self.assertEqual(returncode, 0)
         self.assertEqual(events, ["save", "summary", "flush", "notify", "flush", "launch"])
 
+    def test_finalization_accepts_provisional_without_sleep_or_state_changes(self):
+        state = self._state_with_statuses(["SUCCESS", "PROVISIONAL", "SUCCESS"])
+        provisional = state["stores"][automation.STORE_BIGMARCH]
+        provisional.update({
+            "ranking_class": "PROVISIONAL",
+            "provisional": True,
+            "forward_valid": False,
+            "formal": False,
+            "eligible_for_formal_evaluation": False,
+            "automatic_promotion": False,
+        })
+        before = dict(provisional)
+        events = []
+
+        returncode = automation.finalize_automation_run(
+            Path("unused.json"), state, True,
+            save_function=lambda *args: events.append("save"),
+            summary_function=lambda value: events.append("summary"),
+            flush_function=lambda: events.append("flush"),
+            notification_function=lambda value, root: events.append("notify"),
+            helper_launcher=lambda run_id: events.append("sleep") or 1,
+            clock=lambda: datetime(2026, 9, 14, 9, 32, tzinfo=JST),
+        )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(events, ["save", "summary", "flush", "notify", "flush"])
+        self.assertEqual(provisional, before)
+
+    def test_wrapper_returncode_fails_closed_for_bad_or_missing_store_status(self):
+        for status in ("FAILED_FINAL", "NEEDS_MANUAL_REVIEW", "UNKNOWN_STATUS"):
+            with self.subTest(status=status):
+                state = self._state_with_statuses(["SUCCESS", status, "SUCCESS"])
+                self.assertEqual(automation.wrapper_returncode_for(state), 1)
+                self.assertFalse(automation.should_sleep_on_success(True, state, 1))
+
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        del state["stores"][automation.STORE_YASUDA]
+        self.assertEqual(automation.wrapper_returncode_for(state), 1)
+        self.assertFalse(automation.should_sleep_on_success(True, state, 1))
+
+    def test_finalization_fails_closed_without_sleep_for_bad_or_missing_store(self):
+        cases = ["FAILED_FINAL", "NEEDS_MANUAL_REVIEW", "UNKNOWN_STATUS", None]
+        for status in cases:
+            with self.subTest(status=status):
+                state = self._state_with_statuses(["SUCCESS", status or "SUCCESS", "SUCCESS"])
+                if status is None:
+                    del state["stores"][automation.STORE_YASUDA]
+                events = []
+                returncode = automation.finalize_automation_run(
+                    Path("unused.json"), state, True,
+                    save_function=lambda *args: events.append("save"),
+                    summary_function=lambda value: events.append("summary"),
+                    flush_function=lambda: events.append("flush"),
+                    notification_function=lambda value, root: events.append("notify"),
+                    helper_launcher=lambda run_id: events.append("sleep") or 1,
+                    clock=lambda: datetime(2026, 9, 14, 9, 32, tzinfo=JST),
+                )
+                self.assertEqual(returncode, 1)
+                self.assertNotIn("sleep", events)
+
+    def test_wrapper_returncode_keeps_all_success_behavior(self):
+        state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
+        self.assertEqual(automation.wrapper_returncode_for(state), 0)
+        self.assertTrue(automation.should_sleep_on_success(True, state, 0))
+
     def test_finalization_keeps_zero_when_helper_launch_fails(self):
         state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
 
