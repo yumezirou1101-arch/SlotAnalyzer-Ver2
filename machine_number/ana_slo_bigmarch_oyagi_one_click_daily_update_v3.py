@@ -13,6 +13,10 @@ import urllib.request
 
 import pandas as pd
 
+from slotanalyzer_bigmarch_inventory_guard import (
+    enforce_big_march_formal_inventory_guard,
+)
+
 
 # ============================================================
 # 09 V3 - Big March Takasaki Oyagi
@@ -30,6 +34,7 @@ import pandas as pd
 #   1) Fetch newest Oyagi Ana-Slo HTML
 #   2) Convert HTML -> daily CSV
 #   2.5) Freshness guard
+#   2.6) Big March Inventory Guard V1
 #   3) Frozen JUGGLER_RECENT7_WIN Top3 forward
 #   4) Frozen NON_JUGGLER_WEEKDAY_AVG Top1 forward
 #   5) Juggler future ranking
@@ -42,6 +47,9 @@ import pandas as pd
 #   - A child-script failure propagates to this V3 runner.
 #   - Freshness guard prevents a stale daily CSV from being
 #     treated as a successful morning update.
+#   - Big March Inventory Guard V1 is authoritative before
+#     any forward evaluation or future ranking.
+#   - --allow-gap never bypasses Inventory Guard V1.
 # ============================================================
 
 
@@ -869,6 +877,40 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
+    # 2.6) Big March Inventory Guard V1
+    # --------------------------------------------------------
+    inventory_guard_started = (
+        time.perf_counter()
+    )
+
+    header(
+        "BIG MARCH INVENTORY GUARD V1"
+    )
+
+    inventory_guard = (
+        enforce_big_march_formal_inventory_guard(
+            DATA_DIR,
+            date.today(),
+        )
+    )
+
+    print(
+        inventory_guard.summary()
+    )
+
+    inventory_guard_elapsed = (
+        time.perf_counter()
+        - inventory_guard_started
+    )
+
+    elapsed_rows.append(
+        (
+            "BIG MARCH INVENTORY GUARD V1",
+            inventory_guard_elapsed,
+        )
+    )
+
+    # --------------------------------------------------------
     # 3) Juggler frozen forward
     # --------------------------------------------------------
     elapsed = run_stage(
@@ -979,7 +1021,8 @@ def main() -> None:
         "fetch V3 opened it automatically."
     )
     print(
-        "Freshness validation passed before "
+        "Freshness validation and authoritative "
+        "Big March Inventory Guard V1 passed before "
         "forward evaluation and future ranking."
     )
     print(

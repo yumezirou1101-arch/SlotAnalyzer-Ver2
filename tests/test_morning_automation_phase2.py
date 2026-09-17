@@ -44,10 +44,12 @@ from slotanalyzer_morning_automation_support import (
     run_logged_subprocess,
     verify_big_march_completion,
     verify_big_march_provisional_completion,
+    verify_bic_tsubame_completion,
     verify_maruhan_completion,
     verify_yasuda_completion,
     VerificationResult,
     STORE_BIGMARCH,
+    STORE_BICTSUBAME,
     STORE_MARUHAN,
     STORE_YASUDA,
 )
@@ -190,9 +192,34 @@ class Phase2SupportTests(unittest.TestCase):
     def _state_with_statuses(self, statuses: list[str]) -> dict:
         current = datetime(2026, 9, 3, 8, 0, tzinfo=JST)
         state = automation.create_state(date(2026, 9, 3), "test_run", current)
-        for store, status in zip(automation.STORE_ORDER, statuses):
+        padded = list(statuses) + ["SUCCESS"] * max(0, len(automation.STORE_ORDER) - len(statuses))
+        for store, status in zip(automation.STORE_ORDER, padded):
             state["stores"][store]["status"] = status
         return state
+
+    def _big_march_guard_snapshot(
+        self,
+        *,
+        formal_allowed: bool,
+        provisional_allowed: bool,
+        reason: str = "fixture",
+        status: str = "PASS",
+    ) -> dict:
+        blocked = not (formal_allowed or provisional_allowed)
+        return {
+            "status": status,
+            "blocked": blocked,
+            "formal_allowed": formal_allowed,
+            "provisional_allowed": provisional_allowed,
+            "reason": reason,
+            "operation_date": "2026-09-06",
+            "expected_data_date": "2026-09-05",
+            "latest_data_date": "2026-09-04",
+            "source_delay_days": 1,
+            "known_change_date": False,
+            "comparison_status": "NO_CHANGE",
+            "monitor_status": "NO_CHANGE",
+        }
 
     def test_sleep_option_disabled_does_not_request_sleep(self):
         state = self._state_with_statuses(["SUCCESS", "SUCCESS", "SUCCESS"])
@@ -485,7 +512,7 @@ class Phase2SupportTests(unittest.TestCase):
         )
         self.assertEqual(
             [state["stores"][store]["status"] for store in automation.STORE_ORDER],
-            ["SUCCESS", "SUCCESS", "SUCCESS"],
+            ["SUCCESS", "SUCCESS", "SUCCESS", "SUCCESS"],
         )
 
     def test_operation_date_is_fixed_and_expected_is_previous_day(self):
@@ -627,6 +654,7 @@ class Phase2SupportTests(unittest.TestCase):
                 (STORE_MARUHAN, root / "ana_slo_20260901_source.html", "マルハンメガシティ前橋インター", 450),
                 (STORE_BIGMARCH, root / "ana_slo_bigmarch_oyagi_20260901_source.html", "ビッグマーチ高崎おおやぎ店", 200),
                 (STORE_YASUDA, root / "data/yasuda_maebashi/source_html/ana_slo_20260901_source.html", "やすだ前橋店", 300),
+                (STORE_BICTSUBAME, root / "ana_slo_bic_tsubame_takasaki_20260901_source.html", "ビックつばめ高崎店", 517),
             ]
             for store, path, store_name, rows in cases:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -634,6 +662,28 @@ class Phase2SupportTests(unittest.TestCase):
                 result = check_source_readiness(store, root, expected)
                 self.assertTrue(result.ready, result.error)
                 self.assertEqual(result.details["records"], rows)
+
+    def test_bic_tsubame_known_closure_walks_back_to_last_open_day(self):
+        expected, skipped = automation.bic_tsubame_expected_latest_data_date(
+            date(2026, 8, 8)
+        )
+        self.assertEqual(expected, date(2026, 7, 20))
+        self.assertEqual(len(skipped), 18)
+        self.assertTrue(all(reason == "STORE_RENOVATION" for _, reason in skipped))
+
+    def test_bic_tsubame_source_requires_exact_517_rows(self):
+        expected = date(2026, 9, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ana_slo_bic_tsubame_takasaki_20260901_source.html"
+            path.write_text(
+                make_html(expected, "ビックつばめ高崎店", 516),
+                encoding="utf-8",
+            )
+            result = check_source_readiness(STORE_BICTSUBAME, root, expected)
+        self.assertFalse(result.ready)
+        self.assertEqual(result.category, "SOURCE_INVALID")
+        self.assertIn("machine count mismatch", result.error)
 
     def test_missing_expected_source_after_successful_fetch_waits(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -656,12 +706,30 @@ class Phase2SupportTests(unittest.TestCase):
             for command in (fetch, pipeline):
                 self.assertNotIn("--allow-gap", command)
                 self.assertNotIn("--overwrite", command)
+        bic_fetch = build_fetch_command(
+            STORE_BICTSUBAME, PROJECT_ROOT, "python.exe", date(2026, 9, 1)
+        )
+        bic_pipeline = build_pipeline_command(
+            STORE_BICTSUBAME, PROJECT_ROOT, "python.exe", operation
+        )
+        for command in (bic_fetch, bic_pipeline):
+            self.assertNotIn("--allow-gap", command)
+            self.assertNotIn("--overwrite", command)
+        self.assertEqual(
+            bic_fetch[bic_fetch.index("--start-date") + 1], "2026-09-01"
+        )
+        self.assertEqual(
+            bic_fetch[bic_fetch.index("--end-date") + 1], "2026-09-01"
+        )
         maruhan = build_pipeline_command(STORE_MARUHAN, PROJECT_ROOT, "python.exe", operation)
         yasuda = build_pipeline_command(STORE_YASUDA, PROJECT_ROOT, "python.exe", operation)
         bigmarch = build_pipeline_command(STORE_BIGMARCH, PROJECT_ROOT, "python.exe", operation)
         self.assertEqual(maruhan[maruhan.index("--target-date") + 1], "2026-09-02")
         self.assertEqual(yasuda[yasuda.index("--target-date") + 1], "2026-09-02")
         self.assertNotIn("--target-date", bigmarch)
+        self.assertEqual(
+            bic_pipeline[bic_pipeline.index("--operation-date") + 1], "2026-09-02"
+        )
 
     def test_terminal_state_skip_predicate(self):
         state = automation.create_state(
@@ -904,7 +972,7 @@ class Phase2SupportTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertEqual(result.status, "INVALID")
 
-    def test_big_march_monitor_error_does_not_change_success_or_sleep(self):
+    def test_big_march_monitor_error_does_not_change_success_or_sleep_after_guard_pass(self):
         operation = date(2026, 9, 3)
         current = datetime(2026, 9, 3, 8, 0, tzinfo=JST)
         state = automation.create_state(operation, "monitor_error", current)
@@ -924,9 +992,19 @@ class Phase2SupportTests(unittest.TestCase):
             "mode": "MONITOR_ONLY", "status": "ERROR",
             "affects_morning_status": False, "affects_sleep": False,
         }
+        guard_pass = self._big_march_guard_snapshot(
+            formal_allowed=True,
+            provisional_allowed=False,
+            status="PASS_FORMAL",
+        )
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(automation, "PROJECT_ROOT", Path(directory)), \
                 patch.object(automation, "check_source_readiness", return_value=ready), \
+                patch.object(
+                    automation,
+                    "_assess_big_march_inventory_guard_parent",
+                    return_value=guard_pass,
+                ), \
                 patch.object(automation, "run_logged_subprocess", return_value=process), \
                 patch.object(automation, "verify_store_completion", return_value=complete), \
                 patch.object(automation, "_observe_big_march_inventory", return_value=monitor_error), \
@@ -941,9 +1019,51 @@ class Phase2SupportTests(unittest.TestCase):
         self.assertEqual(item["status"], "SUCCESS")
         self.assertEqual(item["error_category"], "")
         self.assertEqual(item["inventory_monitor"]["status"], "ERROR")
-        for store in (STORE_MARUHAN, STORE_YASUDA):
+        for store in (STORE_MARUHAN, STORE_YASUDA, STORE_BICTSUBAME):
             state["stores"][store]["status"] = "SUCCESS"
         self.assertTrue(automation.should_sleep_on_success(True, state, 0))
+
+    def test_bic_tsubame_completion_requires_exact_517_and_expected_date(self):
+        operation = date(2026, 9, 16)
+        expected = date(2026, 9, 15)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = (
+                root
+                / "data/bic_tsubame_takasaki/machine_number"
+                / "ana_slo_bic_tsubame_takasaki_20260915.csv"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["date", "machine_name", "machine_no", "G", "diff"],
+                )
+                writer.writeheader()
+                for number in range(1, 518):
+                    writer.writerow({
+                        "date": expected.isoformat(),
+                        "machine_name": f"Machine {number}",
+                        "machine_no": number,
+                        "G": 1000,
+                        "diff": number,
+                    })
+            result = verify_bic_tsubame_completion(root, operation)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.status, "COMPLETE")
+            self.assertEqual(result.details["rows"], 517)
+
+    def test_old_three_store_state_gets_bic_tsubame_state_on_reconcile(self):
+        operation = date(2026, 9, 16)
+        current = datetime(2026, 9, 16, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "old_three_store", current)
+        del state["stores"][STORE_BICTSUBAME]
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(automation, "assess_inventory_guard") as guard:
+                guard.return_value = SimpleNamespace(blocked=False, to_dict=lambda: {})
+                automation.reconcile_startup_state(state, Path(directory), operation, current)
+        self.assertIn(STORE_BICTSUBAME, state["stores"])
+        self.assertEqual(state["stores"][STORE_BICTSUBAME]["status"], "PENDING")
 
     def test_maruhan_partial_64_requires_manual_review(self):
         operation = date(2026, 9, 2)
@@ -1060,21 +1180,87 @@ class Phase2SupportTests(unittest.TestCase):
             automation._process_store(STORE_BIGMARCH,state,Path("unused"),operation,date(2026,9,5),SimpleNamespace(max_fetch_attempts=20,retry_interval_sec=300,chrome_wait_sec=15),lambda:datetime(2026,9,6,9,31,tzinfo=JST))
         provisional_run.assert_not_called();self.assertEqual(state["stores"][STORE_BIGMARCH]["status"],"NEEDS_MANUAL_REVIEW")
 
-    def test_reconciliation_restores_verified_provisional(self):
-        operation=date(2026,9,6);now=datetime(2026,9,6,9,35,tzinfo=JST);state=automation.create_state(operation,"run",now)
-        verified=VerificationResult("PROVISIONAL",True,artifacts=["a"],details={"latest_data_date":"2026-09-04"})
-        with patch.object(automation,"verify_big_march_provisional_completion",return_value=verified),patch.object(automation,"verify_store_completion",return_value=VerificationResult("NONE",False)),patch.object(automation,"assess_inventory_guard") as guard:
-            guard.return_value=SimpleNamespace(blocked=False,to_dict=lambda:{})
-            automation.reconcile_startup_state(state,PROJECT_ROOT,operation,now)
-        item=state["stores"][STORE_BIGMARCH];self.assertEqual(item["status"],"PROVISIONAL");self.assertEqual(item["provisional_attempt_count"],0);self.assertEqual(item["verified_artifacts"],[])
+    def test_reconciliation_restores_verified_provisional_only_after_guard_pass(self):
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 9, 35, tzinfo=JST)
+        state = automation.create_state(operation, "run", now)
+        verified = VerificationResult(
+            "PROVISIONAL",
+            True,
+            artifacts=["a"],
+            details={"latest_data_date": "2026-09-04"},
+        )
+        guard_pass = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=True,
+            status="PASS_PROVISIONAL_ONLY",
+        )
+        with patch.object(
+            automation,
+            "verify_big_march_provisional_completion",
+            return_value=verified,
+        ), patch.object(
+            automation,
+            "verify_store_completion",
+            return_value=VerificationResult("NONE", False),
+        ), patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_pass,
+        ):
+            automation.reconcile_startup_state(state, PROJECT_ROOT, operation, now)
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["status"], "PROVISIONAL")
+        self.assertEqual(item["provisional_attempt_count"], 0)
+        self.assertEqual(item["verified_artifacts"], [])
+        self.assertTrue(item["inventory_guard"]["provisional_allowed"])
 
     def test_provisional_success_keeps_formal_attempt_zero_and_records_state(self):
-        operation=date(2026,9,6);now=datetime(2026,9,6,9,31,tzinfo=JST);state=automation.create_state(operation,"run",now);item=state["stores"][STORE_BIGMARCH]
-        process=ProcessResult(0,now.isoformat(),now.isoformat(),0.1,"log")
-        verified=VerificationResult("PROVISIONAL",True,artifacts=["p"],details={"latest_data_date":"2026-09-04"})
-        with patch.object(automation,"save_state"),patch.object(automation,"run_logged_subprocess",return_value=process),patch.object(automation,"verify_big_march_provisional_completion",return_value=verified),patch.object(automation,"_record_history") as history:
-            automation._run_big_march_provisional(state,Path("unused"),operation,now,lambda:now)
-        self.assertEqual(item["status"],"PROVISIONAL");self.assertEqual(item["pipeline_attempt_count"],0);self.assertEqual(item["provisional_attempt_count"],1);self.assertEqual(item["provisional_latest_data_date"],"2026-09-04");self.assertEqual(item["provisional_artifacts"],["p"]);history.assert_called_once()
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 9, 31, tzinfo=JST)
+        state = automation.create_state(operation, "run", now)
+        item = state["stores"][STORE_BIGMARCH]
+        process = ProcessResult(0, now.isoformat(), now.isoformat(), 0.1, "log")
+        verified = VerificationResult(
+            "PROVISIONAL",
+            True,
+            artifacts=["p"],
+            details={"latest_data_date": "2026-09-04"},
+        )
+        guard_pass = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=True,
+            status="PASS_PROVISIONAL_ONLY",
+        )
+        with patch.object(automation, "save_state"), patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_pass,
+        ), patch.object(
+            automation,
+            "run_logged_subprocess",
+            return_value=process,
+        ), patch.object(
+            automation,
+            "verify_big_march_provisional_completion",
+            return_value=verified,
+        ), patch.object(
+            automation,
+            "_observe_big_march_inventory",
+            return_value={"status": "NO_CHANGE"},
+        ), patch.object(
+            automation,
+            "_record_history",
+        ) as history:
+            automation._run_big_march_provisional(
+                state, Path("unused"), operation, now, lambda: now
+            )
+        self.assertEqual(item["status"], "PROVISIONAL")
+        self.assertEqual(item["pipeline_attempt_count"], 0)
+        self.assertEqual(item["provisional_attempt_count"], 1)
+        self.assertEqual(item["provisional_latest_data_date"], "2026-09-04")
+        self.assertEqual(item["provisional_artifacts"], ["p"])
+        history.assert_called_once()
 
     def test_formal_or_prior_provisional_attempt_prevents_new_provisional_run(self):
         operation=date(2026,9,6);now=datetime(2026,9,6,9,31,tzinfo=JST)
@@ -1083,9 +1269,225 @@ class Phase2SupportTests(unittest.TestCase):
             automation._run_big_march_provisional(state,Path("unused"),operation,now,lambda:now)
         run.assert_not_called();self.assertEqual(state["stores"][STORE_BIGMARCH]["status"],"FAILED_FINAL")
         state=automation.create_state(operation,"run",now);state["stores"][STORE_BIGMARCH]["provisional_attempt_count"]=1
-        with patch.object(automation,"save_state"),patch.object(automation,"verify_big_march_provisional_completion",return_value=VerificationResult("INVALID_PROVISIONAL",False,"bad")),patch.object(automation,"run_logged_subprocess") as run:
+        guard_pass = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=True,
+            status="PASS_PROVISIONAL_ONLY",
+        )
+        with patch.object(automation,"save_state"),patch.object(automation,"_assess_big_march_inventory_guard_parent",return_value=guard_pass),patch.object(automation,"verify_big_march_provisional_completion",return_value=VerificationResult("INVALID_PROVISIONAL",False,"bad")),patch.object(automation,"run_logged_subprocess") as run:
             automation._run_big_march_provisional(state,Path("unused"),operation,now,lambda:now)
         run.assert_not_called();self.assertEqual(state["stores"][STORE_BIGMARCH]["status"],"NEEDS_MANUAL_REVIEW")
+
+
+    def test_big_march_startup_existing_provisional_is_blocked_by_guard(self):
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 9, 35, tzinfo=JST)
+        state = automation.create_state(operation, "startup_guard_block", now)
+        verified = VerificationResult(
+            "PROVISIONAL",
+            True,
+            artifacts=["existing_provisional"],
+            details={"latest_data_date": "2026-09-04"},
+        )
+        guard_block = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=False,
+            reason="persistent inventory incident",
+            status="BLOCKED_PERSISTENT_CHANGE",
+        )
+        with patch.object(
+            automation,
+            "verify_big_march_provisional_completion",
+            return_value=verified,
+        ), patch.object(
+            automation,
+            "verify_store_completion",
+            return_value=VerificationResult("NONE", False),
+        ), patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_block,
+        ):
+            automation.reconcile_startup_state(state, PROJECT_ROOT, operation, now)
+
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(item["current_stage"], "INVENTORY_GUARD")
+        self.assertEqual(item["error_category"], "INVENTORY_GUARD_BLOCKED")
+        self.assertEqual(
+            item["provisional_status"], "BLOCKED_BY_INVENTORY_GUARD"
+        )
+        self.assertFalse(item["inventory_guard"]["provisional_allowed"])
+
+    def test_big_march_provisional_guard_block_stops_before_generator(self):
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 9, 31, tzinfo=JST)
+        state = automation.create_state(operation, "provisional_guard_block", now)
+        guard_block = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=False,
+            reason="two-day source delay",
+            status="BLOCKED_SOURCE_DELAY",
+        )
+
+        with patch.object(automation, "save_state"), patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_block,
+        ), patch.object(
+            automation,
+            "run_logged_subprocess",
+        ) as run, patch.object(
+            automation,
+            "verify_big_march_provisional_completion",
+        ) as verify:
+            automation._run_big_march_provisional(
+                state, Path("unused"), operation, now, lambda: now
+            )
+
+        item = state["stores"][STORE_BIGMARCH]
+        run.assert_not_called()
+        verify.assert_not_called()
+        self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(item["current_stage"], "INVENTORY_GUARD")
+        self.assertEqual(item["error_category"], "INVENTORY_GUARD_BLOCKED")
+        self.assertEqual(item["provisional_attempt_count"], 0)
+
+    def test_big_march_only_safe_one_day_guard_reaches_provisional_generator(self):
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 9, 31, tzinfo=JST)
+        state = automation.create_state(operation, "provisional_guard_pass", now)
+        guard_pass = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=True,
+            status="PASS_PROVISIONAL_ONLY",
+        )
+        process = ProcessResult(0, now.isoformat(), now.isoformat(), 0.1, "log")
+        verified = VerificationResult(
+            "PROVISIONAL",
+            True,
+            artifacts=["p"],
+            details={"latest_data_date": "2026-09-04"},
+        )
+
+        with patch.object(automation, "save_state"), patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_pass,
+        ), patch.object(
+            automation,
+            "run_logged_subprocess",
+            return_value=process,
+        ) as run, patch.object(
+            automation,
+            "verify_big_march_provisional_completion",
+            return_value=verified,
+        ), patch.object(
+            automation,
+            "_observe_big_march_inventory",
+            return_value={"status": "NO_CHANGE"},
+        ), patch.object(
+            automation,
+            "_record_history",
+        ):
+            automation._run_big_march_provisional(
+                state, Path("unused"), operation, now, lambda: now
+            )
+
+        run.assert_called_once()
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["status"], "PROVISIONAL")
+        self.assertEqual(item["provisional_attempt_count"], 1)
+        self.assertTrue(item["inventory_guard"]["provisional_allowed"])
+
+    def test_big_march_formal_guard_block_stops_before_pipeline(self):
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "formal_guard_block", now)
+        args = automation.argparse.Namespace(
+            retry_interval_sec=300,
+            max_fetch_attempts=20,
+            chrome_wait_sec=15,
+            sleep_on_success=True,
+        )
+        ready = ReadinessResult(
+            ready=True,
+            source_exists=True,
+            source_path="fixture",
+            expected_data_date="2026-09-05",
+            category="READY",
+        )
+        guard_block = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=False,
+            reason="inventory change",
+            status="BLOCKED_ACTUAL_CHANGE",
+        )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            automation, "PROJECT_ROOT", Path(directory)
+        ), patch.object(
+            automation, "check_source_readiness", return_value=ready
+        ), patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_block,
+        ), patch.object(
+            automation, "run_logged_subprocess"
+        ) as run, patch.object(
+            automation, "save_state"
+        ):
+            automation._process_store(
+                STORE_BIGMARCH,
+                state,
+                Path(directory) / "state.json",
+                operation,
+                operation - timedelta(days=1),
+                args,
+                clock=lambda: now,
+            )
+
+        run.assert_not_called()
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(item["current_stage"], "INVENTORY_GUARD")
+        self.assertEqual(item["error_category"], "INVENTORY_GUARD_BLOCKED")
+        self.assertEqual(item["pipeline_attempt_count"], 0)
+
+    def test_big_march_parent_guard_internal_error_fails_closed(self):
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 8, 0, tzinfo=JST)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            automation,
+            "assess_big_march_inventory_guard",
+            side_effect=RuntimeError("fixture guard failure"),
+        ):
+            result = automation._assess_big_march_inventory_guard_parent(
+                Path(directory), operation, now
+            )
+
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["formal_allowed"])
+        self.assertFalse(result["provisional_allowed"])
+        self.assertEqual(result["status"], "BLOCKED_GUARD_ERROR")
+        self.assertIn("fixture guard failure", result["reason"])
+
+    def test_big_march_guard_block_keeps_wrapper_nonzero_and_sleep_disabled(self):
+        operation = date(2026, 9, 6)
+        now = datetime(2026, 9, 6, 9, 31, tzinfo=JST)
+        state = automation.create_state(operation, "abnormal_morning", now)
+        for store in (STORE_MARUHAN, STORE_YASUDA, STORE_BICTSUBAME):
+            state["stores"][store]["status"] = "SUCCESS"
+        item = state["stores"][STORE_BIGMARCH]
+        item.update(
+            status="NEEDS_MANUAL_REVIEW",
+            current_stage="INVENTORY_GUARD",
+            error_category="INVENTORY_GUARD_BLOCKED",
+            error="fixture guard block",
+        )
+
+        self.assertEqual(automation.wrapper_returncode_for(state), 1)
+        self.assertFalse(automation.should_sleep_on_success(True, state, 1))
 
 
 if __name__ == "__main__":

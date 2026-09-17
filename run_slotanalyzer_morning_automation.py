@@ -18,6 +18,7 @@ if str(MACHINE_DIR) not in sys.path:
 from slotanalyzer_morning_automation_support import (  # noqa: E402
     JST,
     STORE_BIGMARCH,
+    STORE_BICTSUBAME,
     STORE_MARUHAN,
     STORE_ORDER,
     STORE_YASUDA,
@@ -32,6 +33,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     build_big_march_provisional_command,
     build_fetch_command,
     build_pipeline_command,
+    bic_tsubame_expected_latest_data_date,
     check_source_readiness,
     classify_fetch_result,
     classify_pipeline_result,
@@ -55,6 +57,9 @@ from slotanalyzer_inventory_guard import (  # noqa: E402
 from slotanalyzer_inventory_monitor import (  # noqa: E402
     load_inventory_monitor_evidence,
     observe_big_march_inventory_best_effort,
+)
+from slotanalyzer_bigmarch_inventory_guard import (  # noqa: E402
+    assess_big_march_inventory_guard,
 )
 
 
@@ -94,6 +99,7 @@ STORE_LABELS = {
     STORE_MARUHAN: "Maruhan Mega City Maebashi Inter",
     STORE_BIGMARCH: "Big March Takasaki Oyagi",
     STORE_YASUDA: "Yasuda Maebashi",
+    STORE_BICTSUBAME: "Bic Tsubame Takasaki",
 }
 
 
@@ -292,10 +298,19 @@ def _has_big_or_yasuda_completion_artifact(
             / "12_nonjuggler_weekday_future_ranking"
             / f"12_prediction_{ymd}_metadata.csv",
         ]
-    else:
+    elif store == STORE_YASUDA:
         candidates = [
             project_root / "data/yasuda_maebashi/machine_number" / f"ana_slo_{expected:%Y%m%d}.csv"
         ]
+    elif store == STORE_BICTSUBAME:
+        expected, _ = bic_tsubame_expected_latest_data_date(operation_date)
+        candidates = [
+            project_root
+            / "data/bic_tsubame_takasaki/machine_number"
+            / f"ana_slo_bic_tsubame_takasaki_{expected:%Y%m%d}.csv"
+        ]
+    else:
+        return False
     return any(path.exists() for path in candidates)
 
 
@@ -305,8 +320,11 @@ def reconcile_startup_state(
     operation_date: date,
     current: datetime,
 ) -> None:
+    stores = state.setdefault("stores", {})
     for store in STORE_ORDER:
-        store_state = state["stores"][store]
+        if store not in stores:
+            stores[store] = blank_store_state(store, operation_date)
+        store_state = stores[store]
         store_state.setdefault("provisional_attempt_count", 0)
         store_state.setdefault("provisional_status", "")
         store_state.setdefault("provisional_reason", "")
@@ -346,19 +364,44 @@ def reconcile_startup_state(
                         last_completed_at_jst=current.isoformat(),
                     )
                 elif provisional.ok:
-                    store_state.update(
-                        status="PROVISIONAL",
-                        current_stage="PROVISIONAL",
-                        provisional_status="ALREADY_PROVISIONAL",
-                        provisional_reason="Recovered verified provisional artifacts.",
-                        provisional_latest_data_date=provisional.details.get("latest_data_date", ""),
-                        provisional_artifacts=provisional.artifacts,
-                        verified_artifacts=[],
-                        error_category="",
-                        error="",
-                        next_retry_at_jst="",
-                        last_completed_at_jst=current.isoformat(),
+                    inventory_guard = _assess_big_march_inventory_guard_parent(
+                        project_root,
+                        operation_date,
+                        current,
                     )
+                    store_state["inventory_guard"] = inventory_guard
+                    if not inventory_guard["provisional_allowed"]:
+                        store_state.update(
+                            status="NEEDS_MANUAL_REVIEW",
+                            current_stage="INVENTORY_GUARD",
+                            provisional_status="BLOCKED_BY_INVENTORY_GUARD",
+                            provisional_reason=inventory_guard["reason"],
+                            provisional_latest_data_date=provisional.details.get(
+                                "latest_data_date", ""
+                            ),
+                            provisional_artifacts=provisional.artifacts,
+                            verified_artifacts=[],
+                            error_category="INVENTORY_GUARD_BLOCKED",
+                            error=inventory_guard["reason"],
+                            next_retry_at_jst="",
+                            last_completed_at_jst=current.isoformat(),
+                        )
+                    else:
+                        store_state.update(
+                            status="PROVISIONAL",
+                            current_stage="PROVISIONAL",
+                            provisional_status="ALREADY_PROVISIONAL",
+                            provisional_reason="Recovered verified provisional artifacts.",
+                            provisional_latest_data_date=provisional.details.get(
+                                "latest_data_date", ""
+                            ),
+                            provisional_artifacts=provisional.artifacts,
+                            verified_artifacts=[],
+                            error_category="",
+                            error="",
+                            next_retry_at_jst="",
+                            last_completed_at_jst=current.isoformat(),
+                        )
                 else:
                     store_state.update(
                         status="NEEDS_MANUAL_REVIEW",
@@ -460,6 +503,17 @@ def reconcile_startup_state(
                     last_completed_at_jst=current.isoformat(),
                 )
                 continue
+        elif store == STORE_BICTSUBAME and verification.ok:
+            store_state.update(
+                status="ALREADY_COMPLETE",
+                error_category="",
+                error="",
+                verified_artifacts=verification.artifacts,
+                latest_data_date=verification.details.get("latest_data_date", ""),
+                last_completed_at_jst=current.isoformat(),
+                next_retry_at_jst="",
+            )
+            continue
         elif _has_big_or_yasuda_completion_artifact(store, project_root, operation_date):
             store_state.update(
                 status="NEEDS_MANUAL_REVIEW",
@@ -489,6 +543,59 @@ def reconcile_startup_state(
                     error="Previous state was RUNNING after pipeline start or at an unknown stage.",
                     last_completed_at_jst=current.isoformat(),
                 )
+
+
+def _assess_big_march_inventory_guard_parent(
+    project_root: Path,
+    operation_date: date,
+    current: datetime,
+) -> dict:
+    """Parent-side authoritative Big March Inventory Guard snapshot."""
+    try:
+        decision = assess_big_march_inventory_guard(
+            project_root / "data/bigmarch_takasaki_oyagi/machine_number",
+            operation_date,
+            generated_at_jst=current.astimezone(JST),
+        )
+    except Exception as exc:
+        return {
+            "status": "BLOCKED_GUARD_ERROR",
+            "blocked": True,
+            "formal_allowed": False,
+            "provisional_allowed": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "operation_date": operation_date.isoformat(),
+            "expected_data_date": (operation_date - timedelta(days=1)).isoformat(),
+            "latest_data_date": "",
+            "source_delay_days": "",
+            "known_change_date": False,
+            "comparison_status": "",
+            "monitor_status": "ERROR",
+        }
+
+    def _date_text(value) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+
+    return {
+        "status": decision.status,
+        "blocked": bool(decision.blocked),
+        "formal_allowed": bool(decision.formal_allowed),
+        "provisional_allowed": bool(decision.provisional_allowed),
+        "reason": decision.reason,
+        "operation_date": _date_text(decision.operation_date),
+        "expected_data_date": (
+            operation_date - timedelta(days=1)
+        ).isoformat(),
+        "latest_data_date": _date_text(decision.latest_data_date),
+        "source_delay_days": decision.source_delay_days,
+        "known_change_date": bool(decision.known_change_date),
+        "comparison_status": decision.comparison_status,
+        "monitor_status": decision.monitor_status,
+    }
 
 
 def _observe_big_march_inventory(
@@ -529,6 +636,26 @@ def _run_big_march_provisional(
         )
         save_state(state_path, state, current)
         return
+    inventory_guard = _assess_big_march_inventory_guard_parent(
+        PROJECT_ROOT,
+        operation_date,
+        current,
+    )
+    store_state["inventory_guard"] = inventory_guard
+    if not inventory_guard["provisional_allowed"]:
+        store_state.update(
+            status="NEEDS_MANUAL_REVIEW",
+            current_stage="INVENTORY_GUARD",
+            provisional_status="BLOCKED_BY_INVENTORY_GUARD",
+            provisional_reason=inventory_guard["reason"],
+            error_category="INVENTORY_GUARD_BLOCKED",
+            error=inventory_guard["reason"],
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        save_state(state_path, state, current)
+        return
+
     if store_state.get("provisional_attempt_count", 0) > 0:
         verification = verify_big_march_provisional_completion(
             PROJECT_ROOT, operation_date
@@ -829,6 +956,8 @@ def _process_store(
     clock=now_jst,
 ) -> None:
     store_state = state["stores"][store]
+    if store == STORE_BICTSUBAME:
+        expected_data_date, _ = bic_tsubame_expected_latest_data_date(operation_date)
     if store_state["status"] in TERMINAL_STATES:
         return
     current = clock().astimezone(JST)
@@ -924,7 +1053,9 @@ def _process_store(
             )
             save_state(state_path, state, completed)
             return
-        command = build_fetch_command(store, PROJECT_ROOT, sys.executable)
+        command = build_fetch_command(
+            store, PROJECT_ROOT, sys.executable, expected_data_date
+        )
         log_path = (
             RUNS_DIR
             / operation_date.strftime("%Y%m%d")
@@ -1001,6 +1132,24 @@ def _process_store(
         # conversion, and Freshness, but before 69/63/79. Keeping this
         # preflight result in state makes the reason visible while preserving
         # collection of the latest validated daily CSV.
+    elif store == STORE_BIGMARCH:
+        inventory_guard = _assess_big_march_inventory_guard_parent(
+            PROJECT_ROOT,
+            operation_date,
+            current,
+        )
+        store_state["inventory_guard"] = inventory_guard
+        if not inventory_guard["formal_allowed"]:
+            store_state.update(
+                status="NEEDS_MANUAL_REVIEW",
+                current_stage="INVENTORY_GUARD",
+                error_category="INVENTORY_GUARD_BLOCKED",
+                error=inventory_guard["reason"],
+                last_completed_at_jst=current.isoformat(),
+                next_retry_at_jst="",
+            )
+            save_state(state_path, state, current)
+            return
     if not _deadline_open(store, current, operation_date):
         _mark_deadline(store_state, store, current)
         save_state(state_path, state, current)
@@ -1065,27 +1214,62 @@ def _process_store(
         if inventory_guard.blocked:
             classification = "NEEDS_MANUAL_REVIEW"
     elif store == STORE_BIGMARCH and verification.ok:
-        store_state["inventory_monitor"] = _observe_big_march_inventory(
-            PROJECT_ROOT, operation_date, clock().astimezone(JST)
+        big_march_guard = _assess_big_march_inventory_guard_parent(
+            PROJECT_ROOT,
+            operation_date,
+            clock().astimezone(JST),
         )
+        store_state["inventory_guard"] = big_march_guard
+        if not big_march_guard["formal_allowed"]:
+            classification = "NEEDS_MANUAL_REVIEW"
+            inventory_guard = big_march_guard
+        else:
+            store_state["inventory_monitor"] = _observe_big_march_inventory(
+                PROJECT_ROOT, operation_date, clock().astimezone(JST)
+            )
     completed = clock().astimezone(JST)
     store_state.update(
         status=classification,
         current_stage=(
             "INVENTORY_GUARD"
-            if inventory_guard is not None and inventory_guard.blocked
+            if (
+                inventory_guard is not None
+                and (
+                    inventory_guard.get("blocked", False)
+                    if isinstance(inventory_guard, dict)
+                    else inventory_guard.blocked
+                )
+            )
             else "PIPELINE"
         ),
         returncode=result.returncode,
         last_completed_at_jst=completed.isoformat(),
         error_category=(
             "INVENTORY_GUARD_BLOCKED"
-            if inventory_guard is not None and inventory_guard.blocked
+            if (
+                inventory_guard is not None
+                and (
+                    inventory_guard.get("blocked", False)
+                    if isinstance(inventory_guard, dict)
+                    else inventory_guard.blocked
+                )
+            )
             else ("" if classification == "SUCCESS" else verification.status or "PIPELINE_FAILED")
         ),
         error=(
-            inventory_guard.summary()
-            if inventory_guard is not None and inventory_guard.blocked
+            (
+                inventory_guard.get("reason", "")
+                if isinstance(inventory_guard, dict)
+                else inventory_guard.summary()
+            )
+            if (
+                inventory_guard is not None
+                and (
+                    inventory_guard.get("blocked", False)
+                    if isinstance(inventory_guard, dict)
+                    else inventory_guard.blocked
+                )
+            )
             else ("" if classification == "SUCCESS" else verification.error or "One-click returned non-zero.")
         ),
         verified_artifacts=verification.artifacts,

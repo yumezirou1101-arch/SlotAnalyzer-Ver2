@@ -7,6 +7,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import pandas as pd
 
+from slotanalyzer_bigmarch_inventory_guard import (
+    enforce_big_march_provisional_inventory_guard,
+)
+
 PROJECT_ROOT = Path(r"C:\Users\user\Desktop\Documents\SlotAnalyzer")
 DATA_REL = Path("data/bigmarch_takasaki_oyagi/machine_number")
 OUTPUT_REL = DATA_REL / "analysis_31days_deep/90_provisional_future_ranking"
@@ -115,26 +119,131 @@ def _annotate(ranking: pd.DataFrame, e: Eligibility) -> pd.DataFrame:
     result=ranking.copy(); result["target_date"]=e.operation_date.isoformat(); result["expected_data_date"]=e.expected_data_date.isoformat(); result["latest_data_date"]=e.latest_data_date.isoformat(); result["ranking_class"]="PROVISIONAL"; result["provisional"]=True; result["forward_valid"]=False; return result
 
 def generate(project_root: Path, operation_date: date) -> dict:
-    project_root=Path(project_root); e=assess_eligibility(project_root,operation_date); j,n=load_ranking_modules(project_root); models=f"{j.MODEL_NAME}|{n.MODEL_NAME}"; metadata_base=_expected_metadata(e,models); paths=output_paths(project_root,e.operation_date)
-    if validate_existing(paths,metadata_base): return {"status":"ALREADY_PROVISIONAL","paths":paths,"metadata":metadata_base}
-    jh,_,_=j.load_frozen_history(); nh,_,_=n.load_frozen_history()
-    for label,history in (("JUGGLER",jh),("NON_JUGGLER",nh)):
+    project_root=Path(project_root)
+    e=assess_eligibility(project_root,operation_date)
+
+    data_dir=project_root/DATA_REL
+
+    enforce_big_march_provisional_inventory_guard(
+        data_dir,
+        e.operation_date,
+    )
+
+    j,n=load_ranking_modules(project_root)
+    models=f"{j.MODEL_NAME}|{n.MODEL_NAME}"
+    metadata_base=_expected_metadata(e,models)
+    paths=output_paths(project_root,e.operation_date)
+
+    if validate_existing(paths,metadata_base):
+        return {
+            "status":"ALREADY_PROVISIONAL",
+            "paths":paths,
+            "metadata":metadata_base,
+        }
+
+    jh,_,_=j.load_frozen_history()
+    nh,_,_=n.load_frozen_history()
+
+    for label,history in (
+        ("JUGGLER",jh),
+        ("NON_JUGGLER",nh),
+    ):
         latest=pd.Timestamp(history["date"].max()).date()
-        if latest!=e.latest_data_date: raise ProvisionalBlockedError(f"{label}_HISTORY_LATEST_MISMATCH: {latest}")
+
+        if latest!=e.latest_data_date:
+            raise ProvisionalBlockedError(
+                f"{label}_HISTORY_LATEST_MISMATCH: {latest}"
+            )
+
     target=pd.Timestamp(e.operation_date)
-    jr=_annotate(j.build_future_ranking(jh,pd.Timestamp(e.latest_data_date),target),e); nr=_annotate(n.build_future_ranking(nh,pd.Timestamp(e.latest_data_date),target),e)
-    frames={"juggler_all":jr,"juggler_top10":jr.head(10).copy(),"nonjuggler_all":nr,"nonjuggler_top10":nr.head(10).copy()}
-    parent=paths["directory"].parent; parent.mkdir(parents=True,exist_ok=True); temporary=Path(tempfile.mkdtemp(prefix=f".{e.operation_date:%Y%m%d}_",dir=parent))
+
+    jr=_annotate(
+        j.build_future_ranking(
+            jh,
+            pd.Timestamp(e.latest_data_date),
+            target,
+        ),
+        e,
+    )
+
+    nr=_annotate(
+        n.build_future_ranking(
+            nh,
+            pd.Timestamp(e.latest_data_date),
+            target,
+        ),
+        e,
+    )
+
+    frames={
+        "juggler_all":jr,
+        "juggler_top10":jr.head(10).copy(),
+        "nonjuggler_all":nr,
+        "nonjuggler_top10":nr.head(10).copy(),
+    }
+
+    parent=paths["directory"].parent
+    parent.mkdir(parents=True,exist_ok=True)
+
+    temporary=Path(
+        tempfile.mkdtemp(
+            prefix=f".{e.operation_date:%Y%m%d}_",
+            dir=parent,
+        )
+    )
+
     try:
-        for key,frame in frames.items(): frame.to_csv(temporary/paths[key].name,index=False,encoding="utf-8-sig")
-        metadata={**metadata_base,"generated_at_jst":datetime.now(JST).isoformat()}
-        pd.DataFrame([metadata]).to_csv(temporary/paths["metadata"].name,index=False,encoding="utf-8-sig")
-        pd.DataFrame([{**metadata,"status":"PROVISIONAL"}]).to_csv(temporary/paths["status"].name,index=False,encoding="utf-8-sig")
-        os.replace(temporary,paths["directory"])
+        for key,frame in frames.items():
+            frame.to_csv(
+                temporary/paths[key].name,
+                index=False,
+                encoding="utf-8-sig",
+            )
+
+        metadata={
+            **metadata_base,
+            "generated_at_jst":datetime.now(JST).isoformat(),
+        }
+
+        pd.DataFrame(
+            [metadata]
+        ).to_csv(
+            temporary/paths["metadata"].name,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        pd.DataFrame(
+            [
+                {
+                    **metadata,
+                    "status":"PROVISIONAL",
+                }
+            ]
+        ).to_csv(
+            temporary/paths["status"].name,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        os.replace(
+            temporary,
+            paths["directory"],
+        )
+
     except Exception:
-        if temporary.exists(): shutil.rmtree(temporary)
+        if temporary.exists():
+            shutil.rmtree(
+                temporary
+            )
+
         raise
-    return {"status":"PROVISIONAL","paths":paths,"metadata":metadata}
+
+    return {
+        "status":"PROVISIONAL",
+        "paths":paths,
+        "metadata":metadata,
+    }
 
 def parse_args() -> argparse.Namespace:
     parser=argparse.ArgumentParser(description="Generate isolated Big March provisional rankings."); parser.add_argument("--operation-date",required=True); parser.add_argument("--project-root",type=Path,default=PROJECT_ROOT); return parser.parse_args()
