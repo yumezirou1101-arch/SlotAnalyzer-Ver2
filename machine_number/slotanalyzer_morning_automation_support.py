@@ -39,7 +39,13 @@ TERMINAL_STATES = {
 STORE_MARUHAN = "maruhan"
 STORE_BIGMARCH = "bigmarch"
 STORE_YASUDA = "yasuda"
-STORE_ORDER = (STORE_MARUHAN, STORE_BIGMARCH, STORE_YASUDA)
+STORE_BICTSUBAME = "bic_tsubame"
+STORE_ORDER = (STORE_MARUHAN, STORE_BIGMARCH, STORE_YASUDA, STORE_BICTSUBAME)
+
+BICTSUBAME_EXPECTED_MACHINES = 517
+BICTSUBAME_KNOWN_CLOSURES = (
+    (date(2026, 7, 21), date(2026, 8, 7), "STORE_RENOVATION"),
+)
 
 YASUDA_COLUMNS = [
     "日付",
@@ -146,6 +152,27 @@ def determine_operation_dates(current: datetime) -> tuple[date, date]:
         current = current.replace(tzinfo=JST)
     operation_date = current.astimezone(JST).date()
     return operation_date, operation_date - timedelta(days=1)
+
+
+
+def bic_tsubame_closure_reason(target: date) -> str | None:
+    for start_date, end_date, reason in BICTSUBAME_KNOWN_CLOSURES:
+        if start_date <= target <= end_date:
+            return reason
+    return None
+
+
+def bic_tsubame_expected_latest_data_date(
+    operation_date: date,
+) -> tuple[date, list[tuple[date, str]]]:
+    candidate = operation_date - timedelta(days=1)
+    skipped: list[tuple[date, str]] = []
+    while True:
+        reason = bic_tsubame_closure_reason(candidate)
+        if reason is None:
+            return candidate, skipped
+        skipped.append((candidate, reason))
+        candidate -= timedelta(days=1)
 
 
 def deadline_at(operation_date: date, value: datetime_time) -> datetime:
@@ -385,6 +412,8 @@ def source_path_for(store: str, project_root: Path, expected_data_date: date) ->
             / "source_html"
             / f"ana_slo_{ymd}_source.html"
         )
+    if store == STORE_BICTSUBAME:
+        return project_root / f"ana_slo_bic_tsubame_takasaki_{ymd}_source.html"
     raise ValueError(f"Unknown store: {store}")
 
 
@@ -408,6 +437,28 @@ def check_source_readiness(
         return _static_source_readiness(
             path, expected_data_date, ("やすだ前橋店",), 300, 320
         )
+    if store == STORE_BICTSUBAME:
+        result = _static_source_readiness(
+            path,
+            expected_data_date,
+            ("ビックつばめ高崎店", "ビックつばめ高崎"),
+            200,
+            BICTSUBAME_EXPECTED_MACHINES,
+        )
+        if result.ready and result.details.get("records") != BICTSUBAME_EXPECTED_MACHINES:
+            return ReadinessResult(
+                False,
+                True,
+                result.source_path,
+                result.expected_data_date,
+                "SOURCE_INVALID",
+                (
+                    "Bic Tsubame source machine count mismatch: "
+                    f"{result.details.get('records')} != {BICTSUBAME_EXPECTED_MACHINES}"
+                ),
+                result.details,
+            )
+        return result
     raise ValueError(f"Unknown store: {store}")
 
 
@@ -540,7 +591,32 @@ def assess_big_march_catchup(
     )
 
 
-def build_fetch_command(store: str, project_root: Path, python_executable: str) -> list[str]:
+def build_fetch_command(
+    store: str,
+    project_root: Path,
+    python_executable: str,
+    expected_data_date: date | None = None,
+) -> list[str]:
+    if store == STORE_BICTSUBAME:
+        if expected_data_date is None:
+            raise ValueError("Bic Tsubame fetch requires expected_data_date.")
+        command = [
+            python_executable,
+            str(
+                project_root
+                / "machine_number"
+                / "ana_slo_bic_tsubame_takasaki_click_fetch_range_v4.py"
+            ),
+            "--start-date",
+            expected_data_date.isoformat(),
+            "--end-date",
+            expected_data_date.isoformat(),
+            "--min-machines",
+            "200",
+        ]
+        _assert_safe_command(command)
+        return command
+
     scripts = {
         STORE_MARUHAN: "ana_slo_maruhan_maebashi_click_fetch_v3.py",
         STORE_BIGMARCH: "ana_slo_bigmarch_oyagi_click_fetch_31days_v3.py",
@@ -592,6 +668,22 @@ def build_pipeline_command(
             "--skip-fetch",
             "--target-date",
             operation_date.isoformat(),
+        ]
+    elif store == STORE_BICTSUBAME:
+        command = [
+            python_executable,
+            str(
+                project_root
+                / "machine_number"
+                / "ana_slo_bic_tsubame_takasaki_one_click_daily_update_v1.py"
+            ),
+            "--skip-fetch",
+            "--operation-date",
+            operation_date.isoformat(),
+            "--min-machines",
+            "200",
+            "--chrome-wait-sec",
+            str(chrome_wait_sec),
         ]
     else:
         raise ValueError(f"Unknown store: {store}")
@@ -1147,6 +1239,84 @@ def verify_yasuda_completion(project_root: Path, operation_date: date) -> Verifi
     return VerificationResult("COMPLETE", True, artifacts=[str(daily)])
 
 
+
+def verify_bic_tsubame_completion(
+    project_root: Path, operation_date: date
+) -> VerificationResult:
+    expected, skipped_closures = bic_tsubame_expected_latest_data_date(operation_date)
+    daily = (
+        Path(project_root)
+        / "data/bic_tsubame_takasaki/machine_number"
+        / f"ana_slo_bic_tsubame_takasaki_{expected:%Y%m%d}.csv"
+    )
+    if not daily.exists():
+        return VerificationResult(
+            "NONE",
+            False,
+            details={
+                "expected_data_date": expected.isoformat(),
+                "skipped_closure_days": len(skipped_closures),
+            },
+        )
+    if daily.stat().st_size <= 0:
+        return VerificationResult(
+            "INVALID", False, "Bic Tsubame daily CSV is empty.", [str(daily)]
+        )
+    try:
+        frame = pd.read_csv(daily, encoding="utf-8-sig")
+        required = {"date", "machine_name", "machine_no", "G", "diff"}
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise RuntimeError(f"required columns missing: {missing}")
+        if len(frame) != BICTSUBAME_EXPECTED_MACHINES:
+            raise RuntimeError(
+                "Bic Tsubame machine count mismatch: "
+                f"{len(frame)} != {BICTSUBAME_EXPECTED_MACHINES}"
+            )
+        dates = pd.to_datetime(frame["date"], errors="raise").dt.date.unique().tolist()
+        machines = pd.to_numeric(frame["machine_no"], errors="raise")
+        games = pd.to_numeric(frame["G"], errors="raise")
+        differences = pd.to_numeric(frame["diff"], errors="raise")
+        names = frame["machine_name"].astype("string").str.strip()
+        if dates != [expected]:
+            raise RuntimeError(f"internal date mismatch: {dates} != {[expected]}")
+        if machines.isna().any() or machines.duplicated().any():
+            raise RuntimeError("machine_no missing or duplicated")
+        if machines.nunique() != BICTSUBAME_EXPECTED_MACHINES:
+            raise RuntimeError("machine_no unique count mismatch")
+        if names.isna().any() or names.isin(["", "nan", "None"]).any():
+            raise RuntimeError("machine_name missing or empty")
+        if games.isna().any() or differences.isna().any() or (games < 0).any():
+            raise RuntimeError("G/diff missing, non-numeric, or negative G")
+    except Exception as exc:
+        return VerificationResult(
+            "INVALID",
+            False,
+            f"{type(exc).__name__}: {exc}",
+            [str(daily)],
+            details={
+                "expected_data_date": expected.isoformat(),
+                "skipped_closure_days": len(skipped_closures),
+            },
+        )
+    return VerificationResult(
+        "COMPLETE",
+        True,
+        artifacts=[str(daily)],
+        details={
+            "latest_data_date": expected.isoformat(),
+            "expected_data_date": expected.isoformat(),
+            "rows": len(frame),
+            "unique_machines": int(machines.nunique()),
+            "sha256": sha256_file(daily),
+            "skipped_closure_days": len(skipped_closures),
+            "skipped_closures": [
+                {"date": closure_date.isoformat(), "reason": reason}
+                for closure_date, reason in skipped_closures
+            ],
+        },
+    )
+
 def verify_store_completion(store: str, project_root: Path, operation_date: date) -> VerificationResult:
     if store == STORE_MARUHAN:
         return verify_maruhan_completion(project_root, operation_date)
@@ -1154,6 +1324,8 @@ def verify_store_completion(store: str, project_root: Path, operation_date: date
         return verify_big_march_completion(project_root, operation_date)
     if store == STORE_YASUDA:
         return verify_yasuda_completion(project_root, operation_date)
+    if store == STORE_BICTSUBAME:
+        return verify_bic_tsubame_completion(project_root, operation_date)
     raise ValueError(f"Unknown store: {store}")
 
 

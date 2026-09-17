@@ -18,6 +18,7 @@ from typing import Callable
 from slotanalyzer_morning_automation_support import (
     JST,
     STORE_BIGMARCH,
+    STORE_BICTSUBAME,
     STORE_MARUHAN,
     STORE_YASUDA,
     STORE_ORDER,
@@ -26,6 +27,7 @@ from slotanalyzer_morning_automation_support import (
     now_jst,
     verify_big_march_completion,
     verify_big_march_provisional_completion,
+    verify_bic_tsubame_completion,
     verify_maruhan_completion,
     verify_yasuda_completion,
 )
@@ -1046,6 +1048,33 @@ def _yasuda_section(state: dict, root: Path, operation_date: date) -> tuple[list
     return lines, warnings
 
 
+
+def _bic_tsubame_section(
+    state: dict, root: Path, operation_date: date
+) -> tuple[list[str], list[str]]:
+    item = _store_state(state, STORE_BICTSUBAME)
+    verification = verify_bic_tsubame_completion(root, operation_date)
+    expected = verification.details.get(
+        "expected_data_date", (operation_date - timedelta(days=1)).isoformat()
+    )
+    latest = verification.details.get("latest_data_date", item.get("latest_data_date", ""))
+    records = verification.details.get("rows", 0)
+    warnings = [] if verification.ok else [
+        f"Bic Tsubame: Freshness/quality失敗 ({verification.status})"
+    ]
+    lines = [
+        "【Bic Tsubame 高崎】",
+        f"status: {item.get('status', 'UNKNOWN')}",
+        f"expected/latest data date: {expected} / {latest or '-'}",
+        f"records: {records}",
+        f"Freshness/quality: {'OK' if verification.ok else 'FAILED: ' + verification.status}",
+        "ランキング機能: 未実装",
+    ]
+    skipped = verification.details.get("skipped_closures") or []
+    if skipped:
+        lines.append(f"known closure skipped: {len(skipped)} day(s)")
+    return lines, warnings
+
 def build_notification_message(state: dict, project_root: Path, *, store: str | None = None) -> NotificationMessage:
     if store is not None:
         return build_store_notification_message(state, project_root, store)
@@ -1057,10 +1086,11 @@ def build_notification_message(state: dict, project_root: Path, *, store: str | 
     for store, label, builder in [
         (STORE_MARUHAN, "Maruhan", _maruhan_content),
         (STORE_BIGMARCH, "Big March", _bigmarch_content),
-        (STORE_YASUDA, "Yasuda", None),
+        (STORE_YASUDA, "Yasuda", _yasuda_section),
+        (STORE_BICTSUBAME, "Bic Tsubame", _bic_tsubame_section),
     ]:
-        if builder is None:
-            lines, store_warnings = _yasuda_section(state, project_root, operation_date)
+        if builder in {_yasuda_section, _bic_tsubame_section}:
+            lines, store_warnings = builder(state, project_root, operation_date)
             section = StoreSection(lines[0], lines[1:], [], [])
         else:
             section, store_warnings = builder(state, project_root, operation_date)
@@ -1144,6 +1174,9 @@ def build_store_notification_message(state: dict, project_root: Path, store: str
     )
     if store == STORE_YASUDA:
         lines, warnings = _yasuda_section(state, project_root, operation_date)
+        section = StoreSection(lines[0], lines[1:], [], [])
+    elif store == STORE_BICTSUBAME:
+        lines, warnings = _bic_tsubame_section(state, project_root, operation_date)
         section = StoreSection(lines[0], lines[1:], [], [])
     else:
         builder = _maruhan_content if store == STORE_MARUHAN else _bigmarch_content

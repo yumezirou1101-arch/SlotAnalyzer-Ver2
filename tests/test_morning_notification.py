@@ -23,6 +23,7 @@ from slotanalyzer_morning_automation_support import JST
 
 
 def state_with(statuses):
+    padded = list(statuses) + ["SUCCESS"] * max(0, len(automation.STORE_ORDER) - len(statuses))
     return {
         "automation_run_id": "morning_test",
         "operation_date": "2026-09-04",
@@ -33,7 +34,7 @@ def state_with(statuses):
                 "error_category": "" if status == "SUCCESS" else "TEST_ERROR",
                 "error": "" if status == "SUCCESS" else "test failure",
             }
-            for store, status in zip(automation.STORE_ORDER, statuses)
+            for store, status in zip(automation.STORE_ORDER, padded)
         },
     }
 
@@ -114,10 +115,10 @@ class MorningNotificationTests(unittest.TestCase):
         FakeSMTP.calls = []
 
     def test_overall_success_partial_failed_and_manual(self):
-        self.assertEqual(notification.determine_overall_status(state_with(["SUCCESS"] * 3)), "SUCCESS")
+        self.assertEqual(notification.determine_overall_status(state_with(["SUCCESS"] * 4)), "SUCCESS")
         self.assertEqual(notification.determine_overall_status(state_with(["SUCCESS", "FAILED_FINAL", "FAILED_FINAL"])), "PARTIAL")
-        self.assertEqual(notification.determine_overall_status(state_with(["FAILED_FINAL"] * 3)), "FAILED")
-        self.assertEqual(notification.determine_overall_status(state_with(["NEEDS_MANUAL_REVIEW"] * 3)), "MANUAL_REVIEW")
+        self.assertEqual(notification.determine_overall_status(state_with(["FAILED_FINAL"] * 4)), "FAILED")
+        self.assertEqual(notification.determine_overall_status(state_with(["NEEDS_MANUAL_REVIEW"] * 4)), "MANUAL_REVIEW")
 
     def test_credential_read_failure_is_safe(self):
         with mock.patch.object(notification.os, "name", "posix"):
@@ -132,15 +133,15 @@ class MorningNotificationTests(unittest.TestCase):
 
     def test_message_statuses_and_manual_warning(self):
         for statuses, expected in [
-            (["SUCCESS"] * 3, "SUCCESS"),
+            (["SUCCESS"] * 4, "SUCCESS"),
             (["SUCCESS", "FAILED_FINAL", "FAILED_FINAL"], "PARTIAL"),
-            (["FAILED_FINAL"] * 3, "FAILED"),
+            (["FAILED_FINAL"] * 4, "FAILED"),
         ]:
             with tempfile.TemporaryDirectory() as directory:
                 message = notification.build_notification_message(state_with(statuses), Path(directory))
             self.assertIn(f"[{expected}]", message.subject)
         with tempfile.TemporaryDirectory() as directory:
-            message = notification.build_notification_message(state_with(["NEEDS_MANUAL_REVIEW"] * 3), Path(directory))
+            message = notification.build_notification_message(state_with(["NEEDS_MANUAL_REVIEW"] * 4), Path(directory))
         self.assertIn("MANUAL_REVIEW", message.plain)
 
     def test_yesterday_formal_normal_shows_top10_and_69_summaries(self):
@@ -633,6 +634,30 @@ class MorningNotificationTests(unittest.TestCase):
         self.assertIn("CHANGE_OBSERVED", text)
         self.assertIn("added=1 / removed=2 / renamed=3", text)
         self.assertIn("判定には影響しません", text)
+
+    def test_bic_tsubame_section_reports_foundation_only(self):
+        state = state_with(["SUCCESS"] * 4)
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(notification, "verify_bic_tsubame_completion") as verify:
+            verify.return_value = mock.Mock(
+                ok=True,
+                status="COMPLETE",
+                details={
+                    "expected_data_date": "2026-09-03",
+                    "latest_data_date": "2026-09-03",
+                    "rows": 517,
+                    "skipped_closures": [],
+                },
+            )
+            lines, warnings = notification._bic_tsubame_section(
+                state, Path(directory), date(2026, 9, 4)
+            )
+        text = "\n".join(lines)
+        self.assertIn("【Bic Tsubame 高崎】", text)
+        self.assertIn("records: 517", text)
+        self.assertIn("Freshness/quality: OK", text)
+        self.assertIn("ランキング機能: 未実装", text)
+        self.assertEqual(warnings, [])
 
     def test_yasuda_inventory_block_keeps_ranking_unimplemented_message(self):
         state = state_with(["SUCCESS", "SUCCESS", "NEEDS_MANUAL_REVIEW"])
