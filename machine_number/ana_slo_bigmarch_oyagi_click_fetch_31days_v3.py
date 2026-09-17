@@ -143,32 +143,88 @@ async def open_store_list_page(context):
     return page
 
 
+async def wait_for_list_page_ready(
+    page,
+    attempts: int = 20,
+    interval_ms: int = 250,
+):
+    last_title = ""
+    last_link_count = 0
+
+    for _ in range(attempts):
+        try:
+            last_title = await page.title()
+        except Exception:
+            last_title = ""
+
+        if (
+            is_store_list_url(page.url)
+            and LIST_TITLE_TEXT in last_title
+            and has_store_text(last_title)
+        ):
+            try:
+                date_links = await collect_date_links(page)
+            except Exception:
+                date_links = []
+
+            last_link_count = len(date_links)
+
+            if last_link_count > 0:
+                return True, last_title, last_link_count
+
+        await page.wait_for_timeout(interval_ms)
+
+    return False, last_title, last_link_count
+
+
 async def ensure_list_page(page):
     title = await page.title()
 
-    if LIST_TITLE_TEXT in title and has_store_text(title):
-        return
+    if is_store_list_url(page.url):
+        if not title.strip():
+            print("list page URL confirmed : title temporarily blank")
+            print("action                : wait for list page readiness")
 
-    if is_store_list_url(page.url) and not title.strip():
-        print("list page URL confirmed : title temporarily blank")
-        return
+        ready, ready_title, link_count = await wait_for_list_page_ready(page)
 
-    print("returning to list page : explicit URL")
+        if ready:
+            if not title.strip():
+                print(f"list page title       : {ready_title}")
+                print(f"date links ready      : {link_count}")
+                print("list page recovery    : OK")
+            return
 
-    await page.goto(
+        print("list page readiness   : TIMEOUT")
+        print(f"last title            : {ready_title}")
+        print(f"date links ready      : {link_count}")
+        print("action                : explicit list-page reload")
+    else:
+        print("returning to list page : explicit URL")
+
+    response = await page.goto(
         STORE_LIST_URL,
         wait_until="domcontentloaded",
         timeout=30000,
     )
     await page.wait_for_timeout(1200)
 
-    title = await page.title()
-    print(f"list page title       : {title}")
+    status = response.status if response is not None else None
+    ready, title, link_count = await wait_for_list_page_ready(
+        page,
+        attempts=32,
+        interval_ms=250,
+    )
 
-    if LIST_TITLE_TEXT not in title or not has_store_text(title):
+    print(f"list page HTTP status : {status}")
+    print(f"list page title       : {title}")
+    print(f"date links ready      : {link_count}")
+
+    if not ready:
         raise RuntimeError(
-            "Could not return to the Big March Oyagi data-list page."
+            "Could not return to a ready Big March Oyagi data-list page."
         )
+
+    print("list page recovery    : OK")
 
 async def collect_date_links(page):
     anchor_rows = await page.locator("a").evaluate_all(
