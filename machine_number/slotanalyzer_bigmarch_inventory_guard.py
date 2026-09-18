@@ -43,6 +43,7 @@ class BigMarchInventoryGuardDecision:
     known_change_date: bool
     comparison_status: str
     monitor_status: str
+    reference_allowed: bool = False
     comparison: InventoryDiff | None = None
     persistent_state: dict = field(default_factory=dict)
 
@@ -61,6 +62,7 @@ class BigMarchInventoryGuardDecision:
             self.reason,
             f"formal_allowed={self.formal_allowed}",
             f"provisional_allowed={self.provisional_allowed}",
+            f"reference_allowed={self.reference_allowed}",
         ]
 
         if self.latest_data_date:
@@ -87,7 +89,10 @@ class BigMarchInventoryGuardDecision:
 
 
 class BigMarchInventoryGuardBlockedError(RuntimeError):
-    def __init__(self, decision: BigMarchInventoryGuardDecision):
+    def __init__(
+        self,
+        decision: BigMarchInventoryGuardDecision,
+    ):
         self.decision = decision
         super().__init__(decision.summary())
 
@@ -114,15 +119,28 @@ def discover_big_march_daily_files(
         except ValueError:
             continue
 
-        if not_after is not None and file_date > not_after:
+        if (
+            not_after is not None
+            and file_date > not_after
+        ):
             continue
 
-        found.append((file_date, path))
+        found.append(
+            (
+                file_date,
+                path,
+            )
+        )
 
-    return sorted(found, key=lambda item: item[0])
+    return sorted(
+        found,
+        key=lambda item: item[0],
+    )
 
 
-def _evidence_to_diff(evidence) -> InventoryDiff | None:
+def _evidence_to_diff(
+    evidence,
+) -> InventoryDiff | None:
     if not evidence.comparison_performed:
         return None
 
@@ -136,14 +154,40 @@ def _evidence_to_diff(evidence) -> InventoryDiff | None:
             evidence.current_machine_count
         ),
         added_machine_numbers=list(
-            evidence.added_machine_numbers or []
+            evidence.added_machine_numbers
+            or []
         ),
         removed_machine_numbers=list(
-            evidence.removed_machine_numbers or []
+            evidence.removed_machine_numbers
+            or []
         ),
         renamed_machine_numbers=list(
-            evidence.renamed_machine_numbers or []
+            evidence.renamed_machine_numbers
+            or []
         ),
+    )
+
+
+def _known_change_dates_between(
+    latest_data_date: date,
+    expected_data_date: date,
+) -> list[date]:
+    """
+    Return known inventory-change dates that fall inside the
+    unconfirmed span after the latest available daily inventory.
+
+    A fresh latest_data_date == expected_data_date has no
+    unconfirmed span and therefore returns an empty list.
+    """
+    return sorted(
+        change_date
+        for change_date
+        in BIGMARCH_TAKASAKI_OYAGI_POLICY.known_change_dates
+        if (
+            latest_data_date
+            < change_date
+            <= expected_data_date
+        )
     )
 
 
@@ -160,6 +204,7 @@ def _blocked_decision(
     monitor_status: str,
     comparison: InventoryDiff | None,
     persistent_state: dict,
+    reference_allowed: bool = False,
 ) -> BigMarchInventoryGuardDecision:
     return BigMarchInventoryGuardDecision(
         status=status,
@@ -168,7 +213,9 @@ def _blocked_decision(
         provisional_allowed=False,
         reason=reason,
         operation_date=operation_date.isoformat(),
-        expected_data_date=expected_data_date.isoformat(),
+        expected_data_date=(
+            expected_data_date.isoformat()
+        ),
         latest_data_date=(
             latest_data_date.isoformat()
             if latest_data_date is not None
@@ -178,6 +225,7 @@ def _blocked_decision(
         known_change_date=known_change_date,
         comparison_status=comparison_status,
         monitor_status=monitor_status,
+        reference_allowed=reference_allowed,
         comparison=comparison,
         persistent_state=persistent_state,
     )
@@ -198,20 +246,28 @@ def _pass_decision(
     persistent_state: dict,
     formal_allowed: bool,
     provisional_allowed: bool,
+    reference_allowed: bool = False,
 ) -> BigMarchInventoryGuardDecision:
     return BigMarchInventoryGuardDecision(
         status=status,
         blocked=False,
         formal_allowed=formal_allowed,
-        provisional_allowed=provisional_allowed,
+        provisional_allowed=(
+            provisional_allowed
+        ),
         reason=reason,
         operation_date=operation_date.isoformat(),
-        expected_data_date=expected_data_date.isoformat(),
-        latest_data_date=latest_data_date.isoformat(),
+        expected_data_date=(
+            expected_data_date.isoformat()
+        ),
+        latest_data_date=(
+            latest_data_date.isoformat()
+        ),
         source_delay_days=source_delay_days,
         known_change_date=known_change_date,
         comparison_status=comparison_status,
         monitor_status=monitor_status,
+        reference_allowed=reference_allowed,
         comparison=comparison,
         persistent_state=persistent_state,
     )
@@ -223,25 +279,38 @@ def _persist_actual_change(
     evidence,
     persistent_state: dict,
 ) -> dict:
-    state_path = inventory_guard_state_path(data_dir)
+    state_path = inventory_guard_state_path(
+        data_dir
+    )
 
     if (
-        persistent_state.get("status") == "BLOCKED"
-        and _same_change(persistent_state, comparison)
+        persistent_state.get("status")
+        == "BLOCKED"
+        and _same_change(
+            persistent_state,
+            comparison,
+        )
     ):
         return persistent_state
 
     planned_now_confirmed = (
-        persistent_state.get("status") == "BLOCKED"
-        and persistent_state.get("incident_kind")
+        persistent_state.get("status")
+        == "BLOCKED"
+        and persistent_state.get(
+            "incident_kind"
+        )
         == "KNOWN_CHANGE_UNCONFIRMED"
-        and persistent_state.get("change_date")
+        and persistent_state.get(
+            "change_date"
+        )
         == comparison.current_date
     )
 
     if (
         persistent_state
-        and not _is_explicitly_approved(persistent_state)
+        and not _is_explicitly_approved(
+            persistent_state
+        )
         and not planned_now_confirmed
     ):
         return persistent_state
@@ -251,38 +320,56 @@ def _persist_actual_change(
         comparison,
     )
 
-    new_state["policy_version"] = POLICY_VERSION
+    new_state["policy_version"] = (
+        POLICY_VERSION
+    )
+
     new_state["comparison_status"] = (
         evidence.comparison_status
     )
-    new_state["previous_daily_sha256"] = (
-        evidence.previous_daily_sha256
-    )
-    new_state["current_daily_sha256"] = (
-        evidence.current_daily_sha256
-    )
+
+    new_state[
+        "previous_daily_sha256"
+    ] = evidence.previous_daily_sha256
+
+    new_state[
+        "current_daily_sha256"
+    ] = evidence.current_daily_sha256
+
     new_state["incident_reason"] = (
-        "Actual Big March inventory change detected."
+        "Actual Big March inventory "
+        "change detected."
     )
 
-    _atomic_write_state(state_path, new_state)
+    _atomic_write_state(
+        state_path,
+        new_state,
+    )
+
     return new_state
 
 
 def _persist_known_change_unconfirmed(
     data_dir: Path,
-    expected_data_date: date,
+    change_date: date,
     latest_data_date: date,
     persistent_state: dict,
 ) -> dict:
-    state_path = inventory_guard_state_path(data_dir)
+    state_path = inventory_guard_state_path(
+        data_dir
+    )
 
     same_planned = (
-        persistent_state.get("status") == "BLOCKED"
-        and persistent_state.get("incident_kind")
+        persistent_state.get("status")
+        == "BLOCKED"
+        and persistent_state.get(
+            "incident_kind"
+        )
         == "KNOWN_CHANGE_UNCONFIRMED"
-        and persistent_state.get("change_date")
-        == expected_data_date.isoformat()
+        and persistent_state.get(
+            "change_date"
+        )
+        == change_date.isoformat()
     )
 
     if same_planned:
@@ -290,23 +377,35 @@ def _persist_known_change_unconfirmed(
 
     if (
         persistent_state
-        and not _is_explicitly_approved(persistent_state)
+        and not _is_explicitly_approved(
+            persistent_state
+        )
     ):
         return persistent_state
 
-    new_state = _state_for_unconfirmed_known_change(
-        BIGMARCH_TAKASAKI_OYAGI_POLICY,
-        expected_data_date,
-        latest_data_date,
+    new_state = (
+        _state_for_unconfirmed_known_change(
+            BIGMARCH_TAKASAKI_OYAGI_POLICY,
+            change_date,
+            latest_data_date,
+        )
     )
 
-    new_state["policy_version"] = POLICY_VERSION
+    new_state["policy_version"] = (
+        POLICY_VERSION
+    )
+
     new_state["incident_reason"] = (
-        "Known Big March inventory change date is "
-        "not yet confirmed by the expected daily inventory."
+        "Known Big March inventory change "
+        "date is not yet confirmed by an "
+        "available daily inventory."
     )
 
-    _atomic_write_state(state_path, new_state)
+    _atomic_write_state(
+        state_path,
+        new_state,
+    )
+
     return new_state
 
 
@@ -321,127 +420,212 @@ def assess_big_march_inventory_guard(
 
     Rules:
     - Fresh expected daily:
-        Formal may run only if the latest consecutive
-        inventory transition is confirmed safe.
+        Formal may run only if the latest
+        consecutive inventory transition is
+        confirmed safe.
+
     - One-day source delay:
         Formal is forbidden.
-        PROVISIONAL may run only if the latest available
-        consecutive inventory transition is confirmed safe.
+        PROVISIONAL may run only if the latest
+        available consecutive inventory
+        transition is confirmed safe.
+
     - Delay >= 2 days:
-        Formal and PROVISIONAL are blocked.
-    - NON_CONSECUTIVE / invalid / missing comparison:
-        Formal and PROVISIONAL are blocked.
+        Formal and PROVISIONAL remain blocked.
+        STALE_REFERENCE may be allowed only
+        after the latest available consecutive
+        inventory transition is confirmed safe
+        and no known inventory-change date
+        exists inside the unconfirmed span.
+
+    - NON_CONSECUTIVE / invalid / missing
+      comparison:
+        Formal, PROVISIONAL, and
+        STALE_REFERENCE are blocked.
+
     - ACTUAL_CHANGE:
         Persisted BLOCK until explicit approval.
+
     - Known change date not yet confirmed:
-        Formal and PROVISIONAL are blocked.
-    - SOURCE_CHANGED_AFTER_OBSERVATION / monitor ERROR:
+        Formal, PROVISIONAL, and
+        STALE_REFERENCE are blocked.
+
+    - SOURCE_CHANGED_AFTER_OBSERVATION /
+      monitor ERROR:
         Fail closed.
+
     - Monitor Evidence:
-        Preserve observational evidence whenever a daily
-        baseline exists and the monitor can evaluate it.
-        Guard remains authoritative for allow/block control.
+        Preserve observational evidence whenever
+        a daily baseline exists and the monitor
+        can evaluate it.
+
+        Guard remains authoritative for
+        Formal / PROVISIONAL / STALE_REFERENCE
+        allow decisions.
     """
     data_dir = Path(data_dir)
+
     operation_date = date.fromisoformat(
         str(operation_date)
     )
 
     if generated_at_jst is None:
-        generated_at_jst = datetime.now().astimezone()
+        generated_at_jst = (
+            datetime.now().astimezone()
+        )
 
     expected_data_date = (
-        operation_date - timedelta(days=1)
+        operation_date
+        - timedelta(days=1)
     )
 
-    state_path = inventory_guard_state_path(data_dir)
-    persistent_state = _read_persistent_state(
-        state_path,
-        BIGMARCH_TAKASAKI_OYAGI_POLICY,
+    state_path = (
+        inventory_guard_state_path(
+            data_dir
+        )
     )
 
-    daily_files = discover_big_march_daily_files(
-        data_dir,
-        not_after=expected_data_date,
+    persistent_state = (
+        _read_persistent_state(
+            state_path,
+            BIGMARCH_TAKASAKI_OYAGI_POLICY,
+        )
+    )
+
+    daily_files = (
+        discover_big_march_daily_files(
+            data_dir,
+            not_after=expected_data_date,
+        )
     )
 
     if not daily_files:
         return _blocked_decision(
-            status="BLOCKED_NO_DAILY_BASELINE",
+            status=(
+                "BLOCKED_NO_DAILY_BASELINE"
+            ),
             reason=(
-                "No Big March daily inventory is available "
-                "on or before the expected data date."
+                "No Big March daily inventory "
+                "is available on or before the "
+                "expected data date."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
+            expected_data_date=(
+                expected_data_date
+            ),
             latest_data_date=None,
             source_delay_days=None,
             known_change_date=(
                 expected_data_date
-                in BIGMARCH_TAKASAKI_OYAGI_POLICY.known_change_dates
+                in BIGMARCH_TAKASAKI_OYAGI_POLICY
+                .known_change_dates
             ),
-            comparison_status="NO_DAILY_BASELINE",
+            comparison_status=(
+                "NO_DAILY_BASELINE"
+            ),
             monitor_status="",
             comparison=None,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
-    latest_data_date, latest_path = daily_files[-1]
+    latest_data_date, latest_path = (
+        daily_files[-1]
+    )
+
     source_delay_days = (
-        expected_data_date - latest_data_date
+        expected_data_date
+        - latest_data_date
     ).days
 
     if source_delay_days < 0:
         return _blocked_decision(
             status="BLOCKED_FUTURE_DAILY",
             reason=(
-                "Latest Big March daily inventory is later "
-                "than the expected data date."
+                "Latest Big March daily "
+                "inventory is later than the "
+                "expected data date."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
             known_change_date=False,
             comparison_status="FUTURE_DAILY",
             monitor_status="",
             comparison=None,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
-    known_change_date = (
-        expected_data_date
-        in BIGMARCH_TAKASAKI_OYAGI_POLICY.known_change_dates
+    missing_span_known_changes = (
+        _known_change_dates_between(
+            latest_data_date,
+            expected_data_date,
+        )
+    )
+
+    known_change_date = bool(
+        missing_span_known_changes
     )
 
     try:
-        monitor_result = observe_big_march_inventory(
-            data_dir,
-            operation_date,
-            generated_at_jst=generated_at_jst,
+        monitor_result = (
+            observe_big_march_inventory(
+                data_dir,
+                operation_date,
+                generated_at_jst=(
+                    generated_at_jst
+                ),
+            )
         )
+
     except Exception as exc:
         return _blocked_decision(
             status="BLOCKED_GUARD_ERROR",
             reason=(
-                "Big March inventory monitor/evidence "
-                "verification failed during authoritative "
-                f"Guard evaluation: {type(exc).__name__}: "
-                f"{exc}"
+                "Big March inventory "
+                "monitor/evidence verification "
+                "failed during authoritative "
+                "Guard evaluation: "
+                f"{type(exc).__name__}: {exc}"
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
-            known_change_date=known_change_date,
-            comparison_status="MONITOR_EVIDENCE_ERROR",
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
+            known_change_date=(
+                known_change_date
+            ),
+            comparison_status=(
+                "MONITOR_EVIDENCE_ERROR"
+            ),
             monitor_status="ERROR",
             comparison=None,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
     monitor_status = str(
-        monitor_result.get("status", "")
+        monitor_result.get(
+            "status",
+            "",
+        )
     )
 
     if monitor_status in {
@@ -452,75 +636,111 @@ def assess_big_march_inventory_guard(
             status=(
                 "BLOCKED_SOURCE_CHANGED"
                 if monitor_status
-                == "SOURCE_CHANGED_AFTER_OBSERVATION"
+                == (
+                    "SOURCE_CHANGED_"
+                    "AFTER_OBSERVATION"
+                )
                 else "BLOCKED_GUARD_ERROR"
             ),
             reason=(
-                "Previously observed Big March source "
-                "identity changed after observation."
+                "Previously observed Big March "
+                "source identity changed after "
+                "observation."
                 if monitor_status
-                == "SOURCE_CHANGED_AFTER_OBSERVATION"
+                == (
+                    "SOURCE_CHANGED_"
+                    "AFTER_OBSERVATION"
+                )
                 else (
-                    "Big March inventory monitor returned "
-                    "an error during authoritative Guard "
+                    "Big March inventory "
+                    "monitor returned an error "
+                    "during authoritative Guard "
                     "evaluation."
                 )
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
-            known_change_date=known_change_date,
-            comparison_status="MONITOR_EVIDENCE_BLOCK",
-            monitor_status=monitor_status,
-            comparison=None,
-            persistent_state=persistent_state,
-        )
-
-    if source_delay_days >= 2:
-        return _blocked_decision(
-            status="BLOCKED_SOURCE_DELAY",
-            reason=(
-                "Big March source delay is two days or more; "
-                "Formal and PROVISIONAL are both forbidden."
+            expected_data_date=(
+                expected_data_date
             ),
-            operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
-            known_change_date=known_change_date,
-            comparison_status="SOURCE_DELAY_GE_2",
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
+            known_change_date=(
+                known_change_date
+            ),
+            comparison_status=(
+                "MONITOR_EVIDENCE_BLOCK"
+            ),
             monitor_status=monitor_status,
             comparison=None,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
-    if source_delay_days == 1 and known_change_date:
+    # Any known inventory-change date after the
+    # latest available daily inventory makes the
+    # machine mapping untrusted until that change
+    # date is confirmed by a daily inventory.
+    #
+    # This applies to both:
+    #   delay == 1
+    # and
+    #   delay >= 2
+    #
+    # Therefore STALE_REFERENCE cannot cross a
+    # known change date.
+    if missing_span_known_changes:
+        change_date = (
+            missing_span_known_changes[0]
+        )
+
         persistent_state = (
             _persist_known_change_unconfirmed(
                 data_dir,
-                expected_data_date,
+                change_date,
                 latest_data_date,
                 persistent_state,
             )
         )
 
         return _blocked_decision(
-            status="BLOCKED_KNOWN_CHANGE_UNCONFIRMED",
+            status=(
+                "BLOCKED_KNOWN_CHANGE_"
+                "UNCONFIRMED"
+            ),
             reason=(
-                "Expected data date is a known inventory "
-                "change date, but its inventory is not yet "
-                "confirmed; PROVISIONAL is forbidden."
+                "A known Big March inventory "
+                "change date "
+                f"({change_date.isoformat()}) "
+                "exists after the latest "
+                "confirmed daily inventory and "
+                "has not yet been confirmed; "
+                "Formal, PROVISIONAL, and "
+                "STALE_REFERENCE are forbidden."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
             known_change_date=True,
-            comparison_status="KNOWN_CHANGE_UNCONFIRMED",
+            comparison_status=(
+                "KNOWN_CHANGE_UNCONFIRMED"
+            ),
             monitor_status=monitor_status,
             comparison=None,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
     previous_candidates = [
@@ -531,20 +751,35 @@ def assess_big_march_inventory_guard(
 
     if not previous_candidates:
         return _blocked_decision(
-            status="BLOCKED_COMPARISON_UNAVAILABLE",
+            status=(
+                "BLOCKED_COMPARISON_UNAVAILABLE"
+            ),
             reason=(
-                "No previous Big March daily inventory is "
-                "available for continuity verification."
+                "No previous Big March daily "
+                "inventory is available for "
+                "continuity verification."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
-            known_change_date=known_change_date,
-            comparison_status="PREVIOUS_MISSING",
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
+            known_change_date=(
+                known_change_date
+            ),
+            comparison_status=(
+                "PREVIOUS_MISSING"
+            ),
             monitor_status=monitor_status,
             comparison=None,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
     previous_date, previous_path = (
@@ -561,62 +796,97 @@ def assess_big_march_inventory_guard(
         mode="ENFORCE",
     )
 
-    comparison = _evidence_to_diff(evidence)
+    comparison = _evidence_to_diff(
+        evidence
+    )
 
     if not evidence.comparison_performed:
         reason = (
-            "Big March inventory comparison is "
-            "non-consecutive."
+            "Big March inventory comparison "
+            "is non-consecutive."
             if evidence.comparison_status
             == "NON_CONSECUTIVE"
             else (
-                "Big March inventory comparison is "
-                "unavailable or invalid."
+                "Big March inventory "
+                "comparison is unavailable "
+                "or invalid."
             )
         )
 
         return _blocked_decision(
-            status="BLOCKED_NON_CONSECUTIVE"
-            if evidence.comparison_status
-            == "NON_CONSECUTIVE"
-            else "BLOCKED_COMPARISON_UNAVAILABLE",
+            status=(
+                "BLOCKED_NON_CONSECUTIVE"
+                if evidence.comparison_status
+                == "NON_CONSECUTIVE"
+                else (
+                    "BLOCKED_COMPARISON_"
+                    "UNAVAILABLE"
+                )
+            ),
             reason=(
                 f"{reason} "
-                f"comparison_status="
+                "comparison_status="
                 f"{evidence.comparison_status}"
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
-            known_change_date=known_change_date,
-            comparison_status=evidence.comparison_status,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
+            known_change_date=(
+                known_change_date
+            ),
+            comparison_status=(
+                evidence.comparison_status
+            ),
             monitor_status=monitor_status,
             comparison=comparison,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
     if comparison is None:
         return _blocked_decision(
             status="BLOCKED_GUARD_ERROR",
             reason=(
-                "Inventory evidence reported a completed "
-                "comparison but no diff could be built."
+                "Inventory evidence reported "
+                "a completed comparison but no "
+                "diff could be built."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
-            known_change_date=known_change_date,
-            comparison_status=evidence.comparison_status,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
+            known_change_date=(
+                known_change_date
+            ),
+            comparison_status=(
+                evidence.comparison_status
+            ),
             monitor_status=monitor_status,
             comparison=None,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
     if comparison.has_changes:
         approved_same_change = (
-            _is_explicitly_approved(persistent_state)
+            _is_explicitly_approved(
+                persistent_state
+            )
             and _same_change(
                 persistent_state,
                 comparison,
@@ -630,7 +900,9 @@ def assess_big_march_inventory_guard(
                     persistent_state
                 )
                 and not (
-                    persistent_state.get("status")
+                    persistent_state.get(
+                        "status"
+                    )
                     == "BLOCKED"
                     and _same_change(
                         persistent_state,
@@ -641,7 +913,10 @@ def assess_big_march_inventory_guard(
                     persistent_state.get(
                         "incident_kind"
                     )
-                    == "KNOWN_CHANGE_UNCONFIRMED"
+                    == (
+                        "KNOWN_CHANGE_"
+                        "UNCONFIRMED"
+                    )
                     and persistent_state.get(
                         "change_date"
                     )
@@ -651,46 +926,84 @@ def assess_big_march_inventory_guard(
 
             if already_different_unapproved:
                 return _blocked_decision(
-                    status="BLOCKED_PERSISTENT_INCIDENT",
-                    reason=(
-                        "A different unapproved Big March "
-                        "inventory incident is already "
-                        "persisted and was not overwritten."
+                    status=(
+                        "BLOCKED_PERSISTENT_"
+                        "INCIDENT"
                     ),
-                    operation_date=operation_date,
-                    expected_data_date=expected_data_date,
-                    latest_data_date=latest_data_date,
-                    source_delay_days=source_delay_days,
-                    known_change_date=known_change_date,
-                    comparison_status=evidence.comparison_status,
-                    monitor_status=monitor_status,
+                    reason=(
+                        "A different unapproved "
+                        "Big March inventory "
+                        "incident is already "
+                        "persisted and was not "
+                        "overwritten."
+                    ),
+                    operation_date=(
+                        operation_date
+                    ),
+                    expected_data_date=(
+                        expected_data_date
+                    ),
+                    latest_data_date=(
+                        latest_data_date
+                    ),
+                    source_delay_days=(
+                        source_delay_days
+                    ),
+                    known_change_date=(
+                        known_change_date
+                    ),
+                    comparison_status=(
+                        evidence
+                        .comparison_status
+                    ),
+                    monitor_status=(
+                        monitor_status
+                    ),
                     comparison=comparison,
-                    persistent_state=persistent_state,
+                    persistent_state=(
+                        persistent_state
+                    ),
                 )
 
-            persistent_state = _persist_actual_change(
-                data_dir,
-                comparison,
-                evidence,
-                persistent_state,
+            persistent_state = (
+                _persist_actual_change(
+                    data_dir,
+                    comparison,
+                    evidence,
+                    persistent_state,
+                )
             )
 
             return _blocked_decision(
                 status="BLOCKED_ACTUAL_CHANGE",
                 reason=(
-                    "Actual Big March inventory change "
-                    "detected; explicit safety approval is "
-                    "required."
+                    "Actual Big March inventory "
+                    "change detected; explicit "
+                    "safety approval is required."
                 ),
                 operation_date=operation_date,
-                expected_data_date=expected_data_date,
-                latest_data_date=latest_data_date,
-                source_delay_days=source_delay_days,
-                known_change_date=known_change_date,
-                comparison_status=evidence.comparison_status,
-                monitor_status=monitor_status,
+                expected_data_date=(
+                    expected_data_date
+                ),
+                latest_data_date=(
+                    latest_data_date
+                ),
+                source_delay_days=(
+                    source_delay_days
+                ),
+                known_change_date=(
+                    known_change_date
+                ),
+                comparison_status=(
+                    evidence.comparison_status
+                ),
+                monitor_status=(
+                    monitor_status
+                ),
                 comparison=comparison,
-                persistent_state=persistent_state,
+                persistent_state=(
+                    persistent_state
+                ),
             )
 
     if (
@@ -700,83 +1013,168 @@ def assess_big_march_inventory_guard(
         )
     ):
         return _blocked_decision(
-            status="BLOCKED_PERSISTENT_INCIDENT",
+            status=(
+                "BLOCKED_PERSISTENT_INCIDENT"
+            ),
             reason=(
-                "A Big March inventory incident remains "
-                "blocked because explicit approval has not "
-                "been recorded."
+                "A Big March inventory "
+                "incident remains blocked "
+                "because explicit approval "
+                "has not been recorded."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
-            source_delay_days=source_delay_days,
-            known_change_date=known_change_date,
-            comparison_status=evidence.comparison_status,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
+            known_change_date=(
+                known_change_date
+            ),
+            comparison_status=(
+                evidence.comparison_status
+            ),
             monitor_status=monitor_status,
             comparison=comparison,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
         )
 
     if source_delay_days == 0:
         return _pass_decision(
             status="PASS_FORMAL",
             reason=(
-                "Expected Big March daily inventory is "
-                "present and the latest consecutive "
-                "inventory transition has no unapproved "
+                "Expected Big March daily "
+                "inventory is present and the "
+                "latest consecutive inventory "
+                "transition has no unapproved "
                 "change."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
             source_delay_days=0,
-            known_change_date=known_change_date,
-            comparison_status=evidence.comparison_status,
+            known_change_date=False,
+            comparison_status=(
+                evidence.comparison_status
+            ),
             monitor_status=monitor_status,
             comparison=comparison,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
             formal_allowed=True,
             provisional_allowed=False,
+            reference_allowed=False,
         )
 
     if source_delay_days == 1:
         return _pass_decision(
             status="PASS_PROVISIONAL_ONLY",
             reason=(
-                "Big March source is exactly one day "
-                "behind, but the latest available "
-                "consecutive inventory transition is "
-                "confirmed safe; Formal is forbidden and "
+                "Big March source is exactly "
+                "one day behind, but the latest "
+                "available consecutive inventory "
+                "transition is confirmed safe; "
+                "Formal is forbidden and "
                 "PROVISIONAL is allowed."
             ),
             operation_date=operation_date,
-            expected_data_date=expected_data_date,
-            latest_data_date=latest_data_date,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
             source_delay_days=1,
-            known_change_date=known_change_date,
-            comparison_status=evidence.comparison_status,
+            known_change_date=False,
+            comparison_status=(
+                evidence.comparison_status
+            ),
             monitor_status=monitor_status,
             comparison=comparison,
-            persistent_state=persistent_state,
+            persistent_state=(
+                persistent_state
+            ),
             formal_allowed=False,
             provisional_allowed=True,
+            reference_allowed=False,
+        )
+
+    if source_delay_days >= 2:
+        return _blocked_decision(
+            status="BLOCKED_SOURCE_DELAY",
+            reason=(
+                "Big March source delay is two "
+                "days or more. Formal and "
+                "PROVISIONAL remain forbidden, "
+                "but STALE_REFERENCE is allowed "
+                "because the latest available "
+                "consecutive inventory transition "
+                "is confirmed safe and no known "
+                "change date exists in the "
+                "unconfirmed span."
+            ),
+            operation_date=operation_date,
+            expected_data_date=(
+                expected_data_date
+            ),
+            latest_data_date=(
+                latest_data_date
+            ),
+            source_delay_days=(
+                source_delay_days
+            ),
+            known_change_date=False,
+            comparison_status=(
+                evidence.comparison_status
+            ),
+            monitor_status=monitor_status,
+            comparison=comparison,
+            persistent_state=(
+                persistent_state
+            ),
+            reference_allowed=True,
         )
 
     return _blocked_decision(
         status="BLOCKED_GUARD_ERROR",
         reason=(
-            "Unexpected Big March source-delay state."
+            "Unexpected Big March "
+            "source-delay state."
         ),
         operation_date=operation_date,
-        expected_data_date=expected_data_date,
-        latest_data_date=latest_data_date,
-        source_delay_days=source_delay_days,
-        known_change_date=known_change_date,
-        comparison_status=evidence.comparison_status,
+        expected_data_date=(
+            expected_data_date
+        ),
+        latest_data_date=(
+            latest_data_date
+        ),
+        source_delay_days=(
+            source_delay_days
+        ),
+        known_change_date=(
+            known_change_date
+        ),
+        comparison_status=(
+            evidence.comparison_status
+        ),
         monitor_status=monitor_status,
         comparison=comparison,
-        persistent_state=persistent_state,
+        persistent_state=(
+            persistent_state
+        ),
     )
+
 
 def enforce_big_march_formal_inventory_guard(
     data_dir: Path,
@@ -784,15 +1182,24 @@ def enforce_big_march_formal_inventory_guard(
     *,
     generated_at_jst=None,
 ) -> BigMarchInventoryGuardDecision:
-    decision = assess_big_march_inventory_guard(
-        data_dir,
-        operation_date,
-        generated_at_jst=generated_at_jst,
+    decision = (
+        assess_big_march_inventory_guard(
+            data_dir,
+            operation_date,
+            generated_at_jst=(
+                generated_at_jst
+            ),
+        )
     )
 
-    if decision.blocked or not decision.formal_allowed:
-        raise BigMarchInventoryGuardBlockedError(
-            decision
+    if (
+        decision.blocked
+        or not decision.formal_allowed
+    ):
+        raise (
+            BigMarchInventoryGuardBlockedError(
+                decision
+            )
         )
 
     return decision
@@ -804,18 +1211,62 @@ def enforce_big_march_provisional_inventory_guard(
     *,
     generated_at_jst=None,
 ) -> BigMarchInventoryGuardDecision:
-    decision = assess_big_march_inventory_guard(
-        data_dir,
-        operation_date,
-        generated_at_jst=generated_at_jst,
+    decision = (
+        assess_big_march_inventory_guard(
+            data_dir,
+            operation_date,
+            generated_at_jst=(
+                generated_at_jst
+            ),
+        )
     )
 
     if (
         decision.blocked
         or not decision.provisional_allowed
     ):
-        raise BigMarchInventoryGuardBlockedError(
-            decision
+        raise (
+            BigMarchInventoryGuardBlockedError(
+                decision
+            )
+        )
+
+    return decision
+
+
+def enforce_big_march_stale_reference_inventory_guard(
+    data_dir: Path,
+    operation_date: date,
+    *,
+    generated_at_jst=None,
+) -> BigMarchInventoryGuardDecision:
+    """
+    Allow only the isolated STALE_REFERENCE path.
+
+    Important:
+    decision.blocked intentionally remains True for
+    STALE_REFERENCE_ALLOWED because Formal and
+    PROVISIONAL are still blocked.
+
+    Therefore this enforcement function must check
+    reference_allowed directly rather than treating
+    blocked=True as a STALE_REFERENCE failure.
+    """
+    decision = (
+        assess_big_march_inventory_guard(
+            data_dir,
+            operation_date,
+            generated_at_jst=(
+                generated_at_jst
+            ),
+        )
+    )
+
+    if not decision.reference_allowed:
+        raise (
+            BigMarchInventoryGuardBlockedError(
+                decision
+            )
         )
 
     return decision

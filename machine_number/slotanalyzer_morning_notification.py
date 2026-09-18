@@ -27,6 +27,7 @@ from slotanalyzer_morning_automation_support import (
     now_jst,
     verify_big_march_completion,
     verify_big_march_provisional_completion,
+    verify_big_march_stale_reference_completion,
     verify_bic_tsubame_completion,
     verify_maruhan_completion,
     verify_yasuda_completion,
@@ -186,7 +187,7 @@ def determine_overall_status(state: dict) -> str:
     statuses = [str(item.get("status", "")) for item in state.get("stores", {}).values()]
     success = {"SUCCESS", "ALREADY_COMPLETE"}
     manual = {"NEEDS_MANUAL_REVIEW", "MANUAL_REVIEW"}
-    if "PROVISIONAL" in statuses:
+    if "PROVISIONAL" in statuses or "STALE_REFERENCE" in statuses:
         if any(value in manual for value in statuses):
             return "MANUAL_REVIEW"
         if "FAILED_FINAL" in statuses:
@@ -924,6 +925,97 @@ def _bigmarch_content(state: dict, root: Path, operation_date: date) -> tuple[St
     verification = verify_big_march_completion(root, operation_date)
     base = root / "data/bigmarch_takasaki_oyagi/machine_number"
     analysis = base / "analysis_31days_deep"
+    if item.get("status") == "STALE_REFERENCE":
+        stale = verify_big_march_stale_reference_completion(root, operation_date)
+        warnings = [
+            "Big March: STALE_REFERENCE / 実戦参考ランキング（正式・暫定とは別枠）"
+        ]
+        latest = stale.details.get(
+            "latest_data_date",
+            item.get("stale_reference_latest_data_date", ""),
+        )
+        delay = stale.details.get(
+            "source_delay_days",
+            item.get("stale_reference_source_delay_days", ""),
+        )
+        bucket = stale.details.get(
+            "source_delay_bucket",
+            item.get("stale_reference_source_delay_bucket", ""),
+        )
+        if not stale.ok:
+            return (
+                StoreSection(
+                    "【Big March 高崎おおやぎ】",
+                    [
+                        "⚠ STALE_REFERENCE成果物検証失敗",
+                        f"Target: {operation_date.isoformat()}",
+                        f"Expected: {expected.isoformat()}",
+                        f"Latest: {latest or '-'}",
+                        f"Source delay: {delay or '-'} day(s)",
+                        f"Lag bucket: {bucket or '-'}",
+                        "Inventory currentness: UNCONFIRMED",
+                        "Machine mapping: LAST_KNOWN",
+                        "Formal Forward: 対象外",
+                        "PROVISIONAL: 対象外",
+                        "Champion評価: 対象外",
+                    ],
+                    [],
+                    [],
+                ),
+                warnings + [
+                    f"Big March stale-reference verifier: {stale.status} {stale.error}"
+                ],
+            )
+
+        directory = (
+            analysis
+            / "91_stale_reference_future_ranking"
+            / operation_date.strftime("%Y%m%d")
+        )
+        prefix = f"91_stale_reference_{operation_date:%Y%m%d}"
+        juggler = _read_rows(directory / f"{prefix}_juggler_top10.csv")
+        nonjuggler = _read_rows(directory / f"{prefix}_nonjuggler_top10.csv")
+        for row in juggler:
+            row["score"] = row.get("recent7_win", "")
+        for row in nonjuggler:
+            row["score"] = row.get("weekday_avg", "")
+        return (
+            StoreSection(
+                "【Big March 高崎おおやぎ】",
+                [
+                    "⚠ STALE_REFERENCE / 実戦参考ランキング",
+                    "前日データが2日以上未反映のため、正式ランキングではありません",
+                    "PROVISIONALとも別枠の参考情報です",
+                    f"Target: {operation_date.isoformat()}",
+                    f"Expected: {expected.isoformat()}",
+                    f"Latest: {latest or '-'}",
+                    f"Source delay: {delay or '-'} day(s)",
+                    f"Lag bucket: {bucket or '-'}",
+                    "Inventory currentness: UNCONFIRMED",
+                    "Machine mapping: LAST_KNOWN",
+                    "Formal Forward: 対象外",
+                    "PROVISIONAL: 対象外",
+                    "Champion評価: 対象外",
+                    "※台番号・機種名は最新確認済みデータ時点のLAST_KNOWNです",
+                    "※当日の台構成は未確認です",
+                ],
+                [
+                    RankingBlock(
+                        "JUGGLER 実戦参考 Top10（recent7_win）",
+                        juggler,
+                        ("prediction_rank", "rank"),
+                    ),
+                    RankingBlock(
+                        "NON_JUGGLER 実戦参考 Top10（weekday_avg）",
+                        nonjuggler,
+                        ("prediction_rank", "rank"),
+                    ),
+                ],
+                monitor_lines,
+            ),
+            warnings,
+        )
+
     if item.get("status") == "PROVISIONAL":
         provisional = verify_big_march_provisional_completion(root, operation_date)
         expected_latest = expected - timedelta(days=1)
@@ -1170,7 +1262,9 @@ def build_store_notification_message(state: dict, project_root: Path, store: str
     overall = (
         "SUCCESS" if status in {"SUCCESS", "ALREADY_COMPLETE"}
         else "MANUAL_REVIEW" if status in {"NEEDS_MANUAL_REVIEW", "MANUAL_REVIEW"}
-        else "PROVISIONAL" if status == "PROVISIONAL" else "FAILED"
+        else "PROVISIONAL" if status == "PROVISIONAL"
+        else "STALE_REFERENCE" if status == "STALE_REFERENCE"
+        else "FAILED"
     )
     if store == STORE_YASUDA:
         lines, warnings = _yasuda_section(state, project_root, operation_date)

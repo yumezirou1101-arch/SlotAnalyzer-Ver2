@@ -32,6 +32,7 @@ from slotanalyzer_morning_automation_support import (
     atomic_write_json,
     build_fetch_command,
     build_big_march_provisional_command,
+    build_big_march_stale_reference_command,
     build_pipeline_command,
     check_source_readiness,
     classify_fetch_result,
@@ -44,6 +45,7 @@ from slotanalyzer_morning_automation_support import (
     run_logged_subprocess,
     verify_big_march_completion,
     verify_big_march_provisional_completion,
+    verify_big_march_stale_reference_completion,
     verify_bic_tsubame_completion,
     verify_maruhan_completion,
     verify_yasuda_completion,
@@ -202,20 +204,28 @@ class Phase2SupportTests(unittest.TestCase):
         *,
         formal_allowed: bool,
         provisional_allowed: bool,
+        reference_allowed: bool = False,
         reason: str = "fixture",
         status: str = "PASS",
+        source_delay_days: int = 1,
+        latest_data_date: str = "2026-09-04",
     ) -> dict:
         blocked = not (formal_allowed or provisional_allowed)
+        if reference_allowed:
+            # STALE_REFERENCE intentionally keeps blocked=True for
+            # Formal / PROVISIONAL while opening only the third axis.
+            blocked = True
         return {
             "status": status,
             "blocked": blocked,
             "formal_allowed": formal_allowed,
             "provisional_allowed": provisional_allowed,
+            "reference_allowed": reference_allowed,
             "reason": reason,
             "operation_date": "2026-09-06",
             "expected_data_date": "2026-09-05",
-            "latest_data_date": "2026-09-04",
-            "source_delay_days": 1,
+            "latest_data_date": latest_data_date,
+            "source_delay_days": source_delay_days,
             "known_change_date": False,
             "comparison_status": "NO_CHANGE",
             "monitor_status": "NO_CHANGE",
@@ -1144,6 +1154,23 @@ class Phase2SupportTests(unittest.TestCase):
         self.assertEqual(command[-2:], ["--operation-date", "2026-09-06"])
         self.assertNotIn("--allow-gap", command)
 
+    def test_stale_reference_command_is_separate_and_has_no_bypass(self):
+        command = build_big_march_stale_reference_command(
+            PROJECT_ROOT,
+            "python",
+            date(2026, 9, 6),
+        )
+        self.assertIn(
+            "ana_slo_bigmarch_oyagi_stale_reference_future_ranking.py",
+            command[1],
+        )
+        self.assertEqual(
+            command[-2:],
+            ["--operation-date", "2026-09-06"],
+        )
+        self.assertNotIn("--allow-gap", command)
+        self.assertNotIn("--overwrite", command)
+
     def test_existing_20260906_provisional_verifies(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td);directory=root/"data/bigmarch_takasaki_oyagi/machine_number/analysis_31days_deep/90_provisional_future_ranking/20260906";directory.mkdir(parents=True)
@@ -1164,15 +1191,236 @@ class Phase2SupportTests(unittest.TestCase):
         self.assertTrue(automation.all_terminal(state))
         self.assertFalse(automation.should_sleep_on_success(True, state, 0))
 
-    def test_deadline_missing_source_routes_only_to_provisional(self):
-        operation=date(2026,9,6);state=automation.create_state(operation,"run",datetime(2026,9,6,8,0,tzinfo=JST));path=Path("unused")
-        missing=ReadinessResult(False,False,"missing", "2026-09-05","SOURCE_MISSING")
-        clock=lambda:datetime(2026,9,6,9,31,tzinfo=JST)
-        with patch.object(automation,"check_source_readiness",return_value=missing),patch.object(automation,"_run_big_march_catchup",return_value=True) as catchup_run,patch.object(automation,"_run_big_march_provisional") as provisional_run,patch.object(automation,"save_state"):
-            automation._process_store(STORE_BIGMARCH,state,path,operation,date(2026,9,5),SimpleNamespace(max_fetch_attempts=20,retry_interval_sec=300,chrome_wait_sec=15),clock)
+    def test_stale_reference_is_terminal_wrapper_success_but_never_sleep_eligible(self):
+        state = automation.create_state(
+            date(2026, 9, 6),
+            "run",
+            datetime(2026, 9, 6, 8, 0, tzinfo=JST),
+        )
+        for item in state["stores"].values():
+            item["status"] = "SUCCESS"
+        state["stores"][STORE_BIGMARCH]["status"] = "STALE_REFERENCE"
+
+        self.assertTrue(automation.all_terminal(state))
+        self.assertEqual(automation.wrapper_returncode_for(state), 0)
+        self.assertFalse(
+            automation.should_sleep_on_success(
+                True,
+                state,
+                0,
+            )
+        )
+
+    def test_0800_missing_source_lag_one_routes_only_to_provisional(self):
+        operation = date(2026, 9, 6)
+        current = datetime(2026, 9, 6, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "run", current)
+        path = Path("unused")
+        missing = ReadinessResult(
+            False,
+            False,
+            "missing",
+            "2026-09-05",
+            "SOURCE_MISSING",
+        )
+        guard_pass = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=True,
+            reference_allowed=False,
+            status="PASS_PROVISIONAL_ONLY",
+            source_delay_days=1,
+            latest_data_date="2026-09-04",
+        )
+        args = SimpleNamespace(
+            max_fetch_attempts=20,
+            retry_interval_sec=300,
+            chrome_wait_sec=15,
+            fetch_timeout_sec=120,
+        )
+        with patch.object(
+            automation,
+            "check_source_readiness",
+            return_value=missing,
+        ), patch.object(
+            automation,
+            "_run_big_march_catchup",
+            return_value=True,
+        ) as catchup_run, patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_pass,
+        ), patch.object(
+            automation,
+            "_run_big_march_provisional",
+        ) as provisional_run, patch.object(
+            automation,
+            "_run_big_march_stale_reference",
+        ) as stale_run, patch.object(
+            automation,
+            "build_fetch_command",
+        ) as fetch_command, patch.object(
+            automation,
+            "save_state",
+        ):
+            automation._process_store(
+                STORE_BIGMARCH,
+                state,
+                path,
+                operation,
+                date(2026, 9, 5),
+                args,
+                lambda: current,
+            )
+
         catchup_run.assert_called_once()
         provisional_run.assert_called_once()
-        self.assertEqual(state["stores"][STORE_BIGMARCH]["pipeline_attempt_count"],0)
+        stale_run.assert_not_called()
+        fetch_command.assert_not_called()
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["pipeline_attempt_count"], 0)
+        self.assertEqual(item["fetch_attempt_count"], 0)
+        self.assertEqual(item["next_retry_at_jst"], "")
+
+    def test_0800_missing_source_lag_two_routes_to_stale_reference_without_retry(self):
+        operation = date(2026, 9, 6)
+        current = datetime(2026, 9, 6, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "run", current)
+        missing = ReadinessResult(
+            False,
+            False,
+            "missing",
+            "2026-09-05",
+            "SOURCE_MISSING",
+        )
+        guard_pass = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=False,
+            reference_allowed=True,
+            reason="safe stale reference",
+            status="BLOCKED_SOURCE_DELAY",
+            source_delay_days=2,
+            latest_data_date="2026-09-03",
+        )
+        args = SimpleNamespace(
+            max_fetch_attempts=20,
+            retry_interval_sec=300,
+            chrome_wait_sec=15,
+            fetch_timeout_sec=120,
+        )
+
+        with patch.object(
+            automation,
+            "check_source_readiness",
+            return_value=missing,
+        ), patch.object(
+            automation,
+            "_run_big_march_catchup",
+            return_value=True,
+        ) as catchup_run, patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_pass,
+        ), patch.object(
+            automation,
+            "_run_big_march_provisional",
+        ) as provisional_run, patch.object(
+            automation,
+            "_run_big_march_stale_reference",
+        ) as stale_run, patch.object(
+            automation,
+            "build_fetch_command",
+        ) as fetch_command, patch.object(
+            automation,
+            "save_state",
+        ):
+            automation._process_store(
+                STORE_BIGMARCH,
+                state,
+                Path("unused"),
+                operation,
+                date(2026, 9, 5),
+                args,
+                lambda: current,
+            )
+
+        catchup_run.assert_called_once()
+        provisional_run.assert_not_called()
+        stale_run.assert_called_once()
+        fetch_command.assert_not_called()
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["fetch_attempt_count"], 0)
+        self.assertEqual(item["next_retry_at_jst"], "")
+
+    def test_0800_missing_source_guard_anomaly_blocks_all_reference_paths(self):
+        operation = date(2026, 9, 6)
+        current = datetime(2026, 9, 6, 8, 0, tzinfo=JST)
+        state = automation.create_state(operation, "run", current)
+        missing = ReadinessResult(
+            False,
+            False,
+            "missing",
+            "2026-09-05",
+            "SOURCE_MISSING",
+        )
+        guard_block = self._big_march_guard_snapshot(
+            formal_allowed=False,
+            provisional_allowed=False,
+            reference_allowed=False,
+            reason="inventory anomaly",
+            status="BLOCKED_ACTUAL_CHANGE",
+            source_delay_days=2,
+            latest_data_date="2026-09-03",
+        )
+        args = SimpleNamespace(
+            max_fetch_attempts=20,
+            retry_interval_sec=300,
+            chrome_wait_sec=15,
+            fetch_timeout_sec=120,
+        )
+
+        with patch.object(
+            automation,
+            "check_source_readiness",
+            return_value=missing,
+        ), patch.object(
+            automation,
+            "_run_big_march_catchup",
+            return_value=True,
+        ), patch.object(
+            automation,
+            "_assess_big_march_inventory_guard_parent",
+            return_value=guard_block,
+        ), patch.object(
+            automation,
+            "_run_big_march_provisional",
+        ) as provisional_run, patch.object(
+            automation,
+            "_run_big_march_stale_reference",
+        ) as stale_run, patch.object(
+            automation,
+            "build_fetch_command",
+        ) as fetch_command, patch.object(
+            automation,
+            "save_state",
+        ):
+            automation._process_store(
+                STORE_BIGMARCH,
+                state,
+                Path("unused"),
+                operation,
+                date(2026, 9, 5),
+                args,
+                lambda: current,
+            )
+
+        provisional_run.assert_not_called()
+        stale_run.assert_not_called()
+        fetch_command.assert_not_called()
+        item = state["stores"][STORE_BIGMARCH]
+        self.assertEqual(item["status"], "NEEDS_MANUAL_REVIEW")
+        self.assertEqual(item["current_stage"], "INVENTORY_GUARD")
+        self.assertEqual(item["error_category"], "INVENTORY_GUARD_BLOCKED")
+        self.assertEqual(item["next_retry_at_jst"], "")
 
     def test_deadline_invalid_existing_source_never_routes_to_provisional(self):
         operation=date(2026,9,6);state=automation.create_state(operation,"run",datetime(2026,9,6,8,0,tzinfo=JST));invalid=ReadinessResult(False,True,"bad","2026-09-05","SOURCE_INVALID","invalid")
@@ -1469,6 +1717,7 @@ class Phase2SupportTests(unittest.TestCase):
         self.assertTrue(result["blocked"])
         self.assertFalse(result["formal_allowed"])
         self.assertFalse(result["provisional_allowed"])
+        self.assertFalse(result["reference_allowed"])
         self.assertEqual(result["status"], "BLOCKED_GUARD_ERROR")
         self.assertIn("fixture guard failure", result["reason"])
 

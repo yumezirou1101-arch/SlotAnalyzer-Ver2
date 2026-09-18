@@ -47,6 +47,78 @@ def write_csv_rows(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def write_bigmarch_stale_reference_fixture(
+    root: Path,
+    operation: date,
+    *,
+    latest_data_date: date,
+    machine_no: int = 482,
+    machine_name: str = "STALE_TEST",
+) -> None:
+    expected = operation.fromordinal(operation.toordinal() - 1)
+    source_delay_days = (expected - latest_data_date).days
+    if source_delay_days < 2:
+        raise ValueError("STALE_REFERENCE fixture requires source_delay_days >= 2")
+    bucket = "LAG_2" if source_delay_days == 2 else "LAG_3_PLUS"
+    target_to_latest_gap_days = (operation - latest_data_date).days
+    directory = (
+        root
+        / "data/bigmarch_takasaki_oyagi/machine_number/analysis_31days_deep"
+        / "91_stale_reference_future_ranking"
+        / operation.strftime("%Y%m%d")
+    )
+    prefix = f"91_stale_reference_{operation:%Y%m%d}"
+    common = {
+        "target_date": operation.isoformat(),
+        "expected_data_date": expected.isoformat(),
+        "latest_data_date": latest_data_date.isoformat(),
+        "source_delay_days": source_delay_days,
+        "source_delay_bucket": bucket,
+        "ranking_class": "STALE_REFERENCE",
+        "formal": False,
+        "provisional": False,
+        "stale_reference": True,
+        "forward_valid": False,
+        "inventory_currentness": "UNCONFIRMED",
+        "machine_mapping": "LAST_KNOWN",
+        "eligible_for_formal_evaluation": False,
+        "automatic_promotion": False,
+        "source_status": "EXPECTED_DATE_MISSING_STALE",
+        "target_to_latest_gap_days": target_to_latest_gap_days,
+        "model": "CHAMPION_V4.2_C",
+    }
+    ranking_base = {
+        **common,
+        "prediction_rank": 1,
+        "machine_no": machine_no,
+        "machine_name": machine_name,
+    }
+    write_csv_rows(
+        directory / f"{prefix}_juggler_all.csv",
+        [{**ranking_base, "recent7_win": 0.8}],
+    )
+    write_csv_rows(
+        directory / f"{prefix}_juggler_top10.csv",
+        [{**ranking_base, "recent7_win": 0.8}],
+    )
+    write_csv_rows(
+        directory / f"{prefix}_nonjuggler_all.csv",
+        [{**ranking_base, "weekday_avg": 1000}],
+    )
+    write_csv_rows(
+        directory / f"{prefix}_nonjuggler_top10.csv",
+        [{**ranking_base, "weekday_avg": 1000}],
+    )
+    write_csv_rows(
+        directory / f"{prefix}_metadata.csv",
+        [common],
+    )
+    write_csv_rows(
+        directory / f"{prefix}_status.csv",
+        [{**common, "status": "STALE_REFERENCE"}],
+    )
+
+
 def write_formal_69_fixture(root: Path, target: date, *, sha: str = "frozen-sha") -> None:
     base = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep/69_Ver4_2_live_prediction_backtest"
     iso = target.isoformat()
@@ -624,6 +696,126 @@ class MorningNotificationTests(unittest.TestCase):
         state={"operation_date":"2026-09-07","stores":{automation.STORE_BIGMARCH:{"status":"PROVISIONAL"}}}
         section,_=notification._bigmarch_content(state,ROOT,date(2026,9,7));plain=notification._render_section_plain(section)
         self.assertIn("PROVISIONAL成果物検証失敗",plain);self.assertNotIn("482番台",plain)
+
+    def test_bigmarch_stale_reference_galaxy_content(self):
+        operation = date(2026, 9, 6)
+        latest = date(2026, 9, 3)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write_bigmarch_stale_reference_fixture(
+                root,
+                operation,
+                latest_data_date=latest,
+                machine_no=482,
+                machine_name="STALE_TEST",
+            )
+            state = {
+                "operation_date": operation.isoformat(),
+                "stores": {
+                    automation.STORE_BIGMARCH: {
+                        "status": "STALE_REFERENCE",
+                        "stale_reference_latest_data_date": latest.isoformat(),
+                        "stale_reference_source_delay_days": 2,
+                        "stale_reference_source_delay_bucket": "LAG_2",
+                    }
+                },
+            }
+            section, warnings = notification._bigmarch_content(
+                state, root, operation
+            )
+            plain = notification._render_section_plain(section)
+            body = notification._render_section_html(section)
+
+        for value in (
+            "STALE_REFERENCE / 実戦参考ランキング",
+            "正式ランキングではありません",
+            "PROVISIONALとも別枠",
+            "Target: 2026-09-06",
+            "Expected: 2026-09-05",
+            "Latest: 2026-09-03",
+            "Source delay: 2 day(s)",
+            "Lag bucket: LAG_2",
+            "Inventory currentness: UNCONFIRMED",
+            "Machine mapping: LAST_KNOWN",
+            "Formal Forward: 対象外",
+            "PROVISIONAL: 対象外",
+            "Champion評価: 対象外",
+            "JUGGLER 実戦参考 Top10",
+            "NON_JUGGLER 実戦参考 Top10",
+            "482番台",
+            "STALE_TEST",
+            "当日の台構成は未確認",
+        ):
+            self.assertIn(value, plain)
+        self.assertIn("table-layout:fixed", body)
+        self.assertTrue(warnings)
+        self.assertNotIn("FORWARD_VALID", plain)
+
+    def test_stale_reference_overall_is_partial_and_fatal_states_win(self):
+        self.assertEqual(
+            notification.determine_overall_status(
+                state_with(["SUCCESS", "STALE_REFERENCE", "SUCCESS"])
+            ),
+            "PARTIAL",
+        )
+        self.assertEqual(
+            notification.determine_overall_status(
+                state_with(["NEEDS_MANUAL_REVIEW", "STALE_REFERENCE", "SUCCESS"])
+            ),
+            "MANUAL_REVIEW",
+        )
+        self.assertEqual(
+            notification.determine_overall_status(
+                state_with(["FAILED_FINAL", "STALE_REFERENCE", "SUCCESS"])
+            ),
+            "FAILED",
+        )
+
+    def test_stale_reference_store_notification_keeps_explicit_class(self):
+        operation = date(2026, 9, 6)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write_bigmarch_stale_reference_fixture(
+                root,
+                operation,
+                latest_data_date=date(2026, 9, 3),
+            )
+            state = state_with(["SUCCESS", "STALE_REFERENCE", "SUCCESS"])
+            state["operation_date"] = operation.isoformat()
+            message = notification.build_store_notification_message(
+                state, root, automation.STORE_BIGMARCH
+            )
+
+        self.assertEqual(message.overall_status, "STALE_REFERENCE")
+        self.assertIn("[STALE_REFERENCE]", message.subject)
+        self.assertIn("STALE_REFERENCE / 実戦参考ランキング", message.plain)
+
+    def test_old_stale_reference_is_not_used_for_next_day(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write_bigmarch_stale_reference_fixture(
+                root,
+                date(2026, 9, 6),
+                latest_data_date=date(2026, 9, 3),
+                machine_no=482,
+                machine_name="OLD_STALE",
+            )
+            state = {
+                "operation_date": "2026-09-07",
+                "stores": {
+                    automation.STORE_BIGMARCH: {
+                        "status": "STALE_REFERENCE",
+                    }
+                },
+            }
+            section, _ = notification._bigmarch_content(
+                state, root, date(2026, 9, 7)
+            )
+            plain = notification._render_section_plain(section)
+
+        self.assertIn("STALE_REFERENCE成果物検証失敗", plain)
+        self.assertNotIn("OLD_STALE", plain)
+        self.assertNotIn("482番台", plain)
 
     def test_big_march_monitor_change_is_clearly_non_blocking(self):
         lines = notification._inventory_monitor_lines({"inventory_monitor": {

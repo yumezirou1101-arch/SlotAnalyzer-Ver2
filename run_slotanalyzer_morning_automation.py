@@ -31,6 +31,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     assess_big_march_catchup,
     build_big_march_catchup_command,
     build_big_march_provisional_command,
+    build_big_march_stale_reference_command,
     build_fetch_command,
     build_pipeline_command,
     bic_tsubame_expected_latest_data_date,
@@ -47,6 +48,7 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
     sha256_file,
     verify_big_march_daily_for_date,
     verify_big_march_provisional_completion,
+    verify_big_march_stale_reference_completion,
     verify_store_completion,
 )
 from slotanalyzer_morning_notification import notify_terminal_stores_best_effort  # noqa: E402
@@ -92,7 +94,7 @@ PROVISIONAL_MARUHAN_LAST_START = datetime_time(8, 30)
 OTHER_STORE_DEADLINE = datetime_time(9, 30)
 SLEEP_HELPER_PATH = PROJECT_ROOT / "sleep_windows_after_delay.py"
 SLEEP_HELPER_DELAY_SEC = 10
-WRAPPER_SUCCESS_STATUSES = frozenset({"SUCCESS", "ALREADY_COMPLETE", "PROVISIONAL"})
+WRAPPER_SUCCESS_STATUSES = frozenset({"SUCCESS", "ALREADY_COMPLETE", "PROVISIONAL", "STALE_REFERENCE"})
 SLEEP_ELIGIBLE_STATUSES = frozenset({"SUCCESS", "ALREADY_COMPLETE"})
 
 STORE_LABELS = {
@@ -169,6 +171,13 @@ def blank_store_state(store: str, operation_date: date) -> dict:
         "provisional_reason": "",
         "provisional_latest_data_date": "",
         "provisional_artifacts": [],
+        "stale_reference_attempt_count": 0,
+        "stale_reference_status": "",
+        "stale_reference_reason": "",
+        "stale_reference_latest_data_date": "",
+        "stale_reference_source_delay_days": "",
+        "stale_reference_source_delay_bucket": "",
+        "stale_reference_artifacts": [],
         "catchup_attempt_count": 0,
         "catchup_status": "",
         "catchup_reason": "",
@@ -330,6 +339,13 @@ def reconcile_startup_state(
         store_state.setdefault("provisional_reason", "")
         store_state.setdefault("provisional_latest_data_date", "")
         store_state.setdefault("provisional_artifacts", [])
+        store_state.setdefault("stale_reference_attempt_count", 0)
+        store_state.setdefault("stale_reference_status", "")
+        store_state.setdefault("stale_reference_reason", "")
+        store_state.setdefault("stale_reference_latest_data_date", "")
+        store_state.setdefault("stale_reference_source_delay_days", "")
+        store_state.setdefault("stale_reference_source_delay_bucket", "")
+        store_state.setdefault("stale_reference_artifacts", [])
         store_state.setdefault("catchup_attempt_count", 0)
         store_state.setdefault("catchup_status", "")
         store_state.setdefault("catchup_reason", "")
@@ -350,18 +366,27 @@ def reconcile_startup_state(
             )
             if recovered_monitor:
                 store_state["inventory_monitor"] = recovered_monitor
+
             provisional = verify_big_march_provisional_completion(
                 project_root, operation_date
             )
+            stale_reference = verify_big_march_stale_reference_completion(
+                project_root, operation_date
+            )
+
             if provisional.status != "NONE":
                 formal = verify_store_completion(store, project_root, operation_date)
-                if formal.status != "NONE":
+                if formal.status != "NONE" or stale_reference.status != "NONE":
                     store_state.update(
                         status="NEEDS_MANUAL_REVIEW",
                         current_stage="PROVISIONAL_RECONCILIATION",
-                        error_category="FORMAL_PROVISIONAL_CONFLICT",
-                        error="Formal and provisional artifacts both exist for this operation date.",
+                        error_category="RANKING_CLASS_CONFLICT",
+                        error=(
+                            "Formal, PROVISIONAL, and STALE_REFERENCE artifacts "
+                            "must be mutually exclusive for one operation date."
+                        ),
                         last_completed_at_jst=current.isoformat(),
+                        next_retry_at_jst="",
                     )
                 elif provisional.ok:
                     inventory_guard = _assess_big_march_inventory_guard_parent(
@@ -411,6 +436,87 @@ def reconcile_startup_state(
                         provisional_artifacts=provisional.artifacts,
                         error_category=provisional.status,
                         error=provisional.error,
+                        next_retry_at_jst="",
+                        last_completed_at_jst=current.isoformat(),
+                    )
+                continue
+
+            if stale_reference.status != "NONE":
+                formal = verify_store_completion(store, project_root, operation_date)
+                if formal.status != "NONE":
+                    store_state.update(
+                        status="NEEDS_MANUAL_REVIEW",
+                        current_stage="STALE_REFERENCE_RECONCILIATION",
+                        error_category="FORMAL_STALE_REFERENCE_CONFLICT",
+                        error=(
+                            "Formal and STALE_REFERENCE artifacts both exist "
+                            "for this operation date."
+                        ),
+                        last_completed_at_jst=current.isoformat(),
+                        next_retry_at_jst="",
+                    )
+                elif stale_reference.ok:
+                    inventory_guard = _assess_big_march_inventory_guard_parent(
+                        project_root,
+                        operation_date,
+                        current,
+                    )
+                    store_state["inventory_guard"] = inventory_guard
+                    if not inventory_guard["reference_allowed"]:
+                        store_state.update(
+                            status="NEEDS_MANUAL_REVIEW",
+                            current_stage="INVENTORY_GUARD",
+                            stale_reference_status="BLOCKED_BY_INVENTORY_GUARD",
+                            stale_reference_reason=inventory_guard["reason"],
+                            stale_reference_latest_data_date=stale_reference.details.get(
+                                "latest_data_date", ""
+                            ),
+                            stale_reference_source_delay_days=stale_reference.details.get(
+                                "source_delay_days", ""
+                            ),
+                            stale_reference_source_delay_bucket=stale_reference.details.get(
+                                "source_delay_bucket", ""
+                            ),
+                            stale_reference_artifacts=stale_reference.artifacts,
+                            verified_artifacts=[],
+                            error_category="INVENTORY_GUARD_BLOCKED",
+                            error=inventory_guard["reason"],
+                            next_retry_at_jst="",
+                            last_completed_at_jst=current.isoformat(),
+                        )
+                    else:
+                        store_state.update(
+                            status="STALE_REFERENCE",
+                            current_stage="STALE_REFERENCE",
+                            stale_reference_status="ALREADY_STALE_REFERENCE",
+                            stale_reference_reason=(
+                                "Recovered verified STALE_REFERENCE artifacts."
+                            ),
+                            stale_reference_latest_data_date=stale_reference.details.get(
+                                "latest_data_date", ""
+                            ),
+                            stale_reference_source_delay_days=stale_reference.details.get(
+                                "source_delay_days", ""
+                            ),
+                            stale_reference_source_delay_bucket=stale_reference.details.get(
+                                "source_delay_bucket", ""
+                            ),
+                            stale_reference_artifacts=stale_reference.artifacts,
+                            verified_artifacts=[],
+                            error_category="",
+                            error="",
+                            next_retry_at_jst="",
+                            last_completed_at_jst=current.isoformat(),
+                        )
+                else:
+                    store_state.update(
+                        status="NEEDS_MANUAL_REVIEW",
+                        current_stage="STALE_REFERENCE_RECONCILIATION",
+                        stale_reference_status=stale_reference.status,
+                        stale_reference_reason=stale_reference.error,
+                        stale_reference_artifacts=stale_reference.artifacts,
+                        error_category=stale_reference.status,
+                        error=stale_reference.error,
                         next_retry_at_jst="",
                         last_completed_at_jst=current.isoformat(),
                     )
@@ -563,6 +669,7 @@ def _assess_big_march_inventory_guard_parent(
             "blocked": True,
             "formal_allowed": False,
             "provisional_allowed": False,
+            "reference_allowed": False,
             "reason": f"{type(exc).__name__}: {exc}",
             "operation_date": operation_date.isoformat(),
             "expected_data_date": (operation_date - timedelta(days=1)).isoformat(),
@@ -585,6 +692,7 @@ def _assess_big_march_inventory_guard_parent(
         "blocked": bool(decision.blocked),
         "formal_allowed": bool(decision.formal_allowed),
         "provisional_allowed": bool(decision.provisional_allowed),
+        "reference_allowed": bool(decision.reference_allowed),
         "reason": decision.reason,
         "operation_date": _date_text(decision.operation_date),
         "expected_data_date": (
@@ -681,7 +789,7 @@ def _run_big_march_provisional(
         attempt_count=store_state.get("attempt_count", 0) + 1,
         provisional_attempt_count=attempt,
         provisional_status="RUNNING",
-        provisional_reason="Expected source remained missing at the 09:30 JST deadline.",
+        provisional_reason="08:00 morning snapshot found the expected source missing.",
         last_started_at_jst=current.isoformat(),
         next_retry_at_jst="",
         error_category="",
@@ -740,6 +848,202 @@ def _run_big_march_provisional(
     )
     _record_history(
         state, STORE_BIGMARCH, "PROVISIONAL", attempt, status, result, category, error
+    )
+    save_state(state_path, state, completed)
+
+
+def _run_big_march_stale_reference(
+    state: dict,
+    state_path: Path,
+    operation_date: date,
+    current: datetime,
+    clock=now_jst,
+) -> None:
+    store_state = state["stores"][STORE_BIGMARCH]
+
+    if store_state.get("pipeline_attempt_count", 0) > 0:
+        store_state.update(
+            status="FAILED_FINAL",
+            error_category="STALE_REFERENCE_FORBIDDEN_AFTER_FORMAL_PIPELINE",
+            error="Formal pipeline was already attempted; STALE_REFERENCE is forbidden.",
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        save_state(state_path, state, current)
+        return
+
+    if store_state.get("provisional_attempt_count", 0) > 0:
+        store_state.update(
+            status="FAILED_FINAL",
+            error_category="STALE_REFERENCE_FORBIDDEN_AFTER_PROVISIONAL",
+            error="PROVISIONAL was already attempted; STALE_REFERENCE is forbidden.",
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        save_state(state_path, state, current)
+        return
+
+    inventory_guard = _assess_big_march_inventory_guard_parent(
+        PROJECT_ROOT,
+        operation_date,
+        current,
+    )
+    store_state["inventory_guard"] = inventory_guard
+
+    if not inventory_guard["reference_allowed"]:
+        store_state.update(
+            status="NEEDS_MANUAL_REVIEW",
+            current_stage="INVENTORY_GUARD",
+            stale_reference_status="BLOCKED_BY_INVENTORY_GUARD",
+            stale_reference_reason=inventory_guard["reason"],
+            error_category="INVENTORY_GUARD_BLOCKED",
+            error=inventory_guard["reason"],
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        save_state(state_path, state, current)
+        return
+
+    if store_state.get("stale_reference_attempt_count", 0) > 0:
+        verification = verify_big_march_stale_reference_completion(
+            PROJECT_ROOT,
+            operation_date,
+        )
+        store_state.update(
+            status="STALE_REFERENCE" if verification.ok else "NEEDS_MANUAL_REVIEW",
+            current_stage="STALE_REFERENCE",
+            stale_reference_status=(
+                "ALREADY_STALE_REFERENCE" if verification.ok else verification.status
+            ),
+            stale_reference_reason=(
+                "Verified existing STALE_REFERENCE artifacts."
+                if verification.ok
+                else verification.error
+            ),
+            stale_reference_latest_data_date=verification.details.get(
+                "latest_data_date", ""
+            ),
+            stale_reference_source_delay_days=verification.details.get(
+                "source_delay_days", ""
+            ),
+            stale_reference_source_delay_bucket=verification.details.get(
+                "source_delay_bucket", ""
+            ),
+            stale_reference_artifacts=verification.artifacts,
+            verified_artifacts=[],
+            error_category="" if verification.ok else verification.status,
+            error="" if verification.ok else verification.error,
+            last_completed_at_jst=current.isoformat(),
+            next_retry_at_jst="",
+        )
+        save_state(state_path, state, current)
+        return
+
+    attempt = 1
+    store_state.update(
+        status="RUNNING",
+        current_stage="STALE_REFERENCE",
+        attempt_count=store_state.get("attempt_count", 0) + 1,
+        stale_reference_attempt_count=attempt,
+        stale_reference_status="RUNNING",
+        stale_reference_reason=(
+            "08:00 morning snapshot found Big March source delay of two days or more."
+        ),
+        last_started_at_jst=current.isoformat(),
+        next_retry_at_jst="",
+        error_category="",
+        error="",
+    )
+    save_state(state_path, state, current)
+
+    command = build_big_march_stale_reference_command(
+        PROJECT_ROOT,
+        sys.executable,
+        operation_date,
+    )
+    log_path = (
+        RUNS_DIR
+        / operation_date.strftime("%Y%m%d")
+        / state["automation_run_id"]
+        / "bigmarch_stale_reference_attempt01.log"
+    )
+    environment = {
+        **os.environ,
+        "SLOTANALYZER_MORNING_RUN_ID": state["automation_run_id"],
+    }
+    result = run_logged_subprocess(
+        command,
+        PROJECT_ROOT,
+        log_path,
+        "STALE_REFERENCE",
+        environment=environment,
+        clock=clock,
+    )
+    verification = verify_big_march_stale_reference_completion(
+        PROJECT_ROOT,
+        operation_date,
+    )
+    completed = clock().astimezone(JST)
+
+    if result.returncode == 0 and verification.ok:
+        store_state["inventory_monitor"] = _observe_big_march_inventory(
+            PROJECT_ROOT,
+            operation_date,
+            completed,
+        )
+        status = "STALE_REFERENCE"
+        category = ""
+        error = ""
+    elif verification.status in {
+        "PARTIAL_STALE_REFERENCE",
+        "INVALID_STALE_REFERENCE",
+    }:
+        status = "NEEDS_MANUAL_REVIEW"
+        category = verification.status
+        error = verification.error
+    else:
+        status = "FAILED_FINAL"
+        category = "STALE_REFERENCE_NOT_ELIGIBLE_OR_FAILED"
+        error = verification.error or "STALE_REFERENCE generator returned non-zero."
+
+    store_state.update(
+        status=status,
+        current_stage="STALE_REFERENCE",
+        returncode=result.returncode,
+        pipeline_attempt_count=0,
+        stale_reference_status=(
+            "STALE_REFERENCE" if status == "STALE_REFERENCE" else verification.status
+        ),
+        stale_reference_reason=(
+            "08:00 snapshot fixed an isolated STALE_REFERENCE ranking."
+            if status == "STALE_REFERENCE"
+            else error
+        ),
+        stale_reference_latest_data_date=verification.details.get(
+            "latest_data_date", ""
+        ),
+        stale_reference_source_delay_days=verification.details.get(
+            "source_delay_days", ""
+        ),
+        stale_reference_source_delay_bucket=verification.details.get(
+            "source_delay_bucket", ""
+        ),
+        stale_reference_artifacts=verification.artifacts,
+        verified_artifacts=[],
+        error_category=category,
+        error=error,
+        next_retry_at_jst="",
+        last_completed_at_jst=completed.isoformat(),
+    )
+    _record_history(
+        state,
+        STORE_BIGMARCH,
+        "STALE_REFERENCE",
+        attempt,
+        status,
+        result,
+        category,
+        error,
     )
     save_state(state_path, state, completed)
 
@@ -961,6 +1265,86 @@ def _process_store(
     if store_state["status"] in TERMINAL_STATES:
         return
     current = clock().astimezone(JST)
+
+    if store == STORE_BIGMARCH:
+        # Big March is a one-shot morning snapshot. Once this branch runs,
+        # the wrapper never performs a network fetch or schedules a later retry
+        # for Big March on the same operation date.
+        readiness = check_source_readiness(
+            store,
+            PROJECT_ROOT,
+            expected_data_date,
+        )
+        store_state["current_stage"] = "READINESS"
+        store_state["last_readiness"] = readiness.to_dict()
+        store_state["next_retry_at_jst"] = ""
+
+        if readiness.source_exists and not readiness.ready:
+            store_state.update(
+                status="NEEDS_MANUAL_REVIEW",
+                error_category="SOURCE_INVALID",
+                error=readiness.error,
+                last_completed_at_jst=current.isoformat(),
+                next_retry_at_jst="",
+            )
+            save_state(state_path, state, current)
+            return
+
+        if not readiness.ready:
+            if not _run_big_march_catchup(
+                state,
+                state_path,
+                operation_date,
+                expected_data_date,
+                current,
+                clock,
+            ):
+                return
+
+            current = clock().astimezone(JST)
+            inventory_guard = _assess_big_march_inventory_guard_parent(
+                PROJECT_ROOT,
+                operation_date,
+                current,
+            )
+            store_state["inventory_guard"] = inventory_guard
+            store_state["latest_data_date"] = inventory_guard.get(
+                "latest_data_date", ""
+            )
+
+            if inventory_guard["provisional_allowed"]:
+                _run_big_march_provisional(
+                    state,
+                    state_path,
+                    operation_date,
+                    current,
+                    clock,
+                )
+                return
+
+            if inventory_guard["reference_allowed"]:
+                _run_big_march_stale_reference(
+                    state,
+                    state_path,
+                    operation_date,
+                    current,
+                    clock,
+                )
+                return
+
+            store_state.update(
+                status="NEEDS_MANUAL_REVIEW",
+                current_stage="INVENTORY_GUARD",
+                error_category="INVENTORY_GUARD_BLOCKED",
+                error=inventory_guard["reason"],
+                last_completed_at_jst=current.isoformat(),
+                next_retry_at_jst="",
+            )
+            save_state(state_path, state, current)
+            return
+
+        store_state["latest_data_date"] = expected_data_date.isoformat()
+
     next_retry = store_state.get("next_retry_at_jst")
     if next_retry and current < datetime.fromisoformat(next_retry):
         return
@@ -1468,6 +1852,7 @@ def main() -> int:
     print(f"expected data date    : {expected_data_date}")
     print("Maruhan last start    : 08:30 JST (PROVISIONAL)")
     print("Maruhan formal cutoff : 09:00 JST (existing Forward Guard)")
+    print("Big March snapshot    : first morning pass (no post-snapshot fetch/retry)")
     print("other store deadline  : 09:30 JST")
     try:
         with WindowsFileLock(GLOBAL_LOCK_PATH):
@@ -1501,7 +1886,14 @@ def main() -> int:
                     except Exception as exc:
                         item = state["stores"][store]
                         current = now_jst()
-                        if item.get("current_stage") in {"READINESS", "CDP_PREFLIGHT", "FETCH"}:
+                        if store == STORE_BIGMARCH:
+                            item.update(
+                                status="NEEDS_MANUAL_REVIEW",
+                                error_category="BIGMARCH_SNAPSHOT_EXCEPTION",
+                                error=f"{type(exc).__name__}: {exc}",
+                                next_retry_at_jst="",
+                            )
+                        elif item.get("current_stage") in {"READINESS", "CDP_PREFLIGHT", "FETCH"}:
                             item.update(
                                 status="FAILED_RETRYABLE",
                                 error_category="PRE_PIPELINE_EXCEPTION",

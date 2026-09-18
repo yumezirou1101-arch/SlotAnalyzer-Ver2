@@ -32,6 +32,7 @@ TERMINAL_STATES = {
     "SUCCESS",
     "ALREADY_COMPLETE",
     "PROVISIONAL",
+    "STALE_REFERENCE",
     "FAILED_FINAL",
     "NEEDS_MANUAL_REVIEW",
 }
@@ -710,6 +711,25 @@ def build_big_march_provisional_command(
     return command
 
 
+def build_big_march_stale_reference_command(
+    project_root: Path,
+    python_executable: str,
+    operation_date: date,
+) -> list[str]:
+    command = [
+        python_executable,
+        str(
+            project_root
+            / "machine_number"
+            / "ana_slo_bigmarch_oyagi_stale_reference_future_ranking.py"
+        ),
+        "--operation-date",
+        operation_date.isoformat(),
+    ]
+    _assert_safe_command(command)
+    return command
+
+
 def build_big_march_catchup_command(
     project_root: Path,
     python_executable: str,
@@ -1204,6 +1224,195 @@ def verify_big_march_provisional_completion(
             "target_date": operation_date.isoformat(),
             "expected_data_date": expected.isoformat(),
             "latest_data_date": latest.isoformat(),
+        },
+    )
+
+
+def verify_big_march_stale_reference_completion(
+    project_root: Path, operation_date: date
+) -> VerificationResult:
+    compact = operation_date.strftime("%Y%m%d")
+    expected = operation_date - timedelta(days=1)
+    directory = (
+        project_root
+        / "data/bigmarch_takasaki_oyagi/machine_number"
+        / "analysis_31days_deep/91_stale_reference_future_ranking"
+        / compact
+    )
+    prefix = f"91_stale_reference_{compact}"
+    files = [
+        directory / f"{prefix}_juggler_all.csv",
+        directory / f"{prefix}_juggler_top10.csv",
+        directory / f"{prefix}_nonjuggler_all.csv",
+        directory / f"{prefix}_nonjuggler_top10.csv",
+        directory / f"{prefix}_metadata.csv",
+        directory / f"{prefix}_status.csv",
+    ]
+
+    if not any(path.exists() for path in files):
+        return VerificationResult("NONE", False)
+
+    if not _nonempty(files):
+        return VerificationResult(
+            "PARTIAL_STALE_REFERENCE",
+            False,
+            "Big March STALE_REFERENCE artifacts are partial.",
+            [str(path) for path in files if path.exists()],
+        )
+
+    try:
+        metadata = pd.read_csv(files[4], encoding="utf-8-sig")
+        status = pd.read_csv(files[5], encoding="utf-8-sig")
+
+        if len(metadata) != 1 or len(status) != 1:
+            raise RuntimeError(
+                "STALE_REFERENCE metadata/status must contain one row."
+            )
+
+        metadata_row = metadata.iloc[0]
+        status_row = status.iloc[0]
+
+        target_date = str(metadata_row.get("target_date", ""))
+        expected_data_date = str(metadata_row.get("expected_data_date", ""))
+        latest_data_date = str(metadata_row.get("latest_data_date", ""))
+        ranking_class = str(metadata_row.get("ranking_class", ""))
+
+        if target_date != operation_date.isoformat():
+            raise RuntimeError("STALE_REFERENCE target_date mismatch.")
+
+        if expected_data_date != expected.isoformat():
+            raise RuntimeError("STALE_REFERENCE expected_data_date mismatch.")
+
+        latest = date.fromisoformat(latest_data_date)
+        source_delay_days = (expected - latest).days
+
+        if source_delay_days < 2:
+            raise RuntimeError(
+                "STALE_REFERENCE source delay must be at least two days."
+            )
+
+        expected_bucket = (
+            "LAG_2" if source_delay_days == 2 else "LAG_3_PLUS"
+        )
+
+        expected_values = {
+            "target_date": operation_date.isoformat(),
+            "expected_data_date": expected.isoformat(),
+            "latest_data_date": latest.isoformat(),
+            "source_delay_days": source_delay_days,
+            "source_delay_bucket": expected_bucket,
+            "ranking_class": "STALE_REFERENCE",
+            "inventory_currentness": "UNCONFIRMED",
+            "machine_mapping": "LAST_KNOWN",
+        }
+
+        if ranking_class != "STALE_REFERENCE":
+            raise RuntimeError("STALE_REFERENCE ranking_class mismatch.")
+
+        for path in files[:4]:
+            frame = pd.read_csv(path, encoding="utf-8-sig")
+            required = set(expected_values) | {
+                "formal",
+                "provisional",
+                "stale_reference",
+                "forward_valid",
+            }
+
+            if frame.empty or not required.issubset(frame.columns):
+                raise RuntimeError(
+                    f"Invalid STALE_REFERENCE ranking: {path.name}"
+                )
+
+            for key, value in expected_values.items():
+                if isinstance(value, int):
+                    actual = pd.to_numeric(frame[key], errors="coerce")
+                    if actual.isna().any() or not (actual == value).all():
+                        raise RuntimeError(f"{key} mismatch: {path.name}")
+                elif not (frame[key].astype(str) == str(value)).all():
+                    raise RuntimeError(f"{key} mismatch: {path.name}")
+
+            if frame["formal"].map(_truthy).any():
+                raise RuntimeError(f"formal must be false: {path.name}")
+
+            if frame["provisional"].map(_truthy).any():
+                raise RuntimeError(f"provisional must be false: {path.name}")
+
+            if not frame["stale_reference"].map(_truthy).all():
+                raise RuntimeError(
+                    f"stale_reference must be true: {path.name}"
+                )
+
+            if frame["forward_valid"].map(_truthy).any():
+                raise RuntimeError(
+                    f"forward_valid must be false: {path.name}"
+                )
+
+        for row, label in (
+            (metadata_row, "metadata"),
+            (status_row, "status"),
+        ):
+            for key, value in expected_values.items():
+                actual = row.get(key, "")
+                if isinstance(value, int):
+                    if int(actual) != value:
+                        raise RuntimeError(f"{label} {key} mismatch.")
+                elif str(actual) != str(value):
+                    raise RuntimeError(f"{label} {key} mismatch.")
+
+            if _truthy(row.get("formal")):
+                raise RuntimeError(f"{label} formal must be false.")
+
+            if _truthy(row.get("provisional")):
+                raise RuntimeError(f"{label} provisional must be false.")
+
+            if not _truthy(row.get("stale_reference")):
+                raise RuntimeError(
+                    f"{label} stale_reference must be true."
+                )
+
+            if _truthy(row.get("forward_valid")):
+                raise RuntimeError(f"{label} forward_valid must be false.")
+
+            if _truthy(row.get("eligible_for_formal_evaluation")):
+                raise RuntimeError(
+                    f"{label} cannot be eligible for formal evaluation."
+                )
+
+            if str(row.get("source_status", "")) != (
+                "EXPECTED_DATE_MISSING_STALE"
+            ):
+                raise RuntimeError(f"{label} source_status mismatch.")
+
+            if int(row.get("target_to_latest_gap_days", -1)) != (
+                source_delay_days + 1
+            ):
+                raise RuntimeError(
+                    f"{label} target_to_latest_gap_days mismatch."
+                )
+
+        if str(status_row.get("status", "")) != "STALE_REFERENCE":
+            raise RuntimeError("STALE_REFERENCE status is invalid.")
+
+    except Exception as exc:
+        return VerificationResult(
+            "INVALID_STALE_REFERENCE",
+            False,
+            f"{type(exc).__name__}: {exc}",
+            [str(path) for path in files],
+        )
+
+    return VerificationResult(
+        "STALE_REFERENCE",
+        True,
+        artifacts=[str(path) for path in files],
+        details={
+            "target_date": operation_date.isoformat(),
+            "expected_data_date": expected.isoformat(),
+            "latest_data_date": latest.isoformat(),
+            "source_delay_days": source_delay_days,
+            "source_delay_bucket": expected_bucket,
+            "inventory_currentness": "UNCONFIRMED",
+            "machine_mapping": "LAST_KNOWN",
         },
     )
 
