@@ -244,7 +244,7 @@ class MorningNotificationTests(unittest.TestCase):
         self.assertIn("平均 -680枚 ｜ 勝率 10.0%", message.html)
         self.assertNotIn(">平均差枚</th>", message.html)
         self.assertNotIn("overflow-x", message.html)
-        self.assertLess(message.plain.index("NORMAL Top10"), message.plain.index("【昨日の予測結果"))
+        self.assertLess(message.plain.index("NORMAL Top15"), message.plain.index("【昨日の予測結果"))
         self.assertLess(message.plain.index("【昨日の予測結果"), message.plain.index("【詳細情報】"))
 
     def test_yesterday_does_not_fallback_to_older_69_result(self):
@@ -386,7 +386,7 @@ class MorningNotificationTests(unittest.TestCase):
                 mock.patch.object(notification, "_read_rows", side_effect=fail_69_only):
             message = notification.build_notification_message(state, Path(directory))
         self.assertIn("昨日結果取得エラー", message.plain)
-        self.assertIn("NORMAL Top10", message.plain)
+        self.assertIn("NORMAL Top15", message.plain)
         self.assertEqual(
             [item["status"] for item in state["stores"].values()], original_statuses
         )
@@ -404,6 +404,107 @@ class MorningNotificationTests(unittest.TestCase):
         self.assertEqual(lines[2], "3. 885番台　攻殻機動隊")
         self.assertNotIn("台766", "\n".join(lines))
         self.assertNotIn("score=", "\n".join(lines))
+
+
+    def test_top15_block_renders_all_15_rows_while_default_remains_10(self):
+        rows = [{
+            "prediction_rank": str(rank),
+            "machine_no": str(700 + rank),
+            "machine_name": f"TOP15-{rank}",
+            "score": str(80 - rank / 10),
+            "_recent3_text": "9/19 +100｜9/20 +200｜9/21 +300｜3日計 +600枚",
+        } for rank in range(1, 16)]
+
+        top15_section = notification.StoreSection(
+            "MARUHAN",
+            [],
+            [notification.RankingBlock("NORMAL Top15", rows, ("prediction_rank",), limit=15)],
+            [],
+        )
+        top15_plain = notification._render_section_plain(top15_section)
+        self.assertIn("15位｜715｜TOP15-15｜Score 78.50", top15_plain)
+        self.assertEqual(top15_plain.count("3日計 +600枚"), 15)
+
+        default_section = notification.StoreSection(
+            "OTHER",
+            [],
+            [notification.RankingBlock("DEFAULT", rows, ("prediction_rank",))],
+            [],
+        )
+        default_plain = notification._render_section_plain(default_section)
+        self.assertIn("10位｜710｜TOP15-10｜Score 79.00", default_plain)
+        self.assertNotIn("11位｜711｜TOP15-11", default_plain)
+
+    def test_maruhan_recent3_uses_latest_available_dates_before_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "data/maruhan_maebashi/machine_number"
+
+            for day_text, diff in (
+                ("2026-09-18", 100),
+                ("2026-09-19", -200),
+                ("2026-09-21", 300),
+                ("2026-09-22", 9999),
+            ):
+                day = date.fromisoformat(day_text)
+                write_csv_rows(
+                    data_dir / f"ana_slo_{day:%Y%m%d}.csv",
+                    [{
+                        "日付": day.isoformat(),
+                        "台番号": 912,
+                        "機種名": "TEST",
+                        "差枚": diff,
+                    }],
+                )
+
+            discovered = notification._discover_maruhan_recent_actual_files(
+                root, date(2026, 9, 22), count=3
+            )
+            self.assertEqual(
+                [day for day, _ in discovered],
+                [date(2026, 9, 18), date(2026, 9, 19), date(2026, 9, 21)],
+            )
+            self.assertNotIn(date(2026, 9, 22), [day for day, _ in discovered])
+
+            enriched = notification._attach_maruhan_recent3_actuals(
+                [{"machine_no": "912"}],
+                root,
+                date(2026, 9, 22),
+            )
+            self.assertEqual(
+                enriched[0]["_recent3_text"],
+                "9/18 +100｜9/19 -200｜9/21 +300｜3日計 +200枚",
+            )
+
+    def test_maruhan_recent3_missing_machine_is_data_none_and_not_zero_filled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "data/maruhan_maebashi/machine_number"
+
+            write_csv_rows(
+                data_dir / "ana_slo_20260919.csv",
+                [{"日付": "2026-09-19", "台番号": 912, "機種名": "TEST", "差枚": 100}],
+            )
+            write_csv_rows(
+                data_dir / "ana_slo_20260920.csv",
+                [{"日付": "2026-09-20", "台番号": 913, "機種名": "OTHER", "差枚": 0}],
+            )
+            write_csv_rows(
+                data_dir / "ana_slo_20260921.csv",
+                [{"日付": "2026-09-21", "台番号": 912, "機種名": "TEST", "差枚": 300}],
+            )
+
+            enriched = notification._attach_maruhan_recent3_actuals(
+                [{"machine_no": "912"}],
+                root,
+                date(2026, 9, 22),
+            )
+            recent = enriched[0]["_recent3_text"]
+            self.assertIn("9/19 +100", recent)
+            self.assertIn("9/20 データなし", recent)
+            self.assertIn("9/21 +300", recent)
+            self.assertIn("3日計 データなし", recent)
+            self.assertNotIn("9/20 0", recent)
 
     def test_html_ranking_is_mobile_table_and_escapes_values(self):
         block = notification.RankingBlock(
@@ -573,8 +674,9 @@ class MorningNotificationTests(unittest.TestCase):
             )
         text = "\n".join(lines)
         self.assertIn("FORWARD_VALID (formal)", text)
-        self.assertIn("1. 101番台　TEST　12.50", text)
-        self.assertLess(text.index("NORMAL Top10"), text.index("generated_at_jst"))
+        self.assertIn("1位｜101｜TEST｜Score 12.50", text)
+        self.assertIn("3日計 データなし", text)
+        self.assertLess(text.index("NORMAL Top15"), text.index("generated_at_jst"))
         self.assertIn("詳細情報", text)
         self.assertEqual(warnings, [])
 

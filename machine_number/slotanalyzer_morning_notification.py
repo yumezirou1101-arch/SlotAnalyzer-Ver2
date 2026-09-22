@@ -80,6 +80,7 @@ class RankingBlock:
     rows: list[dict[str, str]]
     rank_keys: tuple[str, ...]
     unavailable_message: str = "ランキング未生成"
+    limit: int = 10
 
 
 @dataclass(frozen=True)
@@ -233,6 +234,16 @@ def _rank_lines(rows: list[dict[str, str]], rank_keys: tuple[str, ...], limit: i
     output = []
     for index, row in enumerate(rows[:limit], 1):
         rank, machine_no, name, score_text = _ranking_values(row, rank_keys, index)
+        recent3_text = row.get("_recent3_text", "")
+
+        if recent3_text:
+            first_line = f"{rank}位｜{machine_no}｜{name}"
+            if score_text:
+                first_line += f"｜Score {score_text}"
+            output.append(first_line)
+            output.append(recent3_text)
+            continue
+
         values = [f"{rank}. {machine_no}番台", str(name)]
         if score_text:
             values.append(score_text)
@@ -240,12 +251,14 @@ def _rank_lines(rows: list[dict[str, str]], rank_keys: tuple[str, ...], limit: i
     return output or ["  ランキング未生成"]
 
 
-def _ranking_table_html(block: RankingBlock, limit: int = 10) -> str:
+def _ranking_table_html(block: RankingBlock, limit: int | None = None) -> str:
     if not block.rows:
         return (
             f'<h4 style="margin:14px 0 4px">{html.escape(block.label)}</h4>'
             f'<p style="margin:4px 0 12px;color:#a33">{html.escape(block.unavailable_message)}</p>'
         )
+
+    effective_limit = block.limit if limit is None else limit
     header_style = "padding:8px 6px;border-bottom:2px solid #777;font-size:12px;color:#444;white-space:nowrap"
     cell_style = "padding:8px 6px;border-bottom:1px solid #ddd;vertical-align:top;font-size:14px"
     machine_boundary = "border-left:1px solid #ddd"
@@ -259,8 +272,9 @@ def _ranking_table_html(block: RankingBlock, limit: int = 10) -> str:
         f'<th width="18%" style="{header_style};text-align:right">Score</th>',
         "</tr></thead><tbody>",
     ]
-    for index, row in enumerate(block.rows[:limit], 1):
+    for index, row in enumerate(block.rows[:effective_limit], 1):
         rank, machine_no, name, score_text = _ranking_values(row, block.rank_keys, index)
+        recent3_text = row.get("_recent3_text", "")
         parts.extend([
             "<tr>",
             f'<td style="{cell_style};text-align:center;white-space:nowrap">{html.escape(str(rank))}</td>',
@@ -269,6 +283,14 @@ def _ranking_table_html(block: RankingBlock, limit: int = 10) -> str:
             f'<td style="{cell_style};text-align:right;white-space:nowrap">{html.escape(score_text)}</td>',
             "</tr>",
         ])
+        if recent3_text:
+            parts.extend([
+                "<tr>",
+                f'<td colspan="4" style="padding:4px 6px 9px;border-bottom:1px solid #ddd;'
+                f'font-size:12px;color:#555;white-space:normal;overflow-wrap:anywhere">'
+                f'{html.escape(recent3_text)}</td>',
+                "</tr>",
+            ])
     parts.append("</tbody></table>")
     return "".join(parts)
 
@@ -278,7 +300,7 @@ def _render_section_plain(section: StoreSection, *, include_details: bool = True
     for block in section.rankings:
         lines.append(f"{block.label}:")
         lines.extend(
-            _rank_lines(block.rows, block.rank_keys)
+            _rank_lines(block.rows, block.rank_keys, block.limit)
             if block.rows
             else [f"  {block.unavailable_message}"]
         )
@@ -790,6 +812,155 @@ def _render_details_html(sections: list[StoreSection]) -> str:
     )
 
 
+
+def _normalize_machine_no(value: str) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        return str(int(float(text)))
+    except (TypeError, ValueError):
+        return text
+
+
+def _discover_maruhan_recent_actual_files(
+    root: Path,
+    target_date: date,
+    count: int = 3,
+) -> list[tuple[date, Path]]:
+    data_dir = root / "data/maruhan_maebashi/machine_number"
+    found: list[tuple[date, Path]] = []
+
+    for path in data_dir.glob("ana_slo_????????.csv"):
+        name = path.name
+        if len(name) != len("ana_slo_YYYYMMDD.csv"):
+            continue
+
+        ymd = name[len("ana_slo_"):-len(".csv")]
+        try:
+            file_date = datetime.strptime(ymd, "%Y%m%d").date()
+        except ValueError:
+            continue
+
+        # Absolute leakage guard: target-day and future actuals are never read.
+        if file_date >= target_date:
+            continue
+
+        if not path.is_file() or path.stat().st_size <= 0:
+            continue
+
+        found.append((file_date, path))
+
+    found.sort(key=lambda item: item[0], reverse=True)
+    selected = found[:count]
+    selected.sort(key=lambda item: item[0])
+    return selected
+
+
+def _load_maruhan_actual_map(
+    path: Path,
+    expected_date: date,
+) -> dict[str, float | None]:
+    rows = _read_rows(path)
+    if not rows:
+        return {}
+
+    expected_text = expected_date.isoformat()
+    actuals: dict[str, float | None] = {}
+    duplicated: set[str] = set()
+
+    for row in rows:
+        internal_date = row.get("日付") or row.get("date") or ""
+        if internal_date != expected_text:
+            return {}
+
+        machine_no = _normalize_machine_no(
+            row.get("台番号") or row.get("machine_no") or ""
+        )
+        if not machine_no:
+            continue
+
+        if machine_no in actuals:
+            duplicated.add(machine_no)
+            continue
+
+        raw_diff = row.get("差枚")
+        if raw_diff in (None, ""):
+            raw_diff = row.get("diff")
+        if raw_diff in (None, ""):
+            raw_diff = row.get("actual_diff")
+
+        try:
+            actuals[machine_no] = float(raw_diff)
+        except (TypeError, ValueError):
+            actuals[machine_no] = None
+
+    for machine_no in duplicated:
+        actuals[machine_no] = None
+
+    return actuals
+
+
+def _recent3_actual_text(
+    machine_no: str,
+    recent_actuals: list[tuple[date, dict[str, float | None]]],
+) -> str:
+    normalized_machine = _normalize_machine_no(machine_no)
+    parts: list[str] = []
+    values: list[float] = []
+    complete = len(recent_actuals) == 3
+
+    for actual_date, actual_map in recent_actuals:
+        value = actual_map.get(normalized_machine)
+        date_text = f"{actual_date.month}/{actual_date.day}"
+
+        if value is None:
+            parts.append(f"{date_text} データなし")
+            complete = False
+        else:
+            parts.append(f"{date_text} {_signed_medals(str(value))}")
+            values.append(value)
+
+    if len(recent_actuals) < 3:
+        parts.append("データなし（直近3利用可能日が3日未満）")
+        complete = False
+
+    if complete and len(values) == 3:
+        parts.append(f"3日計 {_signed_medals(str(sum(values)))}枚")
+    else:
+        parts.append("3日計 データなし")
+
+    return "｜".join(parts)
+
+
+def _attach_maruhan_recent3_actuals(
+    rows: list[dict[str, str]],
+    root: Path,
+    target_date: date,
+) -> list[dict[str, str]]:
+    recent_files = _discover_maruhan_recent_actual_files(
+        root,
+        target_date,
+        count=3,
+    )
+    recent_actuals = [
+        (actual_date, _load_maruhan_actual_map(path, actual_date))
+        for actual_date, path in recent_files
+    ]
+
+    enriched: list[dict[str, str]] = []
+    for source_row in rows:
+        row = dict(source_row)
+        machine_no = row.get("machine_no") or row.get("台番号") or ""
+        row["_recent3_text"] = _recent3_actual_text(
+            str(machine_no),
+            recent_actuals,
+        )
+        enriched.append(row)
+
+    return enriched
+
+
 def _store_state(state: dict, store: str) -> dict:
     return state.get("stores", {}).get(store, {})
 
@@ -829,16 +1000,54 @@ def _maruhan_content(state: dict, root: Path, operation_date: date) -> tuple[Sto
         f"Forward: {'正式Forward停止 (inventory guard)' if inventory_blocked else ('FORWARD_VALID (formal)' if formal else '非valid / formal表示不可')}",
     ]
     specs = [
-        ("NORMAL Top10", base / "64_Ver4_2_future_top10" / f"64_prediction_{ymd}_top10.csv", ("prediction_rank",)),
-        ("A-TYPE Top10", base / "74_Ver4_2_A_type_prediction" / f"74_A_type_prediction_{ymd}_top10.csv", ("a_type_rank", "prediction_rank")),
-        ("JUGGLER Top10", base / "75_Ver4_2_Juggler_prediction" / f"75_Juggler_prediction_{ymd}_top10.csv", ("juggler_rank", "prediction_rank")),
-        ("統合ランキング / 代替候補・NEXT", base / "77_live_integrated_prediction_report" / f"77_integrated_prediction_{ymd}.csv", ("report_order",)),
+        (
+            "NORMAL Top15",
+            base / "64_Ver4_2_future_top10" / f"64_prediction_{ymd}_top15.csv",
+            ("prediction_rank",),
+            15,
+            True,
+        ),
+        (
+            "A-TYPE Top15",
+            base / "74_Ver4_2_A_type_prediction" / f"74_A_type_prediction_{ymd}_top15.csv",
+            ("a_type_rank", "prediction_rank"),
+            15,
+            True,
+        ),
+        (
+            "JUGGLER Top15",
+            base / "75_Ver4_2_Juggler_prediction" / f"75_Juggler_prediction_{ymd}_top15.csv",
+            ("juggler_rank", "prediction_rank"),
+            15,
+            True,
+        ),
+        (
+            "統合ランキング / 代替候補・NEXT",
+            base / "77_live_integrated_prediction_report" / f"77_integrated_prediction_{ymd}.csv",
+            ("report_order",),
+            10,
+            False,
+        ),
     ]
     rankings = []
-    for label, path, keys in specs:
+    for label, path, keys, limit, show_recent3 in specs:
         rows = _read_rows(path)
         valid_rows = rows if formal and _same_dates(rows, operation_date, expected) else []
-        rankings.append(RankingBlock(label, valid_rows, keys, "ランキング未生成または日付不一致"))
+        if valid_rows and show_recent3:
+            valid_rows = _attach_maruhan_recent3_actuals(
+                valid_rows,
+                root,
+                operation_date,
+            )
+        rankings.append(
+            RankingBlock(
+                label,
+                valid_rows,
+                keys,
+                "ランキング未生成または日付不一致",
+                limit,
+            )
+        )
     details = [
         f"generated_at_jst: {metadata.get('generated_at_jst', '-')}",
         f"model: {metadata.get('model', '-')}",

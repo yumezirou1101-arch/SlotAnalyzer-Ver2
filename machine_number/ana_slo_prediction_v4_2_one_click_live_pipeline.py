@@ -31,6 +31,7 @@ from slotanalyzer_derived_prediction_evidence import (
 #   74       -> A-type separated prediction
 #   75       -> Juggler separated prediction
 #   77       -> Integrated practical report
+#   TOP15    -> Display-only Top15 artifacts for morning notification
 #
 # Safety
 # -------
@@ -43,7 +44,7 @@ from slotanalyzer_derived_prediction_evidence import (
 # Recommended live flow
 # ---------------------
 # Before lottery:
-#   79 -> 64 / 74 / 75 / 77
+#   79 -> 64 / 74 / 75 / 77 / TOP15 display artifacts
 #
 # After lottery:
 #   78 HISTORY_V2
@@ -90,6 +91,11 @@ SCRIPT_77 = (
     / "ana_slo_prediction_v4_2_live_integrated_report.py"
 )
 
+SCRIPT_TOP15_DISPLAY = (
+    MACHINE_SCRIPT_DIR
+    / "ana_slo_v42c_top15_display_artifacts_v1.py"
+)
+
 DIR_64 = (
     ANALYSIS_DIR
     / "64_Ver4_2_future_top10"
@@ -126,7 +132,7 @@ def header(title: str) -> None:
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run 64 -> 74 -> 75 -> 77 for one prediction target date."
+            "Run 64 -> 74 -> 75 -> 77 -> TOP15 display artifacts for one prediction target date."
         )
     )
 
@@ -545,6 +551,71 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
+    # DISPLAY-ONLY TOP15
+    # --------------------------------------------------------
+    #
+    # This stage expands only the saved/displayed ranking range.
+    # It does NOT recalculate scores, rerank candidates, or alter
+    # Champion / Formal Forward / production ranking logic.
+    #
+    # The generator itself verifies that ranks 1-10 exactly match
+    # the existing frozen Top10 artifacts before accepting ranks 11-15.
+    # --------------------------------------------------------
+
+    _, elapsed = run_stage(
+        "TOP15 DISPLAY",
+        SCRIPT_TOP15_DISPLAY,
+        [
+            "--target-date",
+            target_date.strftime(
+                "%Y-%m-%d"
+            ),
+        ],
+    )
+
+    stage_rows.append(
+        {
+            "stage": "TOP15_DISPLAY",
+            "elapsed_sec": elapsed,
+            "status": "OK",
+        }
+    )
+
+    normal_top15 = (
+        DIR_64
+        / f"64_prediction_{ymd}_top15.csv"
+    )
+
+    a_top15 = (
+        DIR_74
+        / f"74_A_type_prediction_{ymd}_top15.csv"
+    )
+
+    j_top15 = (
+        DIR_75
+        / f"75_Juggler_prediction_{ymd}_top15.csv"
+    )
+
+    header(
+        "CHECK TOP15 DISPLAY OUTPUT"
+    )
+
+    require_file(
+        normal_top15,
+        "64 normal top15"
+    )
+
+    require_file(
+        a_top15,
+        "74 A-type top15"
+    )
+
+    require_file(
+        j_top15,
+        "75 Juggler top15"
+    )
+
+    # --------------------------------------------------------
     # Save pipeline run log
     # --------------------------------------------------------
 
@@ -598,6 +669,10 @@ def main() -> None:
 
     print(
         "77 integrated report : OK"
+    )
+
+    print(
+        "Top15 display files  : OK"
     )
 
     print(
