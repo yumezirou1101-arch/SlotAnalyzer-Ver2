@@ -926,9 +926,9 @@ def _recent3_actual_text(
         complete = False
 
     if complete and len(values) == 3:
-        parts.append(f"3日計 {_signed_medals(str(sum(values)))}枚")
+        parts.append(f"計 {_signed_medals(str(sum(values)))}")
     else:
-        parts.append("3日計 データなし")
+        parts.append("計 データなし")
 
     return "｜".join(parts)
 

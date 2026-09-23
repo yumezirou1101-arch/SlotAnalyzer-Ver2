@@ -412,7 +412,7 @@ class MorningNotificationTests(unittest.TestCase):
             "machine_no": str(700 + rank),
             "machine_name": f"TOP15-{rank}",
             "score": str(80 - rank / 10),
-            "_recent3_text": "9/19 +100｜9/20 +200｜9/21 +300｜3日計 +600枚",
+            "_recent3_text": "9/19 +100｜9/20 +200｜9/21 +300｜計 +600",
         } for rank in range(1, 16)]
 
         top15_section = notification.StoreSection(
@@ -423,7 +423,7 @@ class MorningNotificationTests(unittest.TestCase):
         )
         top15_plain = notification._render_section_plain(top15_section)
         self.assertIn("15位｜715｜TOP15-15｜Score 78.50", top15_plain)
-        self.assertEqual(top15_plain.count("3日計 +600枚"), 15)
+        self.assertEqual(top15_plain.count("計 +600"), 15)
 
         default_section = notification.StoreSection(
             "OTHER",
@@ -473,7 +473,7 @@ class MorningNotificationTests(unittest.TestCase):
             )
             self.assertEqual(
                 enriched[0]["_recent3_text"],
-                "9/18 +100｜9/19 -200｜9/21 +300｜3日計 +200枚",
+                "9/18 +100｜9/19 -200｜9/21 +300｜計 +200",
             )
 
     def test_maruhan_recent3_missing_machine_is_data_none_and_not_zero_filled(self):
@@ -503,7 +503,7 @@ class MorningNotificationTests(unittest.TestCase):
             self.assertIn("9/19 +100", recent)
             self.assertIn("9/20 データなし", recent)
             self.assertIn("9/21 +300", recent)
-            self.assertIn("3日計 データなし", recent)
+            self.assertIn("計 データなし", recent)
             self.assertNotIn("9/20 0", recent)
 
     def test_html_ranking_is_mobile_table_and_escapes_values(self):
@@ -675,7 +675,7 @@ class MorningNotificationTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("FORWARD_VALID (formal)", text)
         self.assertIn("1位｜101｜TEST｜Score 12.50", text)
-        self.assertIn("3日計 データなし", text)
+        self.assertIn("計 データなし", text)
         self.assertLess(text.index("NORMAL Top15"), text.index("generated_at_jst"))
         self.assertIn("詳細情報", text)
         self.assertEqual(warnings, [])
