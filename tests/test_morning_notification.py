@@ -412,7 +412,7 @@ class MorningNotificationTests(unittest.TestCase):
             "machine_no": str(700 + rank),
             "machine_name": f"TOP15-{rank}",
             "score": str(80 - rank / 10),
-            "_recent3_text": "9/19 +100｜9/20 +200｜9/21 +300｜計 +600",
+            "_recent3_text": "19 +100｜20 +200｜21 +300｜計 +600",
         } for rank in range(1, 16)]
 
         top15_section = notification.StoreSection(
@@ -473,7 +473,7 @@ class MorningNotificationTests(unittest.TestCase):
             )
             self.assertEqual(
                 enriched[0]["_recent3_text"],
-                "9/18 +100｜9/19 -200｜9/21 +300｜計 +200",
+                "18 +100｜19 -200｜21 +300｜計 +200",
             )
 
     def test_maruhan_recent3_missing_machine_is_data_none_and_not_zero_filled(self):
@@ -500,11 +500,11 @@ class MorningNotificationTests(unittest.TestCase):
                 date(2026, 9, 22),
             )
             recent = enriched[0]["_recent3_text"]
-            self.assertIn("9/19 +100", recent)
-            self.assertIn("9/20 データなし", recent)
-            self.assertIn("9/21 +300", recent)
+            self.assertIn("19 +100", recent)
+            self.assertIn("20 データなし", recent)
+            self.assertIn("21 +300", recent)
             self.assertIn("計 データなし", recent)
-            self.assertNotIn("9/20 0", recent)
+            self.assertNotIn("20 0", recent)
 
     def test_html_ranking_is_mobile_table_and_escapes_values(self):
         block = notification.RankingBlock(

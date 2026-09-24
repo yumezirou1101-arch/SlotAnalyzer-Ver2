@@ -912,7 +912,7 @@ def _recent3_actual_text(
 
     for actual_date, actual_map in recent_actuals:
         value = actual_map.get(normalized_machine)
-        date_text = f"{actual_date.month}/{actual_date.day}"
+        date_text = str(actual_date.day)
 
         if value is None:
             parts.append(f"{date_text} データなし")
