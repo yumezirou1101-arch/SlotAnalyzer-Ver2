@@ -67,11 +67,20 @@ class Credential:
 
 
 @dataclass(frozen=True)
+class InlineImage:
+    cid: str
+    filename: str
+    data: bytes
+    subtype: str = "png"
+
+
+@dataclass(frozen=True)
 class NotificationMessage:
     subject: str
     plain: str
     html: str
     overall_status: str
+    inline_images: tuple[InlineImage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -309,9 +318,18 @@ def _render_section_plain(section: StoreSection, *, include_details: bool = True
     return "\n".join(lines)
 
 
-def _render_section_html(section: StoreSection, *, include_details: bool = True) -> str:
+def _render_section_html(
+    section: StoreSection,
+    *,
+    include_details: bool = True,
+    ranking_extras: dict[str, str] | None = None,
+) -> str:
     summary = "".join(f"<div>{html.escape(line)}</div>" for line in section.summary_lines)
-    rankings = "".join(_ranking_table_html(block) for block in section.rankings)
+    ranking_extras = ranking_extras or {}
+    rankings = "".join(
+        _ranking_table_html(block) + ranking_extras.get(block.label, "")
+        for block in section.rankings
+    )
     details = ""
     if include_details and section.detail_lines:
         detail_rows = "".join(f"<div>{html.escape(line)}</div>" for line in section.detail_lines)
@@ -1376,6 +1394,83 @@ def _bic_tsubame_section(
         lines.append(f"known closure skipped: {len(skipped)} day(s)")
     return lines, warnings
 
+MARUHAN_FLOOR_MAP_CATEGORIES = {
+    "NORMAL Top15": "NORMAL",
+    "A-TYPE Top15": "A-TYPE",
+    "JUGGLER Top15": "JUGGLER",
+}
+
+
+def _maruhan_floor_map_display(
+    section: StoreSection,
+    project_root: Path,
+    operation_date: date,
+) -> tuple[dict[str, str], tuple[InlineImage, ...]]:
+    """Build display-only floor maps without changing ranking or notification status."""
+    eligible = {
+        MARUHAN_FLOOR_MAP_CATEGORIES[block.label]: (block.rows, block.rank_keys)
+        for block in section.rankings
+        if block.label in MARUHAN_FLOOR_MAP_CATEGORIES and block.rows
+    }
+    if not eligible:
+        return {}, ()
+
+    extras: dict[str, str] = {}
+    inline_images: list[InlineImage] = []
+    try:
+        from maruhan_morning_floor_map import generate_floor_map_bundle
+
+        results = generate_floor_map_bundle(project_root, operation_date, eligible)
+    except Exception as exc:
+        results = {}
+        error = _safe_error(exc)
+        for label, category in MARUHAN_FLOOR_MAP_CATEGORIES.items():
+            if category in eligible:
+                extras[label] = (
+                    '<div style="margin:8px 0 18px;padding:8px 10px;color:#a33;'
+                    'background:#fff4f4;border-left:3px solid #a33">'
+                    f'FLOOR MAP UNAVAILABLE ({html.escape(category)}): '
+                    f'{html.escape(error)}</div>'
+                )
+        return extras, ()
+
+    for label, category in MARUHAN_FLOOR_MAP_CATEGORIES.items():
+        if category not in eligible:
+            continue
+        result = results.get(category)
+        if result is None or result.status != "OK" or result.artifact is None:
+            error = result.error if result is not None else "result missing"
+            extras[label] = (
+                '<div style="margin:8px 0 18px;padding:8px 10px;color:#a33;'
+                'background:#fff4f4;border-left:3px solid #a33">'
+                f'FLOOR MAP UNAVAILABLE ({html.escape(category)}): '
+                f'{html.escape(error)}</div>'
+            )
+            continue
+
+        artifact = result.artifact
+        extras[label] = (
+            '<div style="margin:8px 0 20px">'
+            f'<div style="font-size:12px;color:#666;margin-bottom:5px">'
+            f'{html.escape(category)} Top15 Floor Map</div>'
+            f'<img src="cid:{html.escape(artifact.cid)}" '
+            f'alt="{html.escape(category)} Top15 Floor Map" '
+            'style="display:block;width:100%;max-width:900px;height:auto;'
+            'margin:0 auto;border:1px solid #ddd">'
+            '</div>'
+        )
+        inline_images.append(
+            InlineImage(
+                cid=artifact.cid,
+                filename=artifact.filename,
+                data=artifact.email_bytes,
+                subtype="png",
+            )
+        )
+
+    return extras, tuple(inline_images)
+
+
 def build_notification_message(state: dict, project_root: Path, *, store: str | None = None) -> NotificationMessage:
     if store is not None:
         return build_store_notification_message(state, project_root, store)
@@ -1433,8 +1528,27 @@ def build_notification_message(state: dict, project_root: Path, *, store: str | 
         )
     else:
         warnings_html = "<div>異常警告: なし</div>"
+    maruhan_section = next(
+        (section for section in sections if section.heading == "【Maruhan 前橋インター】"),
+        None,
+    )
+    maruhan_floor_extras: dict[str, str] = {}
+    inline_images: tuple[InlineImage, ...] = ()
+    if maruhan_section is not None:
+        maruhan_floor_extras, inline_images = _maruhan_floor_map_display(
+            maruhan_section, project_root, operation_date
+        )
     sections_html = "".join(
-        _render_section_html(section, include_details=False) for section in sections
+        _render_section_html(
+            section,
+            include_details=False,
+            ranking_extras=(
+                maruhan_floor_extras
+                if section.heading == "【Maruhan 前橋インター】"
+                else None
+            ),
+        )
+        for section in sections
     )
     yesterday_html = _render_yesterday_html(yesterday)
     yesterday_atype_html = _render_yesterday_derived_html(yesterday_atype)
@@ -1459,6 +1573,7 @@ def build_notification_message(state: dict, project_root: Path, *, store: str | 
         plain=plain,
         html=html_body,
         overall_status=overall,
+        inline_images=inline_images,
     )
 
 
@@ -1500,17 +1615,23 @@ def build_store_notification_message(state: dict, project_root: Path, store: str
     plain = "\n\n".join(filter(None, [heading, yesterday_plain,
         _render_section_plain(section, include_details=False), warning_text,
         _render_details_plain([section])]))
+    floor_extras: dict[str, str] = {}
+    inline_images: tuple[InlineImage, ...] = ()
+    if store == STORE_MARUHAN:
+        floor_extras, inline_images = _maruhan_floor_map_display(
+            section, project_root, operation_date
+        )
     body = (
         '<html><body style="margin:0;padding:12px;font-family:sans-serif;line-height:1.45;color:#222">'
         f'<h2 style="margin:0 0 8px">{html.escape(heading)}</h2>'
-        f'{yesterday_html}{_render_section_html(section, include_details=False)}'
+        f'{yesterday_html}{_render_section_html(section, include_details=False, ranking_extras=floor_extras)}'
         '<div style="margin:12px 0;padding:9px;background:#fff4e5;border-left:4px solid #e67e22">'
         + "".join(f'<div>{html.escape(line)}</div>' for line in warning_text.splitlines())
         + f'</div>{_render_details_html([section])}</body></html>'
     )
     return NotificationMessage(
         f"[SlotAnalyzer][{store.upper()}][{overall}] {operation_date.isoformat()} 朝結果",
-        plain, body, overall,
+        plain, body, overall, inline_images,
     )
 
 
@@ -1583,9 +1704,12 @@ def send_notification_best_effort(
         if _already_sent(history_path, state, notification_type):
             return True
         message = build_notification_message(state, project_root, store=store)
-        message_hash = hashlib.sha256(
-            (message.subject + "\n" + message.plain + "\n" + message.html).encode("utf-8")
-        ).hexdigest()
+        digest = hashlib.sha256()
+        digest.update((message.subject + "\n" + message.plain + "\n" + message.html).encode("utf-8"))
+        for image in sorted(message.inline_images, key=lambda item: item.cid):
+            digest.update(image.cid.encode("utf-8"))
+            digest.update(hashlib.sha256(image.data).digest())
+        message_hash = digest.hexdigest()
         if not recipient or "@" not in recipient:
             raise NotificationConfigError(f"{RECIPIENT_ENV} is not configured with a valid address.")
         credential = credential_reader()
@@ -1595,6 +1719,16 @@ def send_notification_best_effort(
         email["To"] = recipient
         email.set_content(message.plain)
         email.add_alternative(message.html, subtype="html")
+        html_part = email.get_payload()[-1]
+        for image in message.inline_images:
+            html_part.add_related(
+                image.data,
+                maintype="image",
+                subtype=image.subtype,
+                cid=f"<{image.cid}>",
+                filename=image.filename,
+                disposition="inline",
+            )
         factory = smtp_factory or smtplib.SMTP_SSL
         with factory(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SEC, context=ssl.create_default_context()) as smtp:
             smtp.login(credential.username, credential.password)

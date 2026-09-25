@@ -971,5 +971,141 @@ class MorningNotificationTests(unittest.TestCase):
         self.assertTrue(warnings)
 
 
+    def test_floor_map_extra_follows_matching_ranking_block_and_plain_is_unchanged(self):
+        row = {"prediction_rank": "1", "machine_no": "910", "machine_name": "TEST", "score": "72.57"}
+        section = notification.StoreSection(
+            "MARUHAN",
+            [],
+            [
+                notification.RankingBlock("NORMAL Top15", [row], ("prediction_rank",), limit=15),
+                notification.RankingBlock("A-TYPE Top15", [row], ("prediction_rank",), limit=15),
+            ],
+            [],
+        )
+        plain_before = notification._render_section_plain(section)
+        rendered = notification._render_section_html(
+            section,
+            ranking_extras={"NORMAL Top15": '<div id="normal-floor">MAP</div>'},
+        )
+        plain_after = notification._render_section_plain(section)
+        self.assertEqual(plain_before, plain_after)
+        self.assertLess(rendered.index("NORMAL Top15"), rendered.index('id="normal-floor"'))
+        self.assertLess(rendered.index('id="normal-floor"'), rendered.index("A-TYPE Top15"))
+
+    def test_cid_inline_image_is_multipart_related_and_hash_recorded(self):
+        secret = "never-print-this-secret"
+        message = notification.NotificationMessage(
+            subject="[SlotAnalyzer][SUCCESS] floor-map-test",
+            plain="plain ranking body",
+            html='<html><body><img src="cid:floor-test@slotanalyzer"></body></html>',
+            overall_status="SUCCESS",
+            inline_images=(
+                notification.InlineImage(
+                    cid="floor-test@slotanalyzer",
+                    filename="floor.png",
+                    data=b"fake-png-bytes",
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(notification, "build_notification_message", return_value=message):
+            root = Path(directory)
+            history = root / "history.csv"
+            result = notification.send_notification_best_effort(
+                state_with(["SUCCESS"] * 3),
+                root,
+                history,
+                credential_reader=lambda: notification.Credential("sender@example.com", secret),
+                smtp_factory=FakeSMTP,
+                recipient="galaxy@example.com",
+                clock=lambda: datetime(2026, 9, 25, 8, 0, tzinfo=JST),
+            )
+            with history.open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertTrue(result)
+        self.assertEqual(rows[0]["status"], "SENT")
+        self.assertEqual(len(rows[0]["message_sha256"]), 64)
+        sent_message = next(call[1] for call in FakeSMTP.calls if call[0] == "send")
+        self.assertEqual(
+            [part.get_content_type() for part in sent_message.iter_parts()],
+            ["text/plain", "multipart/related"],
+        )
+        related = list(sent_message.iter_parts())[1]
+        related_parts = list(related.iter_parts())
+        self.assertEqual(
+            [part.get_content_type() for part in related_parts],
+            ["text/html", "image/png"],
+        )
+        self.assertEqual(related_parts[1]["Content-ID"], "<floor-test@slotanalyzer>")
+        self.assertEqual(related_parts[1].get_filename(), "floor.png")
+
+    def test_floor_map_failure_warning_is_html_only_and_non_blocking(self):
+        state = state_with(["SUCCESS"] * 3)
+        section = notification.StoreSection(
+            "【Maruhan 前橋インター】",
+            ["Forward: FORWARD_VALID (formal)"],
+            [
+                notification.RankingBlock(
+                    "NORMAL Top15",
+                    [{"prediction_rank": "1", "machine_no": "910", "machine_name": "TEST", "score": "72.57"}],
+                    ("prediction_rank",),
+                    limit=15,
+                )
+            ],
+            [],
+        )
+        extra = {
+            "NORMAL Top15": (
+                '<div>FLOOR MAP UNAVAILABLE (NORMAL): intentional fixture</div>'
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(notification, "_maruhan_content", return_value=(section, [])), \
+                mock.patch.object(notification, "_maruhan_floor_map_display", return_value=(extra, ())):
+            message = notification.build_store_notification_message(
+                state, Path(directory), automation.STORE_MARUHAN
+            )
+        self.assertEqual(message.overall_status, "SUCCESS")
+        self.assertIn("FLOOR MAP UNAVAILABLE", message.html)
+        self.assertNotIn("FLOOR MAP UNAVAILABLE", message.plain)
+        self.assertEqual(message.inline_images, ())
+
+    def test_floor_map_display_does_not_mutate_ranking_identity(self):
+        rows = [
+            {
+                "prediction_rank": str(rank),
+                "machine_no": str(900 + rank),
+                "machine_name": f"NAME-{rank}",
+                "score": str(80 - rank / 10),
+            }
+            for rank in range(1, 16)
+        ]
+        section = notification.StoreSection(
+            "【Maruhan 前橋インター】",
+            [],
+            [notification.RankingBlock("NORMAL Top15", rows, ("prediction_rank",), limit=15)],
+            [],
+        )
+        identity_before = [
+            (row["prediction_rank"], row["machine_no"], row["machine_name"], row["score"])
+            for row in rows
+        ]
+        with mock.patch.object(
+            notification,
+            "_maruhan_floor_map_display",
+            return_value=(
+                {"NORMAL Top15": '<div><img src="cid:test"></div>'},
+                (notification.InlineImage("test", "test.png", b"png"),),
+            ),
+        ):
+            notification._maruhan_floor_map_display(section, Path("unused"), date(2026, 9, 25))
+        identity_after = [
+            (row["prediction_rank"], row["machine_no"], row["machine_name"], row["score"])
+            for row in rows
+        ]
+        self.assertEqual(identity_before, identity_after)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -55,7 +55,11 @@ class StoreNotificationTests(unittest.TestCase):
         passes = []
         def process(store, *args):
             events.append("process:" + store)
-            status = {"maruhan": "SUCCESS", "yasuda": "NEEDS_MANUAL_REVIEW"}.get(store)
+            status = {
+                "maruhan": "SUCCESS",
+                "yasuda": "NEEDS_MANUAL_REVIEW",
+                "bic_tsubame": "SUCCESS",
+            }.get(store)
             if store == "bigmarch":
                 passes.append(1)
                 status = "WAITING_FOR_DATA" if len(passes) == 1 else "PROVISIONAL"
@@ -77,7 +81,7 @@ class StoreNotificationTests(unittest.TestCase):
         self.assertLess(events.index("mail:maruhan"), events.index("process:bigmarch"))
         self.assertLess(events.index("mail:yasuda"), events.index("wait"))
         self.assertLess(events.index("wait"), events.index("mail:bigmarch"))
-        self.assertEqual(sender.call_count, 3)
+        self.assertEqual(sender.call_count, 4)
 
     def test_single_store_subjects_content_and_maruhan_order(self):
         state = state_with(["SUCCESS", "PROVISIONAL", "NEEDS_MANUAL_REVIEW"])
@@ -90,8 +94,8 @@ class StoreNotificationTests(unittest.TestCase):
                 self.assertIn(f"[{store.upper()}][{expected}]", message.subject)
                 if store == "maruhan":
                     self.assertLess(message.plain.index("昨日の予測結果"), message.plain.index("Forward:"))
-                    self.assertLess(message.plain.index("NORMAL Top10"), message.plain.index("A-TYPE Top10"))
-                    self.assertLess(message.plain.index("A-TYPE Top10"), message.plain.index("JUGGLER Top10"))
+                    self.assertLess(message.plain.index("NORMAL Top15"), message.plain.index("A-TYPE Top15"))
+                    self.assertLess(message.plain.index("A-TYPE Top15"), message.plain.index("JUGGLER Top15"))
                     self.assertNotIn("Big March", message.plain)
                 elif store == "yasuda":
                     self.assertIn("NEEDS_MANUAL_REVIEW", message.plain)
@@ -111,7 +115,7 @@ class StoreNotificationTests(unittest.TestCase):
                 for store in automation.STORE_ORDER:
                     self.assertTrue(send(store))
             rows = notification._read_rows(history)
-            self.assertEqual(len(rows), 3)
+            self.assertEqual(len(rows), 4)
             self.assertEqual(set(rows[0]), set(notification.HISTORY_FIELDS))
             self.assertEqual({r["notification_type"] for r in rows},
                              {f"MORNING_RESULT:{s.upper()}" for s in automation.STORE_ORDER})
@@ -128,7 +132,7 @@ class StoreNotificationTests(unittest.TestCase):
         attempts = set()
         for _ in range(2):
             notification.notify_terminal_stores_best_effort(state, Path("unused"), attempts, sender=sender)
-        self.assertEqual(sender.call_count, 3)
+        self.assertEqual(sender.call_count, 4)
         self.assertEqual(state, original)
         self.assertTrue(automation.should_sleep_on_success(True, state, 0))
 
