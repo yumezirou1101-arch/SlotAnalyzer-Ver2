@@ -90,7 +90,7 @@ def observe_big_march_inventory(
     *,
     generated_at_jst: datetime,
 ) -> dict:
-    data_dir = Path(data_dir)
+    data_dir = Path(data_dir).resolve()
     operation_date = date.fromisoformat(str(operation_date))
     latest_allowed = operation_date - timedelta(days=1)
     daily_files = [

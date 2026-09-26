@@ -73,6 +73,38 @@ class InventoryMonitorTests(unittest.TestCase):
             self.assertEqual(conflict["status"], "SOURCE_CHANGED_AFTER_OBSERVATION")
             self.assertEqual(path.read_text(encoding="utf-8"), before_text)
 
+    def test_same_sources_relative_then_absolute_are_same_identity(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            absolute_data = Path(directory).resolve()
+            relative_data = absolute_data.relative_to(ROOT)
+
+            write_daily(
+                absolute_data / "ana_slo_bigmarch_oyagi_20260901.csv",
+                "2026-09-01",
+                276,
+            )
+            write_daily(
+                absolute_data / "ana_slo_bigmarch_oyagi_20260902.csv",
+                "2026-09-02",
+                276,
+            )
+
+            with mock.patch.object(monitor.Path, "cwd", return_value=ROOT):
+                first = monitor.observe_big_march_inventory(
+                    relative_data,
+                    date(2026, 9, 3),
+                    generated_at_jst=NOW,
+                )
+
+            second = monitor.observe_big_march_inventory(
+                absolute_data,
+                date(2026, 9, 3),
+                generated_at_jst=NOW,
+            )
+
+        self.assertEqual(first["status"], "NO_CHANGE")
+        self.assertEqual(second["status"], "ALREADY_OBSERVED")
+
     def test_non_consecutive_is_not_evaluated(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
