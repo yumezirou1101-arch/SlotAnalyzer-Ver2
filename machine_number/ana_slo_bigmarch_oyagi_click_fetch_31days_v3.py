@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 from io import StringIO
 import argparse
 import asyncio
@@ -60,9 +60,37 @@ def parse_args():
         )
     )
     parser.add_argument("--max-days", type=int, default=DEFAULT_MAX_DAYS)
+    parser.add_argument(
+        "--target-date",
+        type=str,
+        default="",
+        help=(
+            "Fetch only this exact data date (YYYY-MM-DD). "
+            "When omitted, the existing --max-days behavior is unchanged."
+        ),
+    )
     parser.add_argument("--min-machines", type=int, default=DEFAULT_MIN_MACHINES)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def normalize_target_date(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", text):
+        raise ValueError("--target-date must be YYYY-MM-DD.")
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValueError("--target-date must be YYYY-MM-DD.") from exc
+
+
+def select_date_links(date_links, max_days: int, target_date: str = ""):
+    """Select links without changing the legacy newest-N behavior."""
+    if target_date:
+        return [item for item in date_links if item["date"] == target_date]
+    return date_links[:max_days]
 
 
 def has_store_text(text: str) -> bool:
@@ -489,6 +517,8 @@ async def main():
     if args.min_machines < 1:
         raise ValueError("--min-machines must be at least 1.")
 
+    target_date = normalize_target_date(args.target_date)
+
     header(
         "Big March Takasaki Oyagi - Multi-Day Link-Click Fetch V3"
     )
@@ -513,6 +543,7 @@ async def main():
         print(f"source tab title      : {await page.title()}")
         print(f"source tab URL        : {page.url}")
         print(f"max days              : {args.max_days}")
+        print(f"target date           : {target_date or '(not specified)'}")
         print(f"min machines          : {args.min_machines}")
         print(f"overwrite             : {args.overwrite}")
 
@@ -523,16 +554,136 @@ async def main():
         if not date_links:
             raise RuntimeError("No usable daily date links were found.")
 
-        selected = date_links[: args.max_days]
+        selected = select_date_links(
+            date_links,
+            args.max_days,
+            target_date,
+        )
+
+        # SLOTANALYZER_BIGMARCH_EXACT_DATE_RECOVERY_V1
+        # Existing Chrome tabs can contain a stale list DOM even when the
+        # live store-list page already publishes target_date.
+        # In target-date mode only:
+        # current DOM -> same-tab no-cache navigation -> fresh-tab no-cache.
+        # Never substitute another date.
+        if target_date and not selected:
+            print(
+                "target recovery       : same-tab no-cache navigation"
+            )
+            try:
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Network.enable")
+                await cdp.send(
+                    "Network.setCacheDisabled",
+                    {"cacheDisabled": True},
+                )
+                response = await page.goto(
+                    STORE_LIST_URL,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                await page.wait_for_timeout(3000)
+                date_links = await collect_date_links(page)
+                selected = select_date_links(
+                    date_links,
+                    args.max_days,
+                    target_date,
+                )
+                newest = date_links[0]["date"] if date_links else "NONE"
+                print(
+                    f"same-tab HTTP status  : "
+                    f"{response.status if response else 'NONE'}"
+                )
+                print(f"same-tab newest       : {newest}")
+                print(
+                    f"same-tab target found : {bool(selected)}"
+                )
+            except Exception as exc:
+                print(
+                    f"same-tab recovery warn: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        if target_date and not selected:
+            print(
+                "target recovery       : fresh-tab no-cache navigation"
+            )
+            fresh = await context.new_page()
+            keep_fresh = False
+            try:
+                cdp = await context.new_cdp_session(fresh)
+                await cdp.send("Network.enable")
+                await cdp.send(
+                    "Network.setCacheDisabled",
+                    {"cacheDisabled": True},
+                )
+                response = await fresh.goto(
+                    STORE_LIST_URL,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                await fresh.wait_for_timeout(3000)
+                fresh_links = await collect_date_links(fresh)
+                fresh_selected = select_date_links(
+                    fresh_links,
+                    args.max_days,
+                    target_date,
+                )
+                newest = (
+                    fresh_links[0]["date"]
+                    if fresh_links
+                    else "NONE"
+                )
+                print(
+                    f"fresh-tab HTTP status : "
+                    f"{response.status if response else 'NONE'}"
+                )
+                print(f"fresh-tab newest      : {newest}")
+                print(
+                    f"fresh-tab target found: {bool(fresh_selected)}"
+                )
+
+                if fresh_selected:
+                    page = fresh
+                    date_links = fresh_links
+                    selected = fresh_selected
+                    keep_fresh = True
+            except Exception as exc:
+                print(
+                    f"fresh-tab recovery warn: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            finally:
+                if not keep_fresh:
+                    try:
+                        await fresh.close()
+                    except Exception:
+                        pass
 
         print(f"date links found      : {len(date_links)}")
         print(f"dates selected        : {len(selected)}")
-        print(
-            f"selected range        : "
-            f"{selected[-1]['date']} to {selected[0]['date']}"
-        )
 
         logs = []
+
+        if not selected:
+            if target_date:
+                print(f"target date available : False ({target_date})")
+                print("selected range        : NONE")
+                logs.append(
+                    blank_log_row(
+                        target_date,
+                        "TARGET_NOT_AVAILABLE",
+                        "target date link is not currently published",
+                    )
+                )
+            else:
+                raise RuntimeError("No daily dates were selected.")
+        else:
+            print(
+                f"selected range        : "
+                f"{selected[-1]['date']} to {selected[0]['date']}"
+            )
+
 
         for pos, item in enumerate(selected, start=1):
             date_iso = item["date"]
@@ -729,6 +880,8 @@ async def main():
         print("FINAL RESULT          : OK")
         print()
         print("If the store tab was missing, V3 opened it automatically.")
+        if target_date:
+            print("Target-date mode does not fall back to a different date.")
         print("Historical machine count changes are allowed.")
         print(f"Pages with fewer than {args.min_machines} machines are rejected.")
         print("No Maruhan data files were modified.")

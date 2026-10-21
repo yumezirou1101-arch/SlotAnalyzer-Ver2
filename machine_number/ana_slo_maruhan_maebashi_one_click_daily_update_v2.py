@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 import argparse
@@ -22,7 +22,10 @@ from ana_slo_prediction_v4_2_forward_guard import (
     validate_forward_time,
     validate_target_actual_absent,
 )
-from slotanalyzer_inventory_guard import enforce_inventory_guard
+from slotanalyzer_inventory_guard import (
+    InventoryGuardBlockedError,
+    enforce_inventory_guard,
+)
 
 
 # ============================================================
@@ -46,6 +49,12 @@ from slotanalyzer_inventory_guard import enforce_inventory_guard
 #
 # 3) Evaluate already-saved live predictions against newly available actual data
 #    - ana_slo_prediction_v4_2_live_prediction_backtest.py
+# 3A) Rebuild Formal Performance Ledger (blocking)
+#    - ana_slo_formal_performance_ledger_v1.py
+# 3B) Update DAY7 prospective research monitor (non-blocking)
+#    - ana_slo_special_day_h1_day7_prospective_monitor_offline_v1.py
+# 3C) Evaluate frozen A-TYPE / JUGGLER predictions
+#    - ana_slo_prediction_v4_2_normal_atype_juggler_live_evaluation.py
 #
 # 4) Update Champion / Challenger forward tracking
 #    - ana_slo_prediction_v4_2_forward_champion_challenger.py
@@ -64,7 +73,7 @@ from slotanalyzer_inventory_guard import enforce_inventory_guard
 #   is stale for the prediction target (unless --allow-gap is intentional)
 # - Existing prediction model weights are not recalculated here
 # - 78 lottery filtering is NOT run here
-# - 76 actual-result evaluation is NOT run here
+# - 76 actual-result evaluation IS run after the DAY7 monitor
 # - Big March files are not modified
 # ============================================================
 
@@ -105,6 +114,16 @@ SCRIPT_76 = (
     / "ana_slo_prediction_v4_2_normal_atype_juggler_live_evaluation.py"
 )
 
+SCRIPT_FORMAL_LEDGER = (
+    MACHINE_DIR
+    / "ana_slo_formal_performance_ledger_v1.py"
+)
+
+SCRIPT_DAY7_MONITOR = (
+    MACHINE_DIR
+    / "ana_slo_special_day_h1_day7_prospective_monitor_offline_v1.py"
+)
+
 SCRIPT_FORWARD = (
     MACHINE_DIR
     / "ana_slo_prediction_v4_2_forward_champion_challenger.py"
@@ -113,6 +132,19 @@ SCRIPT_FORWARD = (
 SCRIPT_LIVE = (
     MACHINE_DIR
     / "ana_slo_prediction_v4_2_one_click_live_pipeline.py"
+)
+
+SCRIPT_HISTORY_IDENTITY_TRACKER = (
+    MACHINE_DIR
+    / "slotanalyzer_maruhan_history_identity_future_forward_tracker_v1.py"
+)
+
+# Tail-day V2.2: independent research tracker, not production ranking.
+SCRIPT_TAIL_DAY_V22 = MACHINE_DIR / "slotanalyzer_tail_day_forward_v22.py"
+
+SCRIPT_PRACTICAL_CONTINUITY = (
+    MACHINE_DIR
+    / "ana_slo_maruhan_practical_ranking_continuity_reference_v1.py"
 )
 
 BACKTEST_69_DIR = (
@@ -682,6 +714,90 @@ def run_stage(
     return elapsed
 
 
+def run_stage_nonblocking(
+    label: str,
+    script: Path,
+    args: list[str] | None = None,
+    history_stage: str | None = None,
+) -> tuple[float, bool]:
+    """Run an offline monitoring stage without blocking production."""
+    args = args or []
+
+    header(label)
+
+    command = [
+        sys.executable,
+        str(script),
+        *args,
+    ]
+
+    print(
+        "command               : "
+        + " ".join(
+            f'"{value}"' if " " in value else value
+            for value in command
+        )
+    )
+
+    started_at = now_jst()
+    started = time.perf_counter()
+
+    try:
+        result = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+        )
+        elapsed = time.perf_counter() - started
+        success = result.returncode == 0
+
+        if history_stage:
+            record_timing(
+                history_stage,
+                started_at,
+                started,
+                "OK" if success else "FAILED_NONBLOCKING",
+                result.returncode,
+                "" if success else f"exit code {result.returncode}",
+            )
+
+        print()
+        print(f"{label} return code    : {result.returncode}")
+        print(f"{label} elapsed sec    : {elapsed:.2f}")
+
+        if not success:
+            print(
+                f"{label} warning        : FAILED, "
+                "but production pipeline will continue."
+            )
+
+        return elapsed, success
+
+    except Exception as exc:
+        elapsed = time.perf_counter() - started
+
+        if history_stage:
+            record_timing(
+                history_stage,
+                started_at,
+                started,
+                "FAILED_NONBLOCKING",
+                1,
+                f"{type(exc).__name__}: {exc}",
+            )
+
+        print()
+        print(
+            f"{label} warning        : "
+            f"{type(exc).__name__}: {exc}"
+        )
+        print(
+            f"{label} action         : "
+            "production pipeline will continue."
+        )
+
+        return elapsed, False
+
+
 def discover_latest_source() -> tuple[
     Path,
     pd.Timestamp,
@@ -1023,6 +1139,9 @@ def main() -> None:
         SCRIPT_FETCH,
         SCRIPT_CONVERT,
         SCRIPT_69,
+        SCRIPT_FORMAL_LEDGER,
+        SCRIPT_DAY7_MONITOR,
+        SCRIPT_76,
         SCRIPT_FORWARD,
         SCRIPT_LIVE,
     ):
@@ -1069,6 +1188,9 @@ def main() -> None:
         SCRIPT_FETCH,
         SCRIPT_CONVERT,
         SCRIPT_69,
+        SCRIPT_FORMAL_LEDGER,
+        SCRIPT_DAY7_MONITOR,
+        SCRIPT_76,
         SCRIPT_FORWARD,
         SCRIPT_LIVE,
     ):
@@ -1239,11 +1361,85 @@ def main() -> None:
     # Inventory continuity is independent of --allow-gap. Acquisition,
     # conversion, and Freshness are retained, but no evaluation, Forward
     # update, or formal ranking may proceed while this guard is blocked.
-    enforce_inventory_guard(
-        DATA_DIR,
-        prediction_target.date(),
-        source_date.date(),
+    try:
+        enforce_inventory_guard(
+            DATA_DIR,
+            prediction_target.date(),
+            source_date.date(),
+        )
+    except InventoryGuardBlockedError as exc:
+        print("INVENTORY GUARD: MANUAL_REVIEW")
+        print(str(exc))
+        print("Formal 69/ledger/76/63/79 stages are intentionally stopped.")
+        practical_args = ["--target-date", prediction_target.strftime("%Y-%m-%d")]
+        elapsed = run_stage(
+            "STEP 3R / 5 - PRACTICAL INVENTORY-CONTINUITY REFERENCE",
+            SCRIPT_PRACTICAL_CONTINUITY,
+            practical_args,
+            history_stage="80_PRACTICAL_REFERENCE",
+        )
+        stage_rows.append(("80 PRACTICAL REFERENCE", elapsed))
+        print("PRACTICAL_REFERENCE_COMPLETE")
+        print("Formal Forward remains blocked; practical ranking is available.")
+        return
+
+    # --------------------------------------------------------
+    # 2B) HISTORY-IDENTITY CHALLENGER FUTURE FORWARD TRACKER
+    # --------------------------------------------------------
+    # This point is reached only when Inventory Guard passed.
+    # The tracker itself also enforces target-1 freshness and the
+    # 09:00 JST formal freeze deadline.
+    elapsed = run_stage(
+        "STEP 2B / 5 - HISTORY-IDENTITY FUTURE FORWARD TRACKER",
+        SCRIPT_HISTORY_IDENTITY_TRACKER,
+        history_stage="HISTORY_IDENTITY_FUTURE_FORWARD",
     )
+
+    stage_rows.append(
+        (
+            "HISTORY-ID FUTURE FORWARD",
+            elapsed,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 2C) TAIL DAY V2.2 PROSPECTIVE RESEARCH (NON-BLOCKING)
+    # --------------------------------------------------------
+    # Only evaluate a prospectively saved prediction; no retrospective freeze.
+    tail_yesterday = prediction_target - pd.Timedelta(days=1)
+    tail_yesterday_frozen = (
+        DATA_DIR / "analysis_31days_deep" / "tail_day_forward_v22"
+        / "frozen" / f"{tail_yesterday:%Y%m%d}.json"
+    )
+    if tail_yesterday_frozen.is_file():
+        tail_elapsed, tail_eval_ok = run_stage_nonblocking(
+            "STEP 2C / 5 - TAIL DAY V2.2 EVALUATE",
+            SCRIPT_TAIL_DAY_V22,
+            args=["evaluate", "--target-date", tail_yesterday.strftime("%Y-%m-%d")],
+            history_stage="TAIL_DAY_V22_EVALUATE",
+        )
+        stage_rows.append(("TAIL DAY V22 EVALUATE", tail_elapsed))
+        print(f"TAIL_DAY_V22_EVALUATE_OK={tail_eval_ok}")
+    else:
+        print("TAIL_DAY_V22_EVALUATE=SKIP_NO_PRIOR_SNAPSHOT")
+
+    tail_today_frozen = (
+        DATA_DIR / "analysis_31days_deep" / "tail_day_forward_v22"
+        / "frozen" / f"{prediction_target:%Y%m%d}.json"
+    )
+    if tail_today_frozen.is_file():
+        print("TAIL_DAY_V22_FREEZE=ALREADY_FROZEN")
+    elif now_jst().hour >= 9:
+        print("TAIL_DAY_V22_FREEZE=SKIP_WINDOW_EXPIRED")
+    else:
+        tail_elapsed, tail_freeze_ok = run_stage_nonblocking(
+            "STEP 2C / 5 - TAIL DAY V2.2 FREEZE",
+            SCRIPT_TAIL_DAY_V22,
+            args=["freeze", "--target-date", prediction_target.strftime("%Y-%m-%d")],
+            history_stage="TAIL_DAY_V22_FREEZE",
+        )
+        stage_rows.append(("TAIL DAY V22 FREEZE", tail_elapsed))
+        print(f"TAIL_DAY_V22_FREEZE_OK={tail_freeze_ok}")
 
     # --------------------------------------------------------
     # 3) 69 LIVE PREDICTION BACKTEST
@@ -1278,10 +1474,41 @@ def main() -> None:
         f"69 evaluation status : {backtest_69_summary}"
     )
 
+    # --------------------------------------------------------
+    # 3A) FORMAL PERFORMANCE LEDGER
+    # --------------------------------------------------------
+    # Blocking: if the authoritative Formal Ledger cannot be rebuilt cleanly,
+    # downstream processing stops.
+    elapsed = run_stage(
+        "STEP 3A / 5 - FORMAL PERFORMANCE LEDGER",
+        SCRIPT_FORMAL_LEDGER,
+        history_stage="FORMAL_LEDGER",
+    )
+    stage_rows.append(("FORMAL PERFORMANCE LEDGER", elapsed))
+
+    # --------------------------------------------------------
+    # 3B) DAY7 PROSPECTIVE MONITOR
+    # --------------------------------------------------------
+    # Non-blocking: this is offline/read-only research monitoring. Failure is
+    # logged, but the established 76 -> 63 -> 79 path continues.
+    elapsed, day7_monitor_ok = run_stage_nonblocking(
+        "STEP 3B / 5 - DAY7 PROSPECTIVE MONITOR",
+        SCRIPT_DAY7_MONITOR,
+        history_stage="DAY7_PROSPECTIVE_MONITOR",
+    )
+    stage_rows.append(
+        (
+            "DAY7 PROSPECTIVE MONITOR"
+            if day7_monitor_ok
+            else "DAY7 MONITOR (NONBLOCK FAIL)",
+            elapsed,
+        )
+    )
+
     # Evaluate the already-frozen 74/75 predictions after the corresponding
     # actual daily data is available. This does not modify prediction files.
     elapsed = run_stage(
-        "STEP 3B / 5 - A-TYPE / JUGGLER FORMAL EVALUATION 76",
+        "STEP 3C / 5 - A-TYPE / JUGGLER FORMAL EVALUATION 76",
         SCRIPT_76,
         history_stage="76_FORMAL_EVALUATION",
     )
@@ -1387,6 +1614,13 @@ def main() -> None:
         f"{backtest_69_summary}"
     )
     print(
+        "Formal Ledger         : rebuilt successfully"
+    )
+    print(
+        "DAY7 monitor          : "
+        + ("OK" if day7_monitor_ok else "FAILED (NON-BLOCKING)")
+    )
+    print(
         f"77 integrated report : "
         f"{integrated_path}"
     )
@@ -1410,7 +1644,7 @@ def main() -> None:
         "69 evaluated frozen live predictions against available actual data."
     )
     print(
-        "76 actual-result evaluation was not run."
+        "76 evaluated frozen A-TYPE / JUGGLER predictions against actual data."
     )
     print(
         "No Big March files were modified."

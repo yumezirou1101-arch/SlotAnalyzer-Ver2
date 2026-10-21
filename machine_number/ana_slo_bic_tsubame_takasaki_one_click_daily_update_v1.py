@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import date, timedelta
 import argparse
+import csv
+import hashlib
 import json
 import os
 import re
@@ -22,9 +24,10 @@ import pandas as pd
 #   2) Fetch the expected latest Ana-Slo HTML
 #   3) Convert that HTML -> daily CSV
 #   4) Freshness Guard
+#   5) Challenger V1 REFERENCE ranking
 #
 # IMPORTANT:
-#   - No Forward/ranking stage is connected yet.
+#   - Ranking output is REFERENCE_ONLY; not production/formal.
 #   - No --allow-gap escape hatch is provided.
 #   - Known renovation closure 2026-07-21 through 2026-08-07
 #     is not treated as missing/freshness failure.
@@ -57,6 +60,11 @@ SCRIPT_FETCH = (
 SCRIPT_CONVERT = (
     MACHINE_DIR
     / "ana_slo_bic_tsubame_takasaki_batch_html_to_daily_csv.py"
+)
+
+SCRIPT_REFERENCE_RANKING = (
+    MACHINE_DIR
+    / "ana_slo_bic_tsubame_challenger_v1_reference_future_top10_v1.py"
 )
 
 
@@ -387,6 +395,95 @@ def ensure_cdp(
 # ============================================================
 # Child-script helpers
 # ============================================================
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_existing_reference_outputs(operation_date: date) -> dict:
+    ymd = operation_date.strftime("%Y%m%d")
+    out_dir = DATA_DIR / "analysis_challenger_v1_reference_future_top10"
+
+    all_path = out_dir / f"64_prediction_{ymd}_all517.csv"
+    top10_path = out_dir / f"64_prediction_{ymd}_top10.csv"
+    meta_path = out_dir / f"64_prediction_{ymd}_metadata.csv"
+
+    paths = (all_path, top10_path, meta_path)
+    if not all(p.is_file() and p.stat().st_size > 0 for p in paths):
+        raise RuntimeError(
+            "Existing REFERENCE bundle is incomplete; refusing to treat "
+            "ALREADY_FROZEN as success."
+        )
+
+    with meta_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        meta_rows = list(csv.DictReader(handle))
+    if len(meta_rows) != 1:
+        raise RuntimeError(
+            f"REFERENCE metadata row count mismatch: {len(meta_rows)} != 1"
+        )
+
+    meta = meta_rows[0]
+    expected_latest, _ = expected_latest_data_date(operation_date)
+    expected_meta = {
+        "target_date": operation_date.isoformat(),
+        "latest_data_date": expected_latest.isoformat(),
+        "model": "BIC_TSUBAME_CHALLENGER_V1_DROP_PLUS2000_REFERENCE",
+        "weight_fingerprint": "a3b7ecbead34995a",
+        "forward_valid": "True",
+        "target_actual_absent_at_generation": "True",
+        "target_actual_used": "False",
+        "challenger_used": "True",
+        "reference_only": "True",
+        "formal_evaluation": "False",
+        "production_ranking": "False",
+        "dropped_feature": "plus2000_rate",
+        "machines_ranked": "517",
+        "top_n": "10",
+    }
+    mismatches = {
+        key: (meta.get(key, ""), expected)
+        for key, expected in expected_meta.items()
+        if str(meta.get(key, "")) != str(expected)
+    }
+    if mismatches:
+        raise RuntimeError(f"REFERENCE metadata mismatch: {mismatches}")
+
+    with all_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        all_rows = list(csv.DictReader(handle))
+    with top10_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        top10_rows = list(csv.DictReader(handle))
+
+    if len(all_rows) != 517:
+        raise RuntimeError(
+            f"REFERENCE all517 row count mismatch: {len(all_rows)} != 517"
+        )
+    if len(top10_rows) != 10:
+        raise RuntimeError(
+            f"REFERENCE top10 row count mismatch: {len(top10_rows)} != 10"
+        )
+
+    if top10_rows and "target_date" in top10_rows[0]:
+        target_dates = {row.get("target_date", "") for row in top10_rows}
+        if target_dates != {operation_date.isoformat()}:
+            raise RuntimeError(
+                f"REFERENCE top10 target_date mismatch: {sorted(target_dates)}"
+            )
+
+    if _sha256_file(all_path) != meta.get("all517_sha256", ""):
+        raise RuntimeError("REFERENCE all517 SHA-256 mismatch.")
+    if _sha256_file(top10_path) != meta.get("top10_sha256", ""):
+        raise RuntimeError("REFERENCE top10 SHA-256 mismatch.")
+
+    return {
+        "all_path": all_path,
+        "top10_path": top10_path,
+        "metadata_path": meta_path,
+    }
+
 
 def compile_script(
     path: Path,
@@ -822,6 +919,7 @@ def main() -> None:
     required_scripts = (
         SCRIPT_FETCH,
         SCRIPT_CONVERT,
+        SCRIPT_REFERENCE_RANKING,
     )
 
     for path in required_scripts:
@@ -935,6 +1033,77 @@ def main() -> None:
         )
     )
 
+    # --------------------------------------------------------
+    # 4) Challenger V1 REFERENCE ranking
+    #
+    # The child ranking script performs its own Inventory Guard
+    # and Forward/Future-Leakage safety checks. Any non-zero
+    # return code propagates through run_stage() and stops this
+    # one-click pipeline (Fail-Closed).
+    # --------------------------------------------------------
+
+    ranking_started = time.perf_counter()
+
+    header(
+        "CHALLENGER V1 REFERENCE RANKING"
+    )
+
+    ranking_command = [
+        sys.executable,
+        str(SCRIPT_REFERENCE_RANKING),
+        "--target-date",
+        operation_date.isoformat(),
+    ]
+
+    print(
+        "command               : "
+        + " ".join(ranking_command)
+    )
+
+    ranking_result = subprocess.run(
+        ranking_command,
+        cwd=PROJECT_ROOT,
+    )
+
+    elapsed = (
+        time.perf_counter()
+        - ranking_started
+    )
+
+    print()
+    print(
+        "CHALLENGER V1 REFERENCE RANKING return code    : "
+        f"{ranking_result.returncode}"
+    )
+    print(
+        "CHALLENGER V1 REFERENCE RANKING elapsed sec    : "
+        f"{elapsed:.2f}"
+    )
+
+    if ranking_result.returncode != 0:
+        frozen = verify_existing_reference_outputs(
+            operation_date
+        )
+        print(
+            "CHALLENGER V1 REFERENCE RANKING result         : "
+            "ALREADY_FROZEN_VERIFIED"
+        )
+        print(f"existing all517     : {frozen['all_path']}")
+        print(f"existing top10      : {frozen['top10_path']}")
+        print(f"existing metadata   : {frozen['metadata_path']}")
+    else:
+        print(
+            "CHALLENGER V1 REFERENCE RANKING result         : "
+            "GENERATED_OK"
+        )
+
+    elapsed_rows.append(
+        (
+            "CHALLENGER V1 REFERENCE RANKING",
+            elapsed,
+        )
+    )
+
     total_elapsed = (
         time.perf_counter()
         - total_started
@@ -982,7 +1151,10 @@ def main() -> None:
         "foundation completed."
     )
     print(
-        "No Forward/ranking stage is connected yet."
+        "Challenger V1 REFERENCE ranking stage is connected."
+    )
+    print(
+        "REFERENCE_ONLY: not production ranking / not formal evaluation."
     )
     print(
         "No gap override is permitted."

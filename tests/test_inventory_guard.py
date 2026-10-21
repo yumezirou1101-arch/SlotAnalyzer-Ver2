@@ -250,7 +250,7 @@ class InventoryGuardTests(unittest.TestCase):
         self.assertEqual(reblocked.persistent_state["change_date"], "2026-09-03")
         self.assertEqual(reblocked.persistent_state["status"], "BLOCKED")
 
-    def test_unconfirmed_known_change_without_actual_comparison_persists(self):
+    def test_unconfirmed_known_change_releases_when_matching_actual_no_change_arrives(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             first = assess_inventory_guard(
@@ -263,8 +263,9 @@ class InventoryGuardTests(unittest.TestCase):
             )
         self.assertTrue(first.blocked)
         self.assertEqual(first.persistent_state["incident_kind"], "KNOWN_CHANGE_UNCONFIRMED")
-        self.assertTrue(second.blocked)
+        self.assertFalse(second.blocked)
         self.assertFalse(second.comparison.has_changes)
+        self.assertEqual(second.persistent_state, {})
 
     def test_planned_incident_is_enriched_when_matching_actual_change_arrives(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +285,82 @@ class InventoryGuardTests(unittest.TestCase):
         self.assertEqual(result.persistent_state["incident_kind"], "ACTUAL_CHANGE")
         self.assertEqual(result.persistent_state["change_date"], "2026-09-08")
         self.assertEqual(result.persistent_state["renamed_machine_numbers"][0]["machine_no"], 1)
+
+    def test_planned_incident_is_enriched_when_actual_change_is_observed_one_data_day_early(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            policy = InventoryGuardPolicy(
+                store="TEST_SCHEDULED_OBSERVED",
+                known_change_dates=frozenset({date(2026, 10, 6)}),
+                confirmed_inventory_prefix="test_inventory",
+            )
+            first = assess_inventory_guard(data, date(2026, 10, 6), date(2026, 10, 4), policy)
+            self.assertEqual(first.persistent_state["version"], 1)
+            self.assertEqual(first.persistent_state["scheduled_change_date"], "2026-10-06")
+            self.assertEqual(first.persistent_state["observed_inventory_date"], "")
+
+            previous = machines()
+            changed = machines()
+            changed[0] = (1, "actual-change")
+            write_inventory(data / "ana_slo_20261004.csv", previous, "2026-10-04")
+            write_inventory(data / "ana_slo_20261005.csv", changed, "2026-10-05")
+            result = assess_inventory_guard(data, date(2026, 10, 6), date(2026, 10, 5), policy)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.status, "MANUAL_REVIEW")
+        self.assertEqual(result.persistent_state["version"], 1)
+        self.assertEqual(result.persistent_state["incident_kind"], "ACTUAL_CHANGE")
+        self.assertEqual(result.persistent_state["change_date"], "2026-10-05")
+        self.assertEqual(result.persistent_state["scheduled_change_date"], "2026-10-06")
+        self.assertEqual(result.persistent_state["observed_inventory_date"], "2026-10-05")
+        self.assertEqual(result.persistent_state["approved_at"], "")
+        self.assertNotIn("different unapproved", result.reason)
+
+    def test_planned_incident_does_not_absorb_older_unrelated_actual_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            policy = InventoryGuardPolicy(
+                store="TEST_SCHEDULED_OBSERVED_OLDER",
+                known_change_dates=frozenset({date(2026, 10, 6)}),
+                confirmed_inventory_prefix="test_inventory",
+            )
+            assess_inventory_guard(data, date(2026, 10, 6), date(2026, 10, 3), policy)
+            state_path = inventory_guard_state_path(data)
+            before = state_path.read_bytes()
+            previous = machines()
+            changed = machines()
+            changed[0] = (1, "older-unrelated-change")
+            write_inventory(data / "ana_slo_20261003.csv", previous, "2026-10-03")
+            write_inventory(data / "ana_slo_20261004.csv", changed, "2026-10-04")
+            result = assess_inventory_guard(data, date(2026, 10, 6), date(2026, 10, 4), policy)
+            after = state_path.read_bytes()
+
+        self.assertTrue(result.blocked)
+        self.assertIn("different unapproved", result.reason)
+        self.assertEqual(before, after)
+
+    def test_prior_day_association_is_not_reused_after_scheduled_target_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            policy = InventoryGuardPolicy(
+                store="TEST_SCHEDULED_OBSERVED_LATE",
+                known_change_dates=frozenset({date(2026, 10, 6)}),
+                confirmed_inventory_prefix="test_inventory",
+            )
+            assess_inventory_guard(data, date(2026, 10, 6), date(2026, 10, 4), policy)
+            state_path = inventory_guard_state_path(data)
+            before = state_path.read_bytes()
+            previous = machines()
+            changed = machines()
+            changed[0] = (1, "prior-day-change")
+            write_inventory(data / "ana_slo_20261004.csv", previous, "2026-10-04")
+            write_inventory(data / "ana_slo_20261005.csv", changed, "2026-10-05")
+            result = assess_inventory_guard(data, date(2026, 10, 7), date(2026, 10, 5), policy)
+            after = state_path.read_bytes()
+
+        self.assertTrue(result.blocked)
+        self.assertIn("different unapproved", result.reason)
+        self.assertEqual(before, after)
 
     def test_confirmed_known_change_keeps_actual_evidence_first(self):
         with tempfile.TemporaryDirectory() as directory:

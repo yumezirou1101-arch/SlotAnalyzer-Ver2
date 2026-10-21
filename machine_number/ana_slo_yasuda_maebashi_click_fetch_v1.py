@@ -89,6 +89,15 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--target-date",
+        default=None,
+        help=(
+            "Fetch exactly one visible daily link for YYYY-MM-DD. "
+            "If the target date is not visible, no fallback date is fetched."
+        ),
+    )
+
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing ana_slo_YYYYMMDD_source.html files.",
@@ -140,7 +149,7 @@ def url_looks_maebashi_list(url: str) -> bool:
         "ana-slo.com" in value
         and "%e3%83%87%e3%83%bc%e3%82%bf%e4%b8%80%e8%a6%a7" in value
         and "%e5%89%8d%e6%a9%8b" in value
-        and "%e3%83%9e%e3%83%ab%e3%83%8f%e3%83%b3" in value
+        and "%e3%82%84%e3%81%99%e3%81%a0%e5%89%8d%e6%a9%8b%e5%ba%97" in value
     )
 
 
@@ -176,10 +185,8 @@ async def find_candidate_page(context):
         ):
             return page
 
-    for page in context.pages:
-        if "ana-slo.com" in (page.url or ""):
-            return page
-
+    # Do not fall back to an arbitrary Ana-Slo tab.
+    # A different store page must never be treated as Yasuda Maebashi.
     return None
 
 
@@ -872,9 +879,125 @@ async def main():
                 "DOM is accessible, but no visible daily date links were detected."
             )
 
-        selected = date_links[
-            :args.max_days
-        ]
+        if args.target_date is not None:
+            try:
+                datetime.strptime(
+                    args.target_date,
+                    "%Y-%m-%d",
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "--target-date must be YYYY-MM-DD"
+                ) from exc
+
+            selected = [
+                item
+                for item in date_links
+                if item["date"] == args.target_date
+            ]
+
+            # Exact-date recovery:
+            # current DOM -> same-tab no-cache navigation -> fresh-tab no-cache navigation.
+            # Never substitute an older visible date.
+            if not selected:
+                print(
+                    "target recovery       : same-tab no-cache navigation"
+                )
+                try:
+                    session = await context.new_cdp_session(page)
+                    await session.send("Network.enable")
+                    await session.send(
+                        "Network.setCacheDisabled",
+                        {"cacheDisabled": True},
+                    )
+                    await navigate_to_list(page)
+                    date_links = await collect_date_links(page)
+                    selected = [
+                        item
+                        for item in date_links
+                        if item["date"] == args.target_date
+                    ]
+                    newest = (
+                        date_links[0]["date"]
+                        if date_links
+                        else "NONE"
+                    )
+                    print(
+                        f"newest after same tab : {newest}"
+                    )
+                except Exception as exc:
+                    print(
+                        f"same-tab recovery warn: {exc}"
+                    )
+
+            if not selected:
+                print(
+                    "target recovery       : fresh-tab no-cache navigation"
+                )
+                fresh = await context.new_page()
+                try:
+                    session = await context.new_cdp_session(fresh)
+                    await session.send("Network.enable")
+                    await session.send(
+                        "Network.setCacheDisabled",
+                        {"cacheDisabled": True},
+                    )
+                    await navigate_to_list(fresh)
+                    fresh_links = await collect_date_links(fresh)
+                    fresh_selected = [
+                        item
+                        for item in fresh_links
+                        if item["date"] == args.target_date
+                    ]
+                    newest = (
+                        fresh_links[0]["date"]
+                        if fresh_links
+                        else "NONE"
+                    )
+                    print(
+                        f"newest after fresh tab: {newest}"
+                    )
+                    if fresh_selected:
+                        page = fresh
+                        date_links = fresh_links
+                        selected = fresh_selected
+                    else:
+                        await fresh.close()
+                except Exception as exc:
+                    print(
+                        f"fresh-tab recovery warn: {exc}"
+                    )
+                    try:
+                        await fresh.close()
+                    except Exception:
+                        pass
+
+            print(
+                f"target date           : {args.target_date}"
+            )
+
+            if not selected:
+                logs = [
+                    blank_log_row(
+                        args.target_date,
+                        "TARGET_DATE_NOT_FOUND",
+                        "target date link is not visible; no fallback was attempted",
+                    )
+                ]
+                log_path = save_log(logs)
+                header("SUMMARY")
+                print("processed             : 1")
+                print("TARGET_DATE_NOT_FOUND : 1")
+                print(f"log                   : {log_path}")
+                print()
+                print("FINAL RESULT          : TARGET_DATE_NOT_FOUND")
+                print("No fallback date was fetched.")
+                await browser.close()
+                return
+        else:
+            selected = date_links[
+                :args.max_days
+            ]
 
         print(
             f"dates selected        : {len(selected)}"

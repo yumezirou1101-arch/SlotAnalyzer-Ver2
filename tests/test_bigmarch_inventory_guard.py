@@ -1010,7 +1010,7 @@ class BigMarchInventoryGuardTests(
             evidence_path = (
                 data
                 / "inventory_monitor"
-                / "inventory_monitor_20260903.json"
+                / "inventory_monitor_20260901_to_20260902.json"
             )
 
             self.assertTrue(

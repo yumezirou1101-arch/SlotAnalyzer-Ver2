@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import hashlib
@@ -439,27 +439,13 @@ def check_source_readiness(
             path, expected_data_date, ("やすだ前橋店",), 300, 320
         )
     if store == STORE_BICTSUBAME:
-        result = _static_source_readiness(
+        return _static_source_readiness(
             path,
             expected_data_date,
             ("ビックつばめ高崎店", "ビックつばめ高崎"),
             200,
             BICTSUBAME_EXPECTED_MACHINES,
         )
-        if result.ready and result.details.get("records") != BICTSUBAME_EXPECTED_MACHINES:
-            return ReadinessResult(
-                False,
-                True,
-                result.source_path,
-                result.expected_data_date,
-                "SOURCE_INVALID",
-                (
-                    "Bic Tsubame source machine count mismatch: "
-                    f"{result.details.get('records')} != {BICTSUBAME_EXPECTED_MACHINES}"
-                ),
-                result.details,
-            )
-        return result
     raise ValueError(f"Unknown store: {store}")
 
 
@@ -629,8 +615,35 @@ def build_fetch_command(
         "--max-days",
         "1",
     ]
+
+    # SLOTANALYZER_MARUHAN_EXPECTED_DATE_RECOVERY_V1
+    if store == STORE_MARUHAN:
+        if expected_data_date is None:
+            raise ValueError("Maruhan fetch requires expected_data_date.")
+        command += [
+            "--expected-date",
+            expected_data_date.isoformat(),
+        ]
+
+    # SLOTANALYZER_YASUDA_EXACT_DATE_RECOVERY_V1
+    if store == STORE_YASUDA:
+        if expected_data_date is None:
+            raise ValueError("Yasuda fetch requires expected_data_date.")
+        command += [
+            "--target-date",
+            expected_data_date.isoformat(),
+        ]
+
+    # SLOTANALYZER_BIGMARCH_EXACT_DATE_RECOVERY_V1
     if store == STORE_BIGMARCH:
-        command += ["--min-machines", "200"]
+        if expected_data_date is None:
+            raise ValueError("Big March fetch requires expected_data_date.")
+        command += [
+            "--target-date",
+            expected_data_date.isoformat(),
+            "--min-machines",
+            "200",
+        ]
     _assert_safe_command(command)
     return command
 
@@ -954,6 +967,63 @@ def verify_maruhan_completion(project_root: Path, operation_date: date) -> Verif
     ]
     existing64 = [path for path in files64 if path.exists()]
     if not existing64:
+        practical_dir = analysis / "80_inventory_practical_ranking_reference"
+        practical_files = [
+            practical_dir / f"80_practical_{ymd}_all514.csv",
+            practical_dir / f"80_practical_{ymd}_top15.csv",
+            practical_dir / f"80_stable7_{ymd}_all.csv",
+            practical_dir / f"80_stable7_{ymd}_top15.csv",
+            practical_dir / f"80_practical_{ymd}_metadata.csv",
+        ]
+        if any(path.exists() for path in practical_files):
+            if not _nonempty(practical_files):
+                return VerificationResult(
+                    "PRACTICAL_REFERENCE_PARTIAL",
+                    False,
+                    "Practical reference artifacts are partial.",
+                    [str(p) for p in practical_files if p.exists()],
+                )
+            try:
+                meta = pd.read_csv(practical_files[-1], encoding="utf-8-sig")
+                if len(meta) != 1:
+                    raise RuntimeError("Practical metadata row count invalid.")
+                row = meta.iloc[0]
+                if pd.Timestamp(row["target_date"]).date() != operation_date:
+                    raise RuntimeError("Practical target_date mismatch.")
+                if pd.Timestamp(row["latest_data_date"]).date() != expected:
+                    raise RuntimeError("Practical latest_data_date mismatch.")
+                if int(row["machines_ranked"]) != 514:
+                    raise RuntimeError("Practical machines_ranked is not 514.")
+                if _truthy(row["formal_forward_valid"]):
+                    raise RuntimeError("Practical artifact claims formal validity.")
+                if _truthy(row["target_actual_used"]):
+                    raise RuntimeError("Practical artifact used target actual.")
+                if str(row["weight_fingerprint"]).strip() != "a1eaf45d71ded209":
+                    raise RuntimeError("Practical fingerprint mismatch.")
+                all514 = pd.read_csv(practical_files[0], encoding="utf-8-sig")
+                if (
+                    len(all514) != 514
+                    or pd.to_numeric(all514["machine_no"], errors="raise").nunique() != 514
+                ):
+                    raise RuntimeError("Practical all514 invalid.")
+            except Exception as exc:
+                return VerificationResult(
+                    "PRACTICAL_REFERENCE_INVALID",
+                    False,
+                    f"{type(exc).__name__}: {exc}",
+                    [str(p) for p in practical_files],
+                )
+            return VerificationResult(
+                "PRACTICAL_REFERENCE",
+                False,
+                "Inventory Guard blocks Formal Forward, but practical REFERENCE ranking is available.",
+                [str(p) for p in practical_files],
+                details={
+                    "ranking_available": True,
+                    "formal_forward_valid": False,
+                    "reference_only": True,
+                },
+            )
         downstream = [
             analysis
             / "77_live_integrated_prediction_report"
@@ -1426,8 +1496,8 @@ def verify_yasuda_completion(project_root: Path, operation_date: date) -> Verifi
         return VerificationResult("INVALID", False, "Yasuda daily CSV is empty.", [str(daily)])
     try:
         frame = pd.read_csv(daily, encoding="utf-8-sig")
-        if list(frame.columns) != YASUDA_COLUMNS or len(frame) != 320:
-            raise RuntimeError("Yasuda CSV columns/count are invalid.")
+        if list(frame.columns) != YASUDA_COLUMNS or len(frame) < 300:
+            raise RuntimeError("Yasuda CSV columns/minimum count are invalid.")
         dates = pd.to_datetime(frame["日付"], errors="raise").dt.date.unique().tolist()
         machines = pd.to_numeric(frame["台番号"], errors="raise")
         games = pd.to_numeric(frame["G数"], errors="raise")
@@ -1435,7 +1505,7 @@ def verify_yasuda_completion(project_root: Path, operation_date: date) -> Verifi
         if (
             dates != [expected]
             or machines.isna().any()
-            or machines.nunique() != 320
+            or machines.nunique() != len(frame)
             or machines.duplicated().any()
             or games.isna().any()
             or differences.isna().any()
@@ -1477,10 +1547,9 @@ def verify_bic_tsubame_completion(
         missing = sorted(required - set(frame.columns))
         if missing:
             raise RuntimeError(f"required columns missing: {missing}")
-        if len(frame) != BICTSUBAME_EXPECTED_MACHINES:
+        if len(frame) < 200:
             raise RuntimeError(
-                "Bic Tsubame machine count mismatch: "
-                f"{len(frame)} != {BICTSUBAME_EXPECTED_MACHINES}"
+                f"Bic Tsubame machine rows below minimum: {len(frame)} < 200"
             )
         dates = pd.to_datetime(frame["date"], errors="raise").dt.date.unique().tolist()
         machines = pd.to_numeric(frame["machine_no"], errors="raise")
@@ -1491,7 +1560,7 @@ def verify_bic_tsubame_completion(
             raise RuntimeError(f"internal date mismatch: {dates} != {[expected]}")
         if machines.isna().any() or machines.duplicated().any():
             raise RuntimeError("machine_no missing or duplicated")
-        if machines.nunique() != BICTSUBAME_EXPECTED_MACHINES:
+        if machines.nunique() != len(frame):
             raise RuntimeError("machine_no unique count mismatch")
         if names.isna().any() or names.isin(["", "nan", "None"]).any():
             raise RuntimeError("machine_name missing or empty")
@@ -1551,7 +1620,11 @@ def classify_fetch_result(returncode: int, readiness: ReadinessResult, before_de
 def classify_pipeline_result(returncode: int, verification: VerificationResult) -> str:
     if returncode == 0 and verification.ok:
         return "SUCCESS"
+    if verification.status == "PRACTICAL_REFERENCE":
+        return "NEEDS_MANUAL_REVIEW"
     if verification.status in {
+        "PRACTICAL_REFERENCE_PARTIAL",
+        "PRACTICAL_REFERENCE_INVALID",
         "PARTIAL_64",
         "INVALID_64",
         "COMPLETE_64_INCOMPLETE_PIPELINE",

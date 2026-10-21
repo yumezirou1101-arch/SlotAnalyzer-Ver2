@@ -8,6 +8,7 @@ from slotanalyzer_inventory_guard import (
     InventoryDiff,
     InventoryGuardPolicy,
     _atomic_write_state,
+    _clear_persistent_state,
     _is_explicitly_approved,
     _read_persistent_state,
     _same_change,
@@ -23,7 +24,7 @@ POLICY_VERSION = "BIGMARCH_GUARD_V1"
 
 BIGMARCH_TAKASAKI_OYAGI_POLICY = InventoryGuardPolicy(
     store="BIGMARCH_TAKASAKI_OYAGI",
-    known_change_dates=frozenset(),
+    known_change_dates=frozenset({date(2026, 10, 6)}),
     confirmed_inventory_prefix="bigmarch_oyagi_inventory",
     daily_inventory_pattern="ana_slo_bigmarch_oyagi_{ymd}.csv",
 )
@@ -681,6 +682,30 @@ def assess_big_march_inventory_guard(
             ),
         )
 
+    # Block target-day ranking on a registered inventory-change date.
+    if operation_date in BIGMARCH_TAKASAKI_OYAGI_POLICY.known_change_dates:
+        persistent_state = _persist_known_change_unconfirmed(
+            data_dir, operation_date, latest_data_date, persistent_state
+        )
+        return _blocked_decision(
+            status="BLOCKED_TARGET_DAY_KNOWN_CHANGE_UNCONFIRMED",
+            reason=(
+                "Today is a known Big March inventory-change date "
+                f"({operation_date.isoformat()}); Formal, PROVISIONAL, and "
+                "STALE_REFERENCE are forbidden until actual inventory confirms "
+                "the machine mapping."
+            ),
+            operation_date=operation_date,
+            expected_data_date=expected_data_date,
+            latest_data_date=latest_data_date,
+            source_delay_days=source_delay_days,
+            known_change_date=True,
+            comparison_status="TARGET_DAY_KNOWN_CHANGE_UNCONFIRMED",
+            monitor_status=monitor_status,
+            comparison=None,
+            persistent_state=persistent_state,
+        )
+
     # Any known inventory-change date after the
     # latest available daily inventory makes the
     # machine mapping untrusted until that change
@@ -881,6 +906,15 @@ def assess_big_march_inventory_guard(
                 persistent_state
             ),
         )
+
+    if (
+        not comparison.has_changes
+        and persistent_state.get("status") == "BLOCKED"
+        and persistent_state.get("incident_kind") == "KNOWN_CHANGE_UNCONFIRMED"
+        and persistent_state.get("change_date") == comparison.current_date
+    ):
+        _clear_persistent_state(state_path)
+        persistent_state = {}
 
     if comparison.has_changes:
         approved_same_change = (

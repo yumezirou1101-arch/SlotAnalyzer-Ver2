@@ -26,12 +26,16 @@ class InventoryGuardPolicy:
 # Store policy is separate from reusable inventory comparison/state logic.
 MARUHAN_MAEBASHI_POLICY = InventoryGuardPolicy(
     store="MARUHAN_MAEBASHI",
-    known_change_dates=frozenset(),
+    known_change_dates=frozenset({date(2026, 10, 6)}),
     confirmed_inventory_prefix="maruhan_inventory",
 )
 YASUDA_MAEBASHI_POLICY = InventoryGuardPolicy(
     store="YASUDA_MAEBASHI",
     daily_inventory_pattern="ana_slo_{ymd}.csv",
+)
+BICTSUBAME_TAKASAKI_POLICY = InventoryGuardPolicy(
+    store="BICTSUBAME_TAKASAKI",
+    daily_inventory_pattern="ana_slo_bic_tsubame_takasaki_{ymd}.csv",
 )
 KNOWN_INVENTORY_CHANGE_DATES = MARUHAN_MAEBASHI_POLICY.known_change_dates
 
@@ -394,13 +398,30 @@ def _atomic_write_state(path: Path, value: dict) -> None:
             temporary.unlink()
 
 
-def _state_for_change(policy: InventoryGuardPolicy, diff: InventoryDiff) -> dict:
+def _clear_persistent_state(path: Path) -> None:
+    # Clear only a planned hold after actual consecutive evidence proves no change.
+    path = Path(path)
+    if path.exists():
+        path.unlink()
+
+
+def _state_for_change(
+    policy: InventoryGuardPolicy,
+    diff: InventoryDiff,
+    *,
+    scheduled_change_date: date | None = None,
+) -> dict:
     return {
         "version": 1,
         "incident_kind": "ACTUAL_CHANGE",
         "store": policy.store,
         "detected_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        # Backward-compatible observed change date.
         "change_date": diff.current_date,
+        "observed_inventory_date": diff.current_date,
+        "scheduled_change_date": (
+            scheduled_change_date.isoformat() if scheduled_change_date is not None else ""
+        ),
         "previous_date": diff.previous_date,
         "previous_machine_count": diff.previous_machine_count,
         "current_machine_count": diff.current_machine_count,
@@ -423,7 +444,10 @@ def _state_for_unconfirmed_known_change(
         "incident_kind": "KNOWN_CHANGE_UNCONFIRMED",
         "store": policy.store,
         "detected_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        # Backward-compatible scheduled operational date.
         "change_date": target_date.isoformat(),
+        "scheduled_change_date": target_date.isoformat(),
+        "observed_inventory_date": "",
         "target_date": target_date.isoformat(),
         "latest_data_date": latest_data_date.isoformat(),
         "reason": "Known inventory change date has no confirmed target inventory.",
@@ -506,13 +530,42 @@ def assess_inventory_guard(
         )
         if same_blocked_change:
             return blocked_result(reason, comparison)
-        planned_incident_now_confirmed_by_actual = (
+        scheduled_value = str(
+            persistent_state.get("scheduled_change_date")
+            or persistent_state.get("change_date")
+            or ""
+        ).strip()
+        planned_incident_now_confirmed_by_actual = False
+        scheduled_date_value: date | None = None
+        if (
             persistent_state.get("status") == "BLOCKED"
             and persistent_state.get("incident_kind") == "KNOWN_CHANGE_UNCONFIRMED"
-            and persistent_state.get("change_date") == comparison.current_date
-        )
+            and scheduled_value
+        ):
+            try:
+                scheduled_date_value = date.fromisoformat(scheduled_value)
+            except ValueError:
+                scheduled_date_value = None
+            if scheduled_date_value is not None:
+                observed_date_value = date.fromisoformat(comparison.current_date)
+                # A scheduled change may first appear in the public daily data
+                # on the scheduled date or the immediately preceding data date.
+                # Association enriches the blocked incident only; it never
+                # approves or releases the guard.
+                planned_incident_now_confirmed_by_actual = (
+                    observed_date_value == scheduled_date_value
+                    or (
+                        observed_date_value == scheduled_date_value - timedelta(days=1)
+                        and target_date == scheduled_date_value
+                        and latest_data_date == observed_date_value
+                    )
+                )
         if planned_incident_now_confirmed_by_actual:
-            persistent_state = _state_for_change(policy, comparison)
+            persistent_state = _state_for_change(
+                policy,
+                comparison,
+                scheduled_change_date=scheduled_date_value,
+            )
             _atomic_write_state(state_path, persistent_state)
             return blocked_result(reason, comparison)
         if persistent_state and not _is_explicitly_approved(persistent_state):
@@ -546,6 +599,13 @@ def assess_inventory_guard(
             )
             if blocked is not None:
                 return blocked
+        elif (
+            persistent_state.get("status") == "BLOCKED"
+            and persistent_state.get("incident_kind") == "KNOWN_CHANGE_UNCONFIRMED"
+            and persistent_state.get("change_date") == comparison.current_date
+        ):
+            _clear_persistent_state(state_path)
+            persistent_state = {}
 
     if known_change and not confirmed_exists:
         same_planned_block = (
@@ -623,39 +683,47 @@ def enforce_inventory_guard(
     return result
 
 
-def assess_yasuda_inventory_guard(
+def _assess_fixed_baseline_inventory_guard(
     data_dir: Path,
     target_date: date,
     latest_data_date: date,
+    *,
+    policy: InventoryGuardPolicy,
+    default_machine_count: int,
+    policy_version: str,
 ) -> InventoryGuardResult:
-    """Y1 guard: enforce continuity only for validated 320-machine dailies."""
     data_dir = Path(data_dir)
     target_date = date.fromisoformat(str(target_date))
     latest_data_date = date.fromisoformat(str(latest_data_date))
+
+    generic = assess_inventory_guard(data_dir, target_date, latest_data_date, policy)
+    if generic.blocked:
+        return generic
+
     available_previous = []
-    for path in data_dir.glob("ana_slo_????????.csv"):
-        match = re.fullmatch(r"ana_slo_(\d{8})\.csv", path.name)
-        if match:
-            candidate = datetime.strptime(match.group(1), "%Y%m%d").date()
-            if candidate < latest_data_date:
-                available_previous.append((candidate, path))
+    pattern = policy.daily_inventory_pattern.replace("{ymd}", "????????")
+    for path in data_dir.glob(pattern):
+        match = re.search(r"(\d{8})", path.name)
+        if not match:
+            continue
+        candidate = datetime.strptime(match.group(1), "%Y%m%d").date()
+        if candidate < latest_data_date:
+            available_previous.append((candidate, path))
+
     if available_previous:
         previous_date, previous_path = max(available_previous)
     else:
         previous_date = latest_data_date - timedelta(days=1)
-        previous_path = daily_inventory_path(
-            data_dir, previous_date, YASUDA_MAEBASHI_POLICY
-        )
-    current_path = daily_inventory_path(data_dir, latest_data_date, YASUDA_MAEBASHI_POLICY)
-    state_path = inventory_guard_state_path(data_dir)
-    persistent_state = _read_persistent_state(state_path, YASUDA_MAEBASHI_POLICY)
+        previous_path = daily_inventory_path(data_dir, previous_date, policy)
+
+    current_path = daily_inventory_path(data_dir, latest_data_date, policy)
     evidence = inspect_inventory_transition(
-        YASUDA_MAEBASHI_POLICY.store,
+        policy.store,
         previous_path,
         current_path,
         previous_date,
         latest_data_date,
-        policy_version="YASUDA_Y1_V1",
+        policy_version=policy_version,
         mode="ENFORCE",
     )
     comparison = None
@@ -669,66 +737,98 @@ def assess_yasuda_inventory_guard(
             removed_machine_numbers=list(evidence.removed_machine_numbers or []),
             renamed_machine_numbers=list(evidence.renamed_machine_numbers or []),
         )
-    if (
-        not evidence.comparison_performed
-        or evidence.previous_machine_count != 320
-        or evidence.current_machine_count != 320
-    ):
+
+    persistent_state = generic.persistent_state
+    if not evidence.comparison_performed or comparison is None:
         reason = (
             "Inventory comparison is non-consecutive."
             if evidence.comparison_status == "NON_CONSECUTIVE"
-            else "Inventory comparison is unavailable or outside the validated 320-machine baseline."
+            else "Inventory comparison is unavailable or invalid."
         )
         return InventoryGuardResult(
             status="MANUAL_REVIEW", blocked=True,
             reason=f"{reason} comparison_status={evidence.comparison_status}",
             target_date=target_date.isoformat(),
             latest_data_date=latest_data_date.isoformat(),
-            known_change_date=False,
+            known_change_date=target_date in policy.known_change_dates,
             confirmed_target_inventory_path="",
             confirmed_target_inventory_exists=False,
             comparison=comparison,
             persistent_state=persistent_state,
         )
-    if comparison is not None and comparison.has_changes:
-        if not (_is_explicitly_approved(persistent_state) and _same_change(persistent_state, comparison)):
-            if not (
-                persistent_state.get("status") == "BLOCKED"
-                and _same_change(persistent_state, comparison)
-            ):
-                persistent_state = _state_for_change(YASUDA_MAEBASHI_POLICY, comparison)
-                _atomic_write_state(state_path, persistent_state)
-            return InventoryGuardResult(
-                status="MANUAL_REVIEW", blocked=True,
-                reason="Inventory change detected; explicit safety approval is required.",
-                target_date=target_date.isoformat(),
-                latest_data_date=latest_data_date.isoformat(),
-                known_change_date=False,
-                confirmed_target_inventory_path="",
-                confirmed_target_inventory_exists=False,
-                comparison=comparison,
-                persistent_state=persistent_state,
-            )
-    if persistent_state and not _is_explicitly_approved(persistent_state):
+
+    approved_same_change = (
+        comparison.has_changes
+        and _is_explicitly_approved(persistent_state)
+        and _same_change(persistent_state, comparison)
+    )
+    baseline_count = default_machine_count
+    if _is_explicitly_approved(persistent_state):
+        try:
+            baseline_count = int(persistent_state["current_machine_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Approved Inventory Guard state has no valid current_machine_count."
+            ) from exc
+
+    if not approved_same_change and (
+        comparison.previous_machine_count != baseline_count
+        or comparison.current_machine_count != baseline_count
+    ):
         return InventoryGuardResult(
             status="MANUAL_REVIEW", blocked=True,
-            reason="Inventory change remains blocked because explicit approval has not been recorded.",
+            reason=(
+                "Inventory comparison is outside the validated machine-count "
+                f"baseline ({baseline_count})."
+            ),
             target_date=target_date.isoformat(),
             latest_data_date=latest_data_date.isoformat(),
-            known_change_date=False,
+            known_change_date=target_date in policy.known_change_dates,
             confirmed_target_inventory_path="",
             confirmed_target_inventory_exists=False,
             comparison=comparison,
             persistent_state=persistent_state,
         )
+
     return InventoryGuardResult(
         status="PASS", blocked=False,
-        reason="Validated consecutive 320-machine inventories have no unapproved change.",
+        reason="Consecutive inventory transition has no unapproved change.",
         target_date=target_date.isoformat(),
         latest_data_date=latest_data_date.isoformat(),
-        known_change_date=False,
+        known_change_date=target_date in policy.known_change_dates,
         confirmed_target_inventory_path="",
         confirmed_target_inventory_exists=False,
         comparison=comparison,
         persistent_state=persistent_state,
     )
+
+
+def assess_yasuda_inventory_guard(
+    data_dir: Path,
+    target_date: date,
+    latest_data_date: date,
+) -> InventoryGuardResult:
+    return _assess_fixed_baseline_inventory_guard(
+        data_dir,
+        target_date,
+        latest_data_date,
+        policy=YASUDA_MAEBASHI_POLICY,
+        default_machine_count=320,
+        policy_version="YASUDA_Y2_V1",
+    )
+
+
+def assess_bic_tsubame_inventory_guard(
+    data_dir: Path,
+    target_date: date,
+    latest_data_date: date,
+) -> InventoryGuardResult:
+    return _assess_fixed_baseline_inventory_guard(
+        data_dir,
+        target_date,
+        latest_data_date,
+        policy=BICTSUBAME_TAKASAKI_POLICY,
+        default_machine_count=517,
+        policy_version="BICTSUBAME_B1_V1",
+    )
+

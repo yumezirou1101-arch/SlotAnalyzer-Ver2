@@ -212,7 +212,25 @@ def parse_args():
         help="Overwrite existing ana_slo_YYYYMMDD_source.html files.",
     )
 
-    return parser.parse_args()
+    parser.add_argument(
+        "--expected-date",
+        default=None,
+        help=(
+            "Optional exact expected data date YYYY-MM-DD. "
+            "Morning Automation uses this mode so an older visible date cannot "
+            "be reported as a successful fetch."
+        ),
+    )
+
+    args = parser.parse_args()
+    if args.expected_date is not None:
+        try:
+            parsed = datetime.strptime(args.expected_date, "%Y-%m-%d")
+        except ValueError:
+            parser.error("--expected-date must be YYYY-MM-DD")
+        if parsed.strftime("%Y-%m-%d") != args.expected_date:
+            parser.error("--expected-date must be YYYY-MM-DD")
+    return args
 
 
 async def safe_title(page) -> str:
@@ -460,6 +478,71 @@ async def collect_date_links(page):
         key=lambda item: item["date"],
         reverse=True,
     )
+
+
+# SLOTANALYZER_MARUHAN_EXPECTED_DATE_RECOVERY_V1
+async def disable_http_cache_for_page(context, page) -> bool:
+    try:
+        session = await context.new_cdp_session(page)
+        await session.send("Network.enable")
+        await session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        await page.set_extra_http_headers(
+            {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+        )
+        print("cache recovery         : DISABLED")
+        return True
+    except Exception as exc:
+        print(f"cache recovery warning : {type(exc).__name__}: {exc}")
+        return False
+
+
+def select_exact_date_item(date_links, expected_date: str):
+    for item in date_links:
+        if item.get("date") == expected_date:
+            return item
+    return None
+
+
+async def recover_expected_date_link(context, page, expected_date: str):
+    """
+    Bounded deterministic recovery:
+    current DOM -> same-tab no-cache -> fresh-tab no-cache.
+    Older dates are never substituted for expected_date.
+    """
+    links = await collect_date_links(page)
+    item = select_exact_date_item(links, expected_date)
+    if item is not None:
+        return page, item, links, "INITIAL"
+
+    newest = links[0]["date"] if links else "NONE"
+    print(f"expected date          : {expected_date}")
+    print(f"newest visible date    : {newest}")
+    print("expected-date recovery : SAME_TAB_NO_CACHE")
+
+    await disable_http_cache_for_page(context, page)
+    try:
+        await navigate_to_list(page)
+    except Exception as exc:
+        print(f"same-tab recovery warn : {type(exc).__name__}: {exc}")
+
+    links = await collect_date_links(page)
+    item = select_exact_date_item(links, expected_date)
+    if item is not None:
+        return page, item, links, "SAME_TAB_NO_CACHE"
+
+    newest = links[0]["date"] if links else "NONE"
+    print(f"newest after same tab  : {newest}")
+    print("expected-date recovery : FRESH_TAB_NO_CACHE")
+
+    fresh = await context.new_page()
+    await disable_http_cache_for_page(context, fresh)
+    await navigate_to_list(fresh)
+    links = await collect_date_links(fresh)
+    item = select_exact_date_item(links, expected_date)
+    if item is not None:
+        return fresh, item, links, "FRESH_TAB_NO_CACHE"
+
+    return fresh, None, links, "EXHAUSTED"
 
 
 async def find_link_by_date(
@@ -979,9 +1062,43 @@ async def main():
                 "DOM is accessible, but no visible daily date links were detected."
             )
 
-        selected = date_links[
-            :args.max_days
-        ]
+        if args.expected_date is not None:
+            page, expected_item, date_links, recovery_method = (
+                await recover_expected_date_link(
+                    context,
+                    page,
+                    args.expected_date,
+                )
+            )
+            print(f"expected date          : {args.expected_date}")
+            print(f"recovery method        : {recovery_method}")
+
+            if expected_item is None:
+                newest_visible = date_links[0]["date"] if date_links else "NONE"
+                reason = (
+                    f"Expected date {args.expected_date} is not visible "
+                    f"after bounded recovery; newest visible={newest_visible}."
+                )
+                logs = [
+                    blank_log_row(
+                        args.expected_date,
+                        "EXPECTED_DATE_NOT_VISIBLE",
+                        reason,
+                    )
+                ]
+                log_path = save_log(logs)
+                print()
+                print("FINAL RESULT          : EXPECTED_DATE_NOT_VISIBLE")
+                print(f"expected date         : {args.expected_date}")
+                print(f"newest visible date   : {newest_visible}")
+                print(f"log                   : {log_path}")
+                print("An older source was NOT accepted as success.")
+                await browser.close()
+                raise SystemExit(3)
+
+            selected = [expected_item]
+        else:
+            selected = date_links[:args.max_days]
 
         print(
             f"dates selected        : {len(selected)}"
