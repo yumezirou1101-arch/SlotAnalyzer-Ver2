@@ -1,0 +1,36 @@
+name: SlotAnalyzer safety syntax
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Check source syntax without executing production code
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          paths = [
+              Path("run_slotanalyzer_morning_automation.py"),
+              Path("machine_number/slotanalyzer_inventory_guard.py"),
+              Path("machine_number/ana_slo_prediction_v4_2_machine_number_position_ablation_oos.py"),
+          ]
+          for path in paths:
+              if not path.is_file():
+                  raise SystemExit(f"MISSING_CRITICAL_FILE: {path}")
+              ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+              print(f"SYNTAX_OK: {path}")
+          print("ALL_CRITICAL_SYNTAX_CHECKS_PASS")
+          PY
