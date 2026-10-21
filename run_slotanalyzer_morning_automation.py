@@ -53,8 +53,13 @@ from slotanalyzer_morning_automation_support import (  # noqa: E402
 )
 from slotanalyzer_morning_notification import notify_terminal_stores_best_effort  # noqa: E402
 from slotanalyzer_inventory_guard import (  # noqa: E402
+    assess_bic_tsubame_inventory_guard,
     assess_inventory_guard,
     assess_yasuda_inventory_guard,
+)
+from slotanalyzer_manual_review_auto_triage import (
+    assess_manual_review_auto_triage,
+    not_applicable_triage,
 )
 from slotanalyzer_inventory_monitor import (  # noqa: E402
     load_inventory_monitor_evidence,
@@ -87,13 +92,21 @@ HISTORY_FIELDS = [
 
 SCHEMA_VERSION = 1
 DEFAULT_RETRY_INTERVAL_SEC = 300
+MARUHAN_RETRY_INTERVAL_SEC = 60
 DEFAULT_MAX_FETCH_ATTEMPTS = 20
+MARUHAN_MAX_FETCH_ATTEMPTS = 30
 DEFAULT_CHROME_WAIT_SEC = 15
 DEFAULT_FETCH_TIMEOUT_SEC = 120
 PROVISIONAL_MARUHAN_LAST_START = datetime_time(8, 30)
-OTHER_STORE_DEADLINE = datetime_time(9, 30)
+MORNING_FINALIZE_DEADLINE = datetime_time(8, 30)
+OTHER_STORE_DEADLINE = MORNING_FINALIZE_DEADLINE
 SLEEP_HELPER_PATH = PROJECT_ROOT / "sleep_windows_after_delay.py"
 SLEEP_HELPER_DELAY_SEC = 10
+MARUHAN_E2E_CHECKER_PATH = (
+    MACHINE_DIR / "slotanalyzer_morning_natural_e2e_check.py"
+)
+MARUHAN_E2E_LOG_DIR = LOG_ROOT / "e2e_checks"
+MARUHAN_E2E_TIMEOUT_SEC = 60
 WRAPPER_SUCCESS_STATUSES = frozenset({"SUCCESS", "ALREADY_COMPLETE", "PROVISIONAL", "STALE_REFERENCE"})
 SLEEP_ELIGIBLE_STATUSES = frozenset({"SUCCESS", "ALREADY_COMPLETE"})
 
@@ -276,7 +289,7 @@ def _mark_deadline(store_state: dict, store: str, current: datetime) -> None:
         )
     else:
         store_state["error_category"] = "DEADLINE_EXPIRED"
-        store_state["error"] = "09:30 JST retry deadline has passed."
+        store_state["error"] = "08:30 JST morning finalize deadline has passed."
 
 
 def _has_big_or_yasuda_completion_artifact(
@@ -542,6 +555,29 @@ def reconcile_startup_state(
                         error_category="INVENTORY_GUARD_BLOCKED",
                         error=inventory_guard.summary(),
                         verified_artifacts=yasuda_verification.artifacts,
+                        last_completed_at_jst=current.isoformat(),
+                        next_retry_at_jst="",
+                    )
+                    continue
+        if store == STORE_BICTSUBAME:
+            bic_verification = verify_store_completion(store, project_root, operation_date)
+            if (
+                bic_verification.ok
+                and store_state["status"] in {"SUCCESS", "ALREADY_COMPLETE"}
+            ):
+                inventory_guard = assess_bic_tsubame_inventory_guard(
+                    project_root / "data/bic_tsubame_takasaki/machine_number",
+                    operation_date,
+                    operation_date - timedelta(days=1),
+                )
+                store_state["inventory_guard"] = inventory_guard.to_dict()
+                if inventory_guard.blocked:
+                    store_state.update(
+                        status="NEEDS_MANUAL_REVIEW",
+                        current_stage="INVENTORY_GUARD",
+                        error_category="INVENTORY_GUARD_BLOCKED",
+                        error=inventory_guard.summary(),
+                        verified_artifacts=bic_verification.artifacts,
                         last_completed_at_jst=current.isoformat(),
                         next_retry_at_jst="",
                     )
@@ -1373,9 +1409,10 @@ def _process_store(
                     state, state_path, operation_date, current, clock
                 )
                 return
-        _mark_deadline(store_state, store, current)
-        save_state(state_path, state, current)
-        return
+        else:
+            _mark_deadline(store_state, store, current)
+            save_state(state_path, state, current)
+            return
 
     readiness = check_source_readiness(store, PROJECT_ROOT, expected_data_date)
     store_state["current_stage"] = "READINESS"
@@ -1399,7 +1436,7 @@ def _process_store(
             current, clock,
         ):
             return
-        if store_state["fetch_attempt_count"] >= args.max_fetch_attempts:
+        if store_state["fetch_attempt_count"] >= (MARUHAN_MAX_FETCH_ATTEMPTS if store == STORE_MARUHAN else args.max_fetch_attempts):
             store_state.update(
                 status="FAILED_FINAL",
                 error_category="FETCH_ATTEMPT_LIMIT",
@@ -1426,7 +1463,7 @@ def _process_store(
             store_state.update(
                 status="FAILED_RETRYABLE",
                 current_stage="CDP_PREFLIGHT",
-                next_retry_at_jst=(completed + timedelta(seconds=args.retry_interval_sec)).isoformat(),
+                next_retry_at_jst=(completed + timedelta(seconds=(MARUHAN_RETRY_INTERVAL_SEC if store == STORE_MARUHAN else args.retry_interval_sec))).isoformat(),
                 error_category="CDP_PREFLIGHT_FAILED",
                 error=f"{type(exc).__name__}: {exc}",
                 last_completed_at_jst=completed.isoformat(),
@@ -1465,8 +1502,9 @@ def _process_store(
         readiness = check_source_readiness(store, PROJECT_ROOT, expected_data_date)
         current = clock().astimezone(JST)
         store_state["last_readiness"] = readiness.to_dict()
+        fetch_window_open = _deadline_open(store, current, operation_date)
         classification = classify_fetch_result(
-            result.returncode, readiness, _deadline_open(store, current, operation_date)
+            result.returncode, readiness, fetch_window_open
         )
         _record_history(
             state,
@@ -1491,7 +1529,7 @@ def _process_store(
                 status=classification,
                 current_stage="FETCH",
                 returncode=result.returncode,
-                next_retry_at_jst=(current + timedelta(seconds=args.retry_interval_sec)).isoformat(),
+                next_retry_at_jst=(current + timedelta(seconds=(MARUHAN_RETRY_INTERVAL_SEC if store == STORE_MARUHAN else args.retry_interval_sec))).isoformat(),
                 error_category=(
                     "EXPECTED_SOURCE_NOT_READY" if result.returncode == 0 else "FETCH_NONZERO"
                 ),
@@ -1512,6 +1550,10 @@ def _process_store(
             expected_data_date,
         )
         store_state["inventory_guard"] = inventory_guard.to_dict()
+        store_state["auto_triage"] = not_applicable_triage(
+            store=store, operation_date=operation_date,
+            reason="Maruhan is excluded from MANUAL_REVIEW Auto-Triage V1.",
+        )
         # The one-click child performs the authoritative stop after fetch,
         # conversion, and Freshness, but before 69/63/79. Keeping this
         # preflight result in state makes the reason visible while preserving
@@ -1523,6 +1565,10 @@ def _process_store(
             current,
         )
         store_state["inventory_guard"] = inventory_guard
+        store_state["auto_triage"] = not_applicable_triage(
+            store=store, operation_date=operation_date,
+            reason="Big March is excluded from MANUAL_REVIEW Auto-Triage V1.",
+        )
         if not inventory_guard["formal_allowed"]:
             store_state.update(
                 status="NEEDS_MANUAL_REVIEW",
@@ -1595,6 +1641,27 @@ def _process_store(
             expected_data_date,
         )
         store_state["inventory_guard"] = inventory_guard.to_dict()
+        store_state["auto_triage"] = assess_manual_review_auto_triage(
+            store=store, data_dir=PROJECT_ROOT / "data/yasuda_maebashi/machine_number",
+            operation_date=operation_date, latest_data_date=expected_data_date,
+            inventory_guard=inventory_guard, freshness_quality_ok=verification.ok,
+            baseline_count=320, generated_at=clock().astimezone(JST),
+        )
+        if inventory_guard.blocked:
+            classification = "NEEDS_MANUAL_REVIEW"
+    elif store == STORE_BICTSUBAME and verification.ok:
+        inventory_guard = assess_bic_tsubame_inventory_guard(
+            PROJECT_ROOT / "data/bic_tsubame_takasaki/machine_number",
+            operation_date,
+            expected_data_date,
+        )
+        store_state["inventory_guard"] = inventory_guard.to_dict()
+        store_state["auto_triage"] = assess_manual_review_auto_triage(
+            store=store, data_dir=PROJECT_ROOT / "data/bic_tsubame_takasaki/machine_number",
+            operation_date=operation_date, latest_data_date=expected_data_date,
+            inventory_guard=inventory_guard, freshness_quality_ok=verification.ok,
+            baseline_count=517, generated_at=clock().astimezone(JST),
+        )
         if inventory_guard.blocked:
             classification = "NEEDS_MANUAL_REVIEW"
     elif store == STORE_BIGMARCH and verification.ok:
@@ -1604,6 +1671,10 @@ def _process_store(
             clock().astimezone(JST),
         )
         store_state["inventory_guard"] = big_march_guard
+        store_state["auto_triage"] = not_applicable_triage(
+            store=store, operation_date=operation_date,
+            reason="Big March is excluded from MANUAL_REVIEW Auto-Triage V1.",
+        )
         if not big_march_guard["formal_allowed"]:
             classification = "NEEDS_MANUAL_REVIEW"
             inventory_guard = big_march_guard
@@ -1715,13 +1786,25 @@ def should_sleep_on_success(
     )
 
 
+def _wrapper_store_result_is_nonfatal(item: dict) -> bool:
+    if item.get("status") in WRAPPER_SUCCESS_STATUSES:
+        return True
+
+    return (
+        item.get("status") == "NEEDS_MANUAL_REVIEW"
+        and item.get("current_stage") == "INVENTORY_GUARD"
+        and item.get("error_category") == "INVENTORY_GUARD_BLOCKED"
+    )
+
+
 def wrapper_returncode_for(state: dict) -> int:
     try:
         required_store_states = [state["stores"][store] for store in STORE_ORDER]
     except (KeyError, TypeError):
         return 1
+
     return 0 if all(
-        item.get("status") in WRAPPER_SUCCESS_STATUSES
+        _wrapper_store_result_is_nonfatal(item)
         for item in required_store_states
     ) else 1
 
@@ -1798,6 +1881,82 @@ def flush_output_streams() -> None:
     sys.stderr.flush()
 
 
+
+def run_maruhan_natural_e2e_check_best_effort(
+    operation_date: str,
+    *,
+    runner=subprocess.run,
+) -> bool:
+    """Run read-only Maruhan Natural E2E check and persist stdout/stderr."""
+    try:
+        target_date = date.fromisoformat(operation_date)
+    except ValueError as exc:
+        print(
+            f"WARNING: Maruhan Natural E2E skipped: invalid operation_date: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+    if not MARUHAN_E2E_CHECKER_PATH.is_file():
+        print(
+            f"WARNING: Maruhan Natural E2E checker missing: "
+            f"{MARUHAN_E2E_CHECKER_PATH}",
+            file=sys.stderr,
+        )
+        return False
+
+    MARUHAN_E2E_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = MARUHAN_E2E_LOG_DIR / f"maruhan_e2e_{target_date:%Y%m%d}.log"
+    command = [
+        sys.executable,
+        str(MARUHAN_E2E_CHECKER_PATH),
+        "--operation-date",
+        target_date.isoformat(),
+        "--write-report",
+    ]
+
+    try:
+        completed = runner(
+            command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=MARUHAN_E2E_TIMEOUT_SEC,
+            check=False,
+        )
+    except Exception as exc:
+        log_path.write_text(
+            f"E2E_RUNNER_ERROR={type(exc).__name__}: {exc}\\n",
+            encoding="utf-8",
+        )
+        print(
+            f"WARNING: Maruhan Natural E2E runner failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+    payload = (
+        f"returncode={completed.returncode}\\n"
+        "--- stdout ---\\n"
+        f"{completed.stdout or ''}"
+        "\\n--- stderr ---\\n"
+        f"{completed.stderr or ''}"
+    )
+    log_path.write_text(payload, encoding="utf-8")
+
+    if completed.returncode != 0:
+        print(
+            f"WARNING: Maruhan Natural E2E check returned "
+            f"{completed.returncode}; see {log_path}",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"Maruhan Natural E2E check PASS; log={log_path}")
+    return True
 def finalize_automation_run(
     state_path: Path,
     state: dict,
@@ -1833,6 +1992,17 @@ def finalize_automation_run(
             file=sys.stderr,
         )
     flush_function()
+    try:
+        run_maruhan_natural_e2e_check_best_effort(
+            str(state.get("operation_date", ""))
+        )
+    except Exception as exc:
+        print(
+            f"WARNING: Maruhan Natural E2E check failed unexpectedly: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+    flush_function()
     maybe_sleep_on_success(
         sleep_enabled,
         state,
@@ -1842,6 +2012,215 @@ def finalize_automation_run(
     return wrapper_returncode
 
 
+
+
+
+
+
+def _freeze_maruhan_isolated_reference_best_effort(operation_date: date) -> None:
+    """Independent reference-only freeze; no state mutation and no formal Guard approval."""
+    try:
+        now = now_jst().astimezone(JST)
+        if now.date() != operation_date or now.time().replace(tzinfo=None) >= datetime_time(9, 0):
+            return
+        # Independent reference may run while Formal Inventory Guard remains BLOCKED.
+        # The isolated freezer itself strictly verifies the exact previous-day CSV,
+        # 514 machine identities, recorded incident, and freeze time before writing.
+        # Do not gate this reference on formal completion artifacts.
+        daily = (PROJECT_ROOT / 'data/maruhan_maebashi/machine_number'
+                 / f'ana_slo_{operation_date - timedelta(days=1):%Y%m%d}.csv')
+        if not daily.is_file():
+            print('MARUHAN_ISOLATED: SKIP expected daily source missing')
+            return
+        script = PROJECT_ROOT / 'slotanalyzer_maruhan_isolated_prospective_freeze_v1.py'
+        if not script.is_file():
+            print('MARUHAN_ISOLATED: SKIP freezer missing', file=sys.stderr)
+            return
+        destination = (PROJECT_ROOT / 'data/maruhan_maebashi/machine_number'
+                       / 'analysis_isolated_prospective_reference_v1' / f'{operation_date:%Y%m%d}')
+        if destination.exists():
+            return
+        command = [sys.executable, str(script), '--root', str(PROJECT_ROOT),
+                   '--target-date', operation_date.isoformat(), '--freeze']
+        done = subprocess.run(command, cwd=str(PROJECT_ROOT), capture_output=True,
+                              text=True, encoding='utf-8', errors='replace', timeout=150, check=False)
+        if done.stdout:
+            print('MARUHAN_ISOLATED_OUTPUT: ' + done.stdout.strip().replace('\n', ' | '))
+        if done.returncode:
+            print(f'MARUHAN_ISOLATED: FAILED code={done.returncode} '
+                  + done.stderr[-1200:], file=sys.stderr)
+        else:
+            print('MARUHAN_ISOLATED: FROZEN_REFERENCE_NOT_FORMAL')
+    except Exception as exc:
+        print(f'MARUHAN_ISOLATED: ERROR {type(exc).__name__}: {exc}', file=sys.stderr)
+
+
+def _evaluate_maruhan_isolated_reference_best_effort(operation_date: date) -> None:
+    """Evaluate yesterday's pre-09:00 frozen isolated reference only; never Formal Forward."""
+    try:
+        previous = operation_date - timedelta(days=1)
+        directory = (PROJECT_ROOT / 'data/maruhan_maebashi/machine_number'
+                     / 'analysis_isolated_prospective_reference_v1' / f'{previous:%Y%m%d}')
+        if not (directory / 'freeze_manifest.json').is_file():
+            return
+        if (directory / 'evaluation_receipt_v1.json').exists():
+            return
+        script = PROJECT_ROOT / 'slotanalyzer_maruhan_isolated_auto_evaluate_v1.py'
+        if not script.is_file():
+            print('MARUHAN_ISOLATED_EVAL: SKIP evaluator missing', file=sys.stderr)
+            return
+        command = [sys.executable, str(script), '--root', str(PROJECT_ROOT),
+                   '--target-date', previous.isoformat(), '--save']
+        done = subprocess.run(command, cwd=str(PROJECT_ROOT), capture_output=True,
+                              text=True, encoding='utf-8', errors='replace', timeout=120, check=False)
+        if done.stdout:
+            print('MARUHAN_ISOLATED_EVAL: ' + done.stdout.strip().replace('\n', ' | '))
+        if done.returncode:
+            print(f'MARUHAN_ISOLATED_EVAL: FAILED code={done.returncode} '
+                  + done.stderr[-1200:], file=sys.stderr)
+    except Exception as exc:
+        print(f'MARUHAN_ISOLATED_EVAL: ERROR {type(exc).__name__}: {exc}', file=sys.stderr)
+
+def _evaluate_maruhan_pair_reference_best_effort(operation_date: date) -> None:
+    """Evaluate yesterday's frozen reference after today's acquisition, never formal Forward."""
+    try:
+        previous = operation_date - timedelta(days=1)
+        directory = (PROJECT_ROOT / 'data/maruhan_maebashi/machine_number'
+                     / 'analysis_paired_prospective_reference_v1' / f'{previous:%Y%m%d}')
+        if not (directory / 'freeze_manifest.json').is_file():
+            return
+        if (directory / 'evaluation_receipt_v1.json').exists():
+            return
+        script = PROJECT_ROOT / 'slotanalyzer_maruhan_pair_auto_evaluate_v1.py'
+        if not script.is_file():
+            print('MARUHAN_PAIR_EVAL: SKIP evaluator missing', file=sys.stderr)
+            return
+        cmd = [sys.executable, str(script), '--root', str(PROJECT_ROOT),
+               '--target-date', previous.isoformat(), '--save']
+        done = subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True,
+                              text=True, encoding='utf-8', errors='replace', timeout=150)
+        if done.stdout:
+            print('MARUHAN_PAIR_EVAL: ' + done.stdout.strip().replace('\n',' | '))
+        if done.returncode:
+            print('MARUHAN_PAIR_EVAL: FAILED ' + done.stderr[-1000:], file=sys.stderr)
+    except Exception as exc:
+        print(f'MARUHAN_PAIR_EVAL: ERROR {type(exc).__name__}: {exc}', file=sys.stderr)
+
+def _freeze_maruhan_pair_best_effort(state: dict, operation_date: date) -> None:
+    """Independent reference-only frozen predictions; fail closed, never approve Guard."""
+    try:
+        item = state["stores"][STORE_MARUHAN]
+        if item.get("status") not in {"SUCCESS", "ALREADY_COMPLETE"}:
+            print("MARUHAN_PAIR: SKIP store not SUCCESS")
+            return
+        verified = verify_store_completion(STORE_MARUHAN, PROJECT_ROOT, operation_date)
+        if not verified.ok:
+            print("MARUHAN_PAIR: SKIP data verification failed")
+            return
+        guard = assess_inventory_guard(
+            PROJECT_ROOT / "data/maruhan_maebashi/machine_number",
+            operation_date, operation_date - timedelta(days=1),
+        )
+        if guard.blocked or guard.status != "PASS":
+            print("MARUHAN_PAIR: SKIP inventory guard blocked")
+            return
+        now = now_jst().astimezone(JST)
+        if now.date() != operation_date or now.time().replace(tzinfo=None) >= datetime_time(9, 0):
+            print("MARUHAN_PAIR: SKIP outside 09:00 freeze window")
+            return
+        script = PROJECT_ROOT / "slotanalyzer_maruhan_prospective_pair_v1.py"
+        if not script.is_file():
+            print("MARUHAN_PAIR: SKIP script missing", file=sys.stderr)
+            return
+        directory = (PROJECT_ROOT / "data/maruhan_maebashi/machine_number"
+                     / "analysis_paired_prospective_reference_v1" / f"{operation_date:%Y%m%d}")
+        if directory.exists():
+            print("MARUHAN_PAIR: SKIP prediction directory already exists")
+            return
+        command = [sys.executable, str(script), "--root", str(PROJECT_ROOT),
+                   "--target-date", operation_date.isoformat(), "--freeze"]
+        finished = subprocess.run(command, cwd=str(PROJECT_ROOT), capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=90, check=False)
+        if finished.stdout:
+            print("MARUHAN_PAIR_OUTPUT: " + finished.stdout.strip().replace("\n", " | "))
+        if finished.returncode:
+            print(f"MARUHAN_PAIR: FAILED code={finished.returncode} "
+                  + finished.stderr[-1200:], file=sys.stderr)
+        else:
+            print("MARUHAN_PAIR: FROZEN_PROSPECTIVE_REFERENCE_NOT_FORMAL")
+    except Exception as exc:
+        print(f"MARUHAN_PAIR: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+
+def _freeze_yasuda_v3_best_effort(state: dict, operation_date: date) -> None:
+    """Nonfatal prospective-reference freeze, only after verified Yasuda SUCCESS.
+
+    Does not modify store state, email status, or other stores. It cannot bypass
+    Inventory Guard or freeze after 09:00 JST. V3 script is the final authority.
+    """
+    try:
+        item = state["stores"][STORE_YASUDA]
+        if item.get("status") not in {"SUCCESS", "ALREADY_COMPLETE"}:
+            return
+        v = verify_store_completion(STORE_YASUDA, PROJECT_ROOT, operation_date)
+        if not v.ok:
+            print("YASUDA_V3: SKIP quality verification failed")
+            return
+        guard = assess_yasuda_inventory_guard(
+            PROJECT_ROOT / "data/yasuda_maebashi/machine_number",
+            operation_date, operation_date - timedelta(days=1),
+        )
+        if guard.blocked:
+            print("YASUDA_V3: SKIP inventory guard blocked")
+            return
+        current = now_jst().astimezone(JST)
+        if current.date() != operation_date or current.time().replace(tzinfo=None) >= datetime_time(9, 0):
+            print("YASUDA_V3: SKIP freeze window closed")
+            return
+        script = MACHINE_DIR / "slotanalyzer_yasuda_v3_forward_v1.py"
+        if not script.is_file():
+            print("YASUDA_V3: SKIP missing script", file=sys.stderr)
+            return
+        folder = PROJECT_ROOT / "data/yasuda_maebashi/machine_number/analysis_prospective_forward_v1" / f"{operation_date:%Y%m%d}"
+        if folder.exists():
+            print("YASUDA_V3: SKIP preexisting prediction; never overwrite")
+            return
+        command = [sys.executable, str(script), "--root", str(PROJECT_ROOT),
+                   "--target-date", operation_date.isoformat(), "--freeze"]
+        done = subprocess.run(command, cwd=str(PROJECT_ROOT), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=60,
+                              check=False)
+        if done.stdout:
+            print("YASUDA_V3_OUTPUT: " + done.stdout.strip().replace("\n", " | "))
+        if done.returncode != 0:
+            print(f"YASUDA_V3: FAILED code={done.returncode} " + done.stderr[-1200:], file=sys.stderr)
+        else:
+            print("YASUDA_V3: FROZEN_PROSPECTIVE_REFERENCE")
+    except Exception as exc:
+        print(f"YASUDA_V3: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+
+def _refresh_bic_reference_ledger(operation_date: date) -> None:
+    """Non-fatal, idempotent reference result snapshot, independent of email."""
+    import subprocess as _bic_subprocess
+    source = PROJECT_ROOT / "machine_number" / "slotanalyzer_bic_tsubame_reference_ledger_v1.py"
+    if not source.is_file():
+        print("BIC_LEDGER: MISSING_SCRIPT", file=sys.stderr)
+        return
+    command = [sys.executable, str(source), "--root", str(PROJECT_ROOT),
+               "--operation-date", operation_date.isoformat(), "--write"]
+    try:
+        completed = _bic_subprocess.run(command, cwd=str(PROJECT_ROOT),
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+        if completed.stdout:
+            print("BIC_LEDGER_OUTPUT: " + completed.stdout.strip().replace("\n", " | "))
+        if completed.returncode:
+            print(f"BIC_LEDGER: FAILED returncode={completed.returncode} "
+                  + completed.stderr[-1200:], file=sys.stderr)
+        else:
+            print("BIC_LEDGER: SUCCESS")
+    except Exception as exc:
+        print(f"BIC_LEDGER: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+
 def main() -> int:
     args = parse_args()
     started = now_jst()
@@ -1850,10 +2229,12 @@ def main() -> int:
     print("SlotAnalyzer Phase 2 morning automation")
     print(f"operation date        : {operation_date}")
     print(f"expected data date    : {expected_data_date}")
-    print("Maruhan last start    : 08:30 JST (PROVISIONAL)")
-    print("Maruhan formal cutoff : 09:00 JST (existing Forward Guard)")
+    print("Morning finalize      : 08:30 JST")
+    print("Maruhan last start    : 08:30 JST (ranking/pipeline)")
+    print("Late Collection       : separate process; never run inside Morning wrapper")
+    print("Maruhan formal cutoff : 09:00 JST (existing Forward Guard; unchanged)")
     print("Big March snapshot    : first morning pass (no post-snapshot fetch/retry)")
-    print("other store deadline  : 09:30 JST")
+    print("other store deadline  : 08:30 JST")
     try:
         with WindowsFileLock(GLOBAL_LOCK_PATH):
             try:
@@ -1869,6 +2250,12 @@ def main() -> int:
                 return 2
             reconcile_startup_state(state, PROJECT_ROOT, operation_date, now_jst())
             save_state(state_path, state)
+            _refresh_bic_reference_ledger(operation_date)
+            _freeze_yasuda_v3_best_effort(state, operation_date)
+            _freeze_maruhan_pair_best_effort(state, operation_date)
+            _evaluate_maruhan_pair_reference_best_effort(operation_date)
+            _freeze_maruhan_isolated_reference_best_effort(operation_date)
+            _evaluate_maruhan_isolated_reference_best_effort(operation_date)
             # Notification attempts are process-local, never part of store/run state.
             notification_attempts = set()
             notify_terminal_stores_best_effort(state, PROJECT_ROOT, notification_attempts)
@@ -1898,7 +2285,7 @@ def main() -> int:
                                 status="FAILED_RETRYABLE",
                                 error_category="PRE_PIPELINE_EXCEPTION",
                                 error=f"{type(exc).__name__}: {exc}",
-                                next_retry_at_jst=(current + timedelta(seconds=args.retry_interval_sec)).isoformat(),
+                                next_retry_at_jst=(current + timedelta(seconds=(MARUHAN_RETRY_INTERVAL_SEC if store == STORE_MARUHAN else args.retry_interval_sec))).isoformat(),
                             )
                         else:
                             item.update(
@@ -1909,6 +2296,15 @@ def main() -> int:
                         item["last_completed_at_jst"] = current.isoformat()
                         save_state(state_path, state, current)
                         print(f"{store}: {item['status']}: {item['error']}", file=sys.stderr)
+                    if store == STORE_BICTSUBAME:
+                        _refresh_bic_reference_ledger(operation_date)
+                    if store == STORE_YASUDA:
+                        _freeze_yasuda_v3_best_effort(state, operation_date)
+                    if store == STORE_MARUHAN:
+                        _freeze_maruhan_pair_best_effort(state, operation_date)
+                        _evaluate_maruhan_pair_reference_best_effort(operation_date)
+                        _freeze_maruhan_isolated_reference_best_effort(operation_date)
+                        _evaluate_maruhan_isolated_reference_best_effort(operation_date)
                     # Dispatch before processing the next store or waiting for data.
                     notify_terminal_stores_best_effort(state, PROJECT_ROOT, notification_attempts)
                 if all_terminal(state):
@@ -1921,6 +2317,17 @@ def main() -> int:
                 sleep_sec = args.retry_interval_sec
                 if future_retries:
                     sleep_sec = max(1, min(sleep_sec, int((min(future_retries) - current).total_seconds())))
+
+                # Never sleep through the Morning finalize boundary.
+                finalize_at = datetime.combine(
+                    operation_date, MORNING_FINALIZE_DEADLINE, tzinfo=JST
+                )
+                remaining_to_finalize = int((finalize_at - current).total_seconds())
+                if remaining_to_finalize > 0:
+                    sleep_sec = max(1, min(sleep_sec, remaining_to_finalize))
+                else:
+                    sleep_sec = 1
+
                 print(f"Waiting {sleep_sec} seconds before the next readiness pass...")
                 time.sleep(sleep_sec)
             return finalize_automation_run(
@@ -1938,3 +2345,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -989,88 +989,179 @@ def _maruhan_content(state: dict, root: Path, operation_date: date) -> tuple[Sto
     verification = verify_maruhan_completion(root, operation_date)
     base = root / "data/maruhan_maebashi/machine_number/analysis_31days_deep"
     ymd = operation_date.strftime("%Y%m%d")
-    metadata_rows = _read_rows(base / "64_Ver4_2_future_top10" / f"64_prediction_{ymd}_metadata.csv")
+
+    formal_dir = base / "64_Ver4_2_future_top10"
+    practical_dir = base / "80_inventory_practical_ranking_reference"
+
+    practical_reference = verification.status == "PRACTICAL_REFERENCE"
+
+    if practical_reference:
+        metadata_rows = _read_rows(
+            practical_dir / f"80_practical_{ymd}_metadata.csv"
+        )
+    else:
+        metadata_rows = _read_rows(
+            formal_dir / f"64_prediction_{ymd}_metadata.csv"
+        )
     metadata = metadata_rows[0] if len(metadata_rows) == 1 else {}
+
     inventory_guard = item.get("inventory_guard") or {}
     inventory_blocked = bool(inventory_guard.get("blocked"))
+
     formal = (
-        not inventory_blocked
+        not practical_reference
+        and not inventory_blocked
         and verification.ok
         and metadata.get("forward_valid", "").lower() in {"true", "1", "yes"}
     )
-    warnings = [] if formal else [f"Maruhan: 非valid ({verification.status})"]
-    if inventory_blocked:
-        warnings.extend([
-            "Maruhan: 台構成変更を検知",
-            "Maruhan: 正式Forward停止",
-            "Maruhan: MANUAL_REVIEW",
-        ])
-        persistent_state = inventory_guard.get("persistent_state") or {}
-        if persistent_state.get("status") == "BLOCKED":
+
+    if practical_reference:
+        warnings = [
+            "Maruhan: 実戦用ランキング利用可能（REFERENCE）",
+            "Maruhan: 正式Forward評価は保留",
+        ]
+        if inventory_blocked:
+            warnings.append("Maruhan: 台構成変更を検知")
+    else:
+        warnings = [] if formal else [f"Maruhan: 非valid ({verification.status})"]
+        if inventory_blocked:
             warnings.extend([
-                "Maruhan: 台構成変更による正式Forward停止中",
-                "Maruhan: 未承認のため停止継続",
+                "Maruhan: 台構成変更を検知",
+                "Maruhan: 正式Forward停止",
+                "Maruhan: MANUAL_REVIEW",
             ])
-    summary_lines = [
-        f"status: {item.get('status', 'UNKNOWN')}",
-        f"target_date: {metadata.get('target_date', operation_date.isoformat())}",
-        f"latest_data_date: {metadata.get('latest_data_date', item.get('latest_data_date', ''))}",
-        f"Forward: {'正式Forward停止 (inventory guard)' if inventory_blocked else ('FORWARD_VALID (formal)' if formal else '非valid / formal表示不可')}",
-    ]
-    specs = [
-        (
-            "NORMAL Top15",
-            base / "64_Ver4_2_future_top10" / f"64_prediction_{ymd}_top15.csv",
-            ("prediction_rank",),
-            15,
-            True,
-        ),
-        (
-            "A-TYPE Top15",
-            base / "74_Ver4_2_A_type_prediction" / f"74_A_type_prediction_{ymd}_top15.csv",
-            ("a_type_rank", "prediction_rank"),
-            15,
-            True,
-        ),
-        (
-            "JUGGLER Top15",
-            base / "75_Ver4_2_Juggler_prediction" / f"75_Juggler_prediction_{ymd}_top15.csv",
-            ("juggler_rank", "prediction_rank"),
-            15,
-            True,
-        ),
-        (
-            "統合ランキング / 代替候補・NEXT",
-            base / "77_live_integrated_prediction_report" / f"77_integrated_prediction_{ymd}.csv",
-            ("report_order",),
-            10,
-            False,
-        ),
-    ]
+            persistent_state = inventory_guard.get("persistent_state") or {}
+            if persistent_state.get("status") == "BLOCKED":
+                warnings.extend([
+                    "Maruhan: 台構成変更による正式Forward停止中",
+                    "Maruhan: 未承認のため停止継続",
+                ])
+
+    if practical_reference:
+        summary_lines = [
+            f"status: {item.get('status', 'UNKNOWN')}",
+            f"target_date: {metadata.get('target_date', operation_date.isoformat())}",
+            f"latest_data_date: {metadata.get('latest_data_date', item.get('latest_data_date', ''))}",
+            "ランキング: 利用可能（PRACTICAL_REFERENCE / 実戦用参考）",
+            "Formal Forward: 保留（正式評価対象外）",
+            "Future Leakage: PASS（予測時点より後の情報は不使用）",
+        ]
+        specs = [
+            (
+                "PRACTICAL NORMAL Top15",
+                practical_dir / f"80_practical_{ymd}_top15.csv",
+                ("prediction_rank", "rank"),
+                15,
+                True,
+            ),
+            (
+                "PRACTICAL A-TYPE Top15",
+                practical_dir / f"80_practical_atype_{ymd}_top15.csv",
+                ("a_type_rank", "prediction_rank", "rank"),
+                15,
+                True,
+            ),
+            (
+                "PRACTICAL JUGGLER Top15",
+                practical_dir / f"80_practical_juggler_{ymd}_top15.csv",
+                ("juggler_rank", "prediction_rank", "rank"),
+                15,
+                True,
+            ),
+            (
+                "Stable7 Top15（入替影響除外・REFERENCE）",
+                practical_dir / f"80_stable7_{ymd}_top15.csv",
+                ("prediction_rank", "rank"),
+                15,
+                True,
+            ),
+        ]
+    else:
+        summary_lines = [
+            f"status: {item.get('status', 'UNKNOWN')}",
+            f"target_date: {metadata.get('target_date', operation_date.isoformat())}",
+            f"latest_data_date: {metadata.get('latest_data_date', item.get('latest_data_date', ''))}",
+            f"Forward: {'正式Forward停止 (inventory guard)' if inventory_blocked else ('FORWARD_VALID (formal)' if formal else '非valid / formal表示不可')}",
+        ]
+        specs = [
+            (
+                "NORMAL Top15",
+                formal_dir / f"64_prediction_{ymd}_top15.csv",
+                ("prediction_rank",),
+                15,
+                True,
+            ),
+            (
+                "A-TYPE Top15",
+                base / "74_Ver4_2_A_type_prediction" / f"74_A_type_prediction_{ymd}_top15.csv",
+                ("a_type_rank", "prediction_rank"),
+                15,
+                True,
+            ),
+            (
+                "JUGGLER Top15",
+                base / "75_Ver4_2_Juggler_prediction" / f"75_Juggler_prediction_{ymd}_top15.csv",
+                ("juggler_rank", "prediction_rank"),
+                15,
+                True,
+            ),
+            (
+                "統合ランキング / 代替候補NEXT",
+                base / "77_live_integrated_prediction_report" / f"77_integrated_prediction_{ymd}.csv",
+                ("report_order",),
+                10,
+                False,
+            ),
+        ]
+
     rankings = []
     for label, path, keys, limit, show_recent3 in specs:
         rows = _read_rows(path)
-        valid_rows = rows if formal and _same_dates(rows, operation_date, expected) else []
+
+        if practical_reference:
+            valid_rows = rows if _same_dates(rows, operation_date, expected) else []
+        else:
+            valid_rows = rows if formal and _same_dates(rows, operation_date, expected) else []
+
         if valid_rows and show_recent3:
             valid_rows = _attach_maruhan_recent3_actuals(
                 valid_rows,
                 root,
                 operation_date,
             )
+
+        empty_message = (
+            "実戦用REFERENCEランキング未生成または日付不一致"
+            if practical_reference
+            else "ランキング未生成または日付不一致"
+        )
         rankings.append(
             RankingBlock(
                 label,
                 valid_rows,
                 keys,
-                "ランキング未生成または日付不一致",
+                empty_message,
                 limit,
             )
         )
+
     details = [
         f"generated_at_jst: {metadata.get('generated_at_jst', '-')}",
-        f"model: {metadata.get('model', '-')}",
+        f"model: {metadata.get('model', 'CHAMPION_V4.2_C' if practical_reference else '-')}",
         f"fingerprint: {metadata.get('weight_fingerprint', '-')}",
     ]
+
+    if practical_reference:
+        details.extend([
+            "ranking_class: PRACTICAL_REFERENCE",
+            f"ranking_available: {metadata.get('ranking_available', 'True')}",
+            f"formal_forward_valid: {metadata.get('formal_forward_valid', 'False')}",
+            f"reference_only: {metadata.get('reference_only', 'True')}",
+            f"stable_machines: {metadata.get('stable_machines', '-')}",
+            f"changed_latest_count: {metadata.get('changed_latest_count', '-')}",
+            f"old_model_history_risk_count: {metadata.get('old_model_history_risk_count', '-')}",
+        ])
+
     if inventory_blocked:
         comparison = inventory_guard.get("comparison") or {}
         persistent_state = inventory_guard.get("persistent_state") or {}
@@ -1095,8 +1186,8 @@ def _maruhan_content(state: dict, root: Path, operation_date: date) -> tuple[Sto
                     f"{changed.get('machine_no')} "
                     f"{changed.get('previous_machine_name')} -> {changed.get('current_machine_name')}"
                 )
-    return StoreSection("【Maruhan 前橋インター】", summary_lines, rankings, details), warnings
 
+    return StoreSection("【Maruhan 前橋インター】", summary_lines, rankings, details), warnings
 
 def _maruhan_section(state: dict, root: Path, operation_date: date) -> tuple[list[str], list[str]]:
     section, warnings = _maruhan_content(state, root, operation_date)
@@ -1247,7 +1338,7 @@ def _bigmarch_content(state: dict, root: Path, operation_date: date) -> tuple[St
         provisional = verify_big_march_provisional_completion(root, operation_date)
         expected_latest = expected - timedelta(days=1)
         warnings = [
-            "Big March: PROVISIONAL / 前日データ未反映のため正式ランキングではありません"
+            "Big March: REFERENCE / 前日1日分未反映のため正式ランキングではありません"
         ]
         if not provisional.ok:
             return (
@@ -1282,13 +1373,13 @@ def _bigmarch_content(state: dict, root: Path, operation_date: date) -> tuple[St
             StoreSection(
                 "【Big March 高崎おおやぎ】",
                 [
-                    "⚠ PROVISIONAL / 暫定ランキング",
-                    "前日データ未反映のため正式ランキングではありません",
+                    "⚠ REFERENCE / 実戦用参考ランキング",
+                    "前日1日分が未反映のため正式ランキングではありません",
                     f"Target: {operation_date.isoformat()}",
                     f"Expected: {expected.isoformat()}",
                     f"Latest: {expected_latest.isoformat()}",
                     "Forward VALID: False",
-                    "正式Forward対象外 / 正式評価対象外",
+                    "Formal Forward: 対象外 / 正式評価対象外",
                 ],
                 [
                     RankingBlock("JUGGLER 暫定 Top10（recent7_win）", juggler, ("prediction_rank", "rank")),
@@ -1330,6 +1421,21 @@ def _bigmarch_section(state: dict, root: Path, operation_date: date) -> tuple[li
     return _render_section_plain(section).splitlines(), warnings
 
 
+def _auto_triage_lines(item: dict) -> list[str]:
+    triage = item.get("auto_triage") or {}
+    if not triage:
+        return []
+    status = str(triage.get("auto_triage_status", "NOT_APPLICABLE"))
+    stable_days = triage.get("stable_days", 0)
+    reason = str(triage.get("reason", "")).strip()
+    lines = [f"Auto-Triage: {status}", f"stable days: {stable_days}"]
+    if status == "AUTO_CLEAR_CANDIDATE":
+        lines.append("過去Inventory変更は未承認だが、直近2日以上安定 → AUTO_CLEAR_CANDIDATE")
+    if reason:
+        lines.append(f"triage reason: {reason}")
+    return lines
+
+
 def _yasuda_section(state: dict, root: Path, operation_date: date) -> tuple[list[str], list[str]]:
     expected = operation_date - timedelta(days=1)
     item = _store_state(state, STORE_YASUDA)
@@ -1350,6 +1456,7 @@ def _yasuda_section(state: dict, root: Path, operation_date: date) -> tuple[list
         f"Freshness/quality: {'OK' if verification.ok else 'FAILED: ' + verification.status}",
         "ランキング機能: 未実装",
     ]
+    lines.extend(_auto_triage_lines(item))
     if blocked:
         comparison = guard.get("comparison") or {}
         lines.extend([
@@ -1368,36 +1475,571 @@ def _yasuda_section(state: dict, root: Path, operation_date: date) -> tuple[list
 
 
 
+def _bic_tsubame_recent3_actuals(
+    root: Path, target_date: date, ranking_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Display-only past-three-day actuals; never read target/future data.
+
+    Reject incomplete daily CSVs and old-machine history after a model change.
+    """
+    import math
+
+    daily_dir = root / "data/bic_tsubame_takasaki/machine_number"
+    candidates: list[tuple[date, Path]] = []
+    for path in daily_dir.glob("ana_slo_bic_tsubame_takasaki_????????.csv"):
+        date_str = path.stem.rsplit("_", 1)[-1]
+        try:
+            day = datetime.strptime(date_str, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if day < target_date and path.is_file() and path.stat().st_size:
+            candidates.append((day, path))
+    selected = sorted(candidates, reverse=True)[:3]
+    selected.sort()
+
+    history: list[tuple[date, dict[str, tuple[str, float]]]] = []
+    for day, path in selected:
+        data: dict[str, tuple[str, float]] = {}
+        try:
+            rows = _read_rows(path)
+            # Preserve the established 517-machine integrity requirement.
+            if len(rows) != 517:
+                raise ValueError("daily machine count mismatch")
+            for row in rows:
+                if str(row.get("date", "")).strip() != day.isoformat():
+                    raise ValueError("daily internal date mismatch")
+                number = _normalize_machine_no(row.get("machine_no", ""))
+                name = str(row.get("machine_name", "")).strip()
+                raw_diff = str(row.get("diff", "")).replace(",", "").strip()
+                value = float(raw_diff)
+                if not number or not name or not math.isfinite(value) or number in data:
+                    raise ValueError("daily machine identity/diff invalid")
+                data[number] = (name, value)
+        except (OSError, ValueError, TypeError, KeyError):
+            data = {}
+        history.append((day, data))
+
+    enriched = []
+    for source in ranking_rows:
+        row = dict(source)
+        number = _normalize_machine_no(source.get("machine_no", ""))
+        name = str(source.get("machine_name", "")).strip()
+        tier = str(source.get("tier", "")).strip().upper()
+        parts: list[str] = []
+        values: list[float] = []
+        complete = len(history) == 3
+        for day, data in history:
+            found = data.get(number)
+            if found is None:
+                parts.append(f"{day.day} データなし")
+                complete = False
+            elif found[0] != name:
+                parts.append(f"{day.day} 機種変更前・対象外")
+                complete = False
+            else:
+                parts.append(f"{day.day} {_signed_medals(str(found[1]))}")
+                values.append(found[1])
+        if len(history) < 3:
+            parts.append("直近利用可能日が3日未満")
+            complete = False
+        parts.append(
+            f"計 {_signed_medals(str(sum(values)))}"
+            if complete and len(values) == 3 else "計 データ不足"
+        )
+        row["_recent3_text"] = "｜".join(parts)
+        enriched.append(row)
+    return enriched
+
+
+def _bic_tsubame_yesterday_reference_summary(
+    root: Path, operation_date: date,
+) -> tuple[str, str]:
+    """Read-only reference comparison. No claim of frozen/formal prediction."""
+    import math
+
+    target = operation_date - timedelta(days=1)
+    previous = target - timedelta(days=1)
+    directory = root / "data/bic_tsubame_takasaki/machine_number"
+    ranking_dir = directory / "analysis_challenger_v1_reference_future_top10"
+    top_path = ranking_dir / f"64_prediction_{target:%Y%m%d}_top10.csv"
+    all_path = ranking_dir / f"64_prediction_{target:%Y%m%d}_all517.csv"
+    meta_path = ranking_dir / f"64_prediction_{target:%Y%m%d}_metadata.csv"
+    actual_path = directory / f"ana_slo_bic_tsubame_takasaki_{target:%Y%m%d}.csv"
+    title = f"【昨日の予測結果 {target.isoformat()}】"
+    explanation = "REFERENCE_ONLY（参考照合・事前凍結未確認・正式評価対象外）"
+
+    def unavailable(reason: str) -> tuple[str, str]:
+        plain = f"{title}\n{explanation}\n未評価: {reason}"
+        html_body = (
+            '<section style="margin:20px 0">'
+            f'<h3 style="margin:0 0 6px">{html.escape(title)}</h3>'
+            f'<div>{html.escape(explanation)}</div>'
+            f'<div style="color:#a33">未評価: {html.escape(reason)}</div></section>'
+        )
+        return plain, html_body
+
+    if not all(p.is_file() and p.stat().st_size > 0
+               for p in (top_path, all_path, meta_path, actual_path)):
+        return unavailable("予測・検証情報または対象日実績が不足")
+    try:
+        meta_rows = _read_rows(meta_path)
+        predictions = _read_rows(top_path)
+        all_rows = _read_rows(all_path)
+        actual_rows = _read_rows(actual_path)
+        if len(meta_rows) != 1 or len(predictions) != 10 or len(all_rows) != 517 or len(actual_rows) != 517:
+            raise ValueError("517台/Top10/metadataの件数不一致")
+        meta = meta_rows[0]
+        expected = {
+            "target_date": target.isoformat(),
+            "latest_data_date": previous.isoformat(),
+            "model": "BIC_TSUBAME_CHALLENGER_V1_DROP_PLUS2000_REFERENCE",
+            "weight_fingerprint": "a3b7ecbead34995a",
+            "reference_only": "True",
+            "formal_evaluation": "False",
+            "production_ranking": "False",
+            "target_actual_absent_at_generation": "True",
+            "target_actual_used": "False",
+            "machines_ranked": "517", "top_n": "10",
+        }
+        if any(str(meta.get(k, '')).strip() != v for k,v in expected.items()):
+            raise ValueError("予測metadataの整合性不一致")
+        if (sha256_file(all_path).lower() != str(meta.get("all517_sha256", "")).lower()
+                or sha256_file(top_path).lower() != str(meta.get("top10_sha256", "")).lower()):
+            raise ValueError("予測SHA256の不一致")
+        ranks = [int(row['prediction_rank']) for row in predictions]
+        if sorted(ranks) != list(range(1,11)):
+            raise ValueError("ランキング順位不一致")
+        if any(row.get('target_date',target.isoformat()) != target.isoformat()
+               for row in predictions):
+            raise ValueError("予測対象日の不一致")
+        actual: dict[str, tuple[str,float]] = {}
+        for row in actual_rows:
+            if row.get('date') != target.isoformat():
+                raise ValueError("実績CSVの日付不一致")
+            number = _normalize_machine_no(row.get('machine_no',''))
+            name = str(row.get('machine_name','')).strip()
+            raw = str(row.get('diff','')).replace(',','').strip()
+            value = float(raw)
+            if not number or not name or number in actual or not math.isfinite(value):
+                raise ValueError("実績CSVの台番号・機種・差枚不正")
+            actual[number] = (name, value)
+        predictions.sort(key=lambda row: int(row['prediction_rank']))
+        evaluated = []
+        for pred in predictions:
+            number = _normalize_machine_no(pred.get('machine_no',''))
+            name = str(pred.get('machine_name','')).strip()
+            if not number or number not in actual or actual[number][0] != name:
+                raise ValueError("予測対象台の実績未発見または機種変更")
+            evaluated.append((int(pred['prediction_rank']), number, name, actual[number][1]))
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+        return unavailable(f"検証不成立（{type(exc).__name__}: {exc}）")
+
+    plain_lines = [title, explanation, '※過去予測ファイルの事前確定時刻は未検証']
+    html_parts = [
+        '<section style="margin:20px 0">',
+        f'<h3 style="margin:0 0 6px">{html.escape(title)}</h3>',
+        f'<div style="font-weight:bold">{html.escape(explanation)}</div>',
+        '<div style="font-size:12px;color:#a33">事前確定時刻は未検証。正式成績ではありません。</div>',
+    ]
+    for n in (3,5,10):
+        selected = evaluated[:n]
+        total = sum(r[3] for r in selected)
+        wins = sum(r[3] > 0 for r in selected)
+        average = total / n
+        summary = f'Top{n}: {wins}/{n}勝（{wins/n*100:.1f}%）｜平均 {_signed_medals(str(average))}枚｜合計 {_signed_medals(str(total))}枚'
+        plain_lines.append(summary)
+        # Mobile-friendly two-line summary; plain-text reporting remains unchanged.
+        line1 = f'Top{n}: {wins}/{n}勝（{wins/n*100:.1f}%）'
+        line2 = (f'平均 {_signed_medals(str(average))}枚'
+                 f' ／ 合計 {_signed_medals(str(total))}枚')
+        html_parts.append(
+            '<div style="margin:7px 0;padding:8px 10px;background:#f6f7f8;border-left:3px solid #777">'
+            f'<div style="font-weight:bold;font-size:14px;line-height:1.5">{html.escape(line1)}</div>'
+            f'<div style="font-size:13px;line-height:1.5;white-space:nowrap">{html.escape(line2)}</div>'
+            '</div>'
+        )
+    cell_style = 'padding:7px 4px;vertical-align:top;font-size:13px'
+    for rank, number, name, diff in evaluated:
+        win = diff > 0
+        outcome = 'WIN' if win else 'LOSE'
+        color = '#176b32' if win else '#a33'
+        text = f'{rank}. {number}番台 {name}  {_signed_medals(str(diff))}枚  {outcome}'
+        plain_lines.append(text)
+        # Match Maruhan's two-row previous-day result arrangement.
+        html_parts.extend([
+            '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;'
+            'border-collapse:collapse;margin-top:7px;border-bottom:1px solid #ddd">',
+            '<tr>',
+            f'<td width="9%" style="{cell_style};text-align:center;font-weight:bold;white-space:nowrap">{rank}</td>',
+            f'<td width="18%" style="{cell_style};text-align:center;white-space:nowrap">{html.escape(number)}</td>',
+            f'<td width="73%" style="{cell_style};text-align:left;overflow-wrap:anywhere;word-break:break-word">{html.escape(name)}</td>',
+            '</tr><tr>',
+            '<td colspan="3" style="padding:0 4px 8px">',
+            '<table width="100%" role="presentation" style="width:100%;table-layout:fixed;border-collapse:collapse"><tr>',
+            f'<td width="45%" style="font-size:13px;text-align:right;white-space:nowrap">{html.escape(_signed_medals(str(diff)))}枚</td>',
+            f'<td width="30%" style="font-size:13px;text-align:center;font-weight:bold;color:{color};white-space:nowrap">{outcome}</td>',
+            '<td width="25%" style="font-size:12px;text-align:left;color:#666"></td>',
+            '</tr></table></td>',
+            '</tr></table>',
+        ])
+    html_parts.append('</section>')
+    return '\n'.join(plain_lines), ''.join(html_parts)
+
+
+def _bic_tsubame_cumulative_reference(root: Path, operation_date: date) -> tuple[str, str]:
+    """Read-only, historical REFERENCE_ONLY aggregation; no formal-frozen claim.
+
+    Each day requires matching, hashed all517/top10/metadata artifacts and
+    complete, same-date 517-machine actuals with unchanged machine identity.
+    Missing or invalid days are excluded (never treated as zero returns).
+    """
+    import math
+
+    base = root / "data/bic_tsubame_takasaki/machine_number"
+    preds_dir = base / "analysis_challenger_v1_reference_future_top10"
+    totals = {3: 0.0, 5: 0.0, 10: 0.0}
+    wins = {3: 0, 5: 0, 10: 0}
+    valid_dates: list[date] = []
+    excluded = 0
+    for top_path in sorted(preds_dir.glob("64_prediction_????????_top10.csv")):
+        ymd = top_path.name[len("64_prediction_"):-len("_top10.csv")]
+        try:
+            target = datetime.strptime(ymd, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if target >= operation_date:
+            continue  # Never use target-day/future actuals in today's email.
+        all_path = preds_dir / f"64_prediction_{ymd}_all517.csv"
+        meta_path = preds_dir / f"64_prediction_{ymd}_metadata.csv"
+        actual_path = base / f"ana_slo_bic_tsubame_takasaki_{ymd}.csv"
+        try:
+            if not all(p.is_file() and p.stat().st_size > 0 for p in
+                       (top_path, all_path, meta_path, actual_path)):
+                raise ValueError("artifact missing")
+            metadata_rows = _read_rows(meta_path)
+            predictions = _read_rows(top_path)
+            universe = _read_rows(all_path)
+            actual_rows = _read_rows(actual_path)
+            if (len(metadata_rows), len(predictions), len(universe), len(actual_rows)) != (1,10,517,517):
+                raise ValueError("record count mismatch")
+            meta = metadata_rows[0]
+            required = {
+                "target_date": target.isoformat(),
+                "latest_data_date": (target-timedelta(days=1)).isoformat(),
+                "model": "BIC_TSUBAME_CHALLENGER_V1_DROP_PLUS2000_REFERENCE",
+                "weight_fingerprint": "a3b7ecbead34995a",
+                "reference_only": "True", "formal_evaluation": "False",
+                "production_ranking": "False", "target_actual_absent_at_generation": "True",
+                "target_actual_used": "False", "machines_ranked": "517", "top_n": "10",
+            }
+            if any(str(meta.get(k,"")).strip() != v for k,v in required.items()):
+                raise ValueError("metadata mismatch")
+            if (sha256_file(top_path).lower() != str(meta.get("top10_sha256","")).lower()
+                or sha256_file(all_path).lower() != str(meta.get("all517_sha256","")).lower()):
+                raise ValueError("hash mismatch")
+            ranks = [int(r["prediction_rank"]) for r in predictions]
+            if sorted(ranks) != list(range(1,11)) or len({r.get("machine_no") for r in predictions}) != 10:
+                raise ValueError("rank/machine mismatch")
+            if any(r.get("target_date",target.isoformat()) != target.isoformat() for r in predictions):
+                raise ValueError("prediction target date mismatch")
+            actual = {}
+            for row in actual_rows:
+                if row.get("date") != target.isoformat():
+                    raise ValueError("actual date mismatch")
+                no = _normalize_machine_no(row.get("machine_no",""))
+                name = str(row.get("machine_name","")).strip()
+                v = float(str(row.get("diff","")).replace(",",""))
+                if not no or not name or not math.isfinite(v) or no in actual:
+                    raise ValueError("actual row invalid")
+                actual[no] = (name,v)
+            diffs = []
+            for row in sorted(predictions,key=lambda r:int(r["prediction_rank"])):
+                no = _normalize_machine_no(row.get("machine_no",""))
+                name = str(row.get("machine_name","")).strip()
+                if no not in actual or actual[no][0] != name:
+                    raise ValueError("machine identity changed")
+                diffs.append(actual[no][1])
+            for n in (3,5,10):
+                totals[n] += sum(diffs[:n])
+                wins[n] += sum(v>0 for v in diffs[:n])
+            valid_dates.append(target)
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            excluded += 1
+    title = "【ビックつばめ 累積参考成績】"
+    caveat = "REFERENCE_ONLY・事前確定時刻未検証／正式Forward集計には含めません"
+    lines = [title, caveat]
+    blocks = [
+        '<section style="margin:16px 0;padding:12px;background:#f7f7f7;border-left:4px solid #555">',
+        f'<div style="font-size:16px;font-weight:bold">{html.escape(title)}</div>',
+        f'<div style="font-size:12px;color:#a33">{html.escape(caveat)}</div>',
+    ]
+    if not valid_dates:
+        lines.append("照合可能な過去予測なし（未集計）")
+        blocks.append('<div>照合可能な過去予測なし（未集計）</div>')
+    else:
+        days = len(valid_dates)
+        period = f"{min(valid_dates).isoformat()} ～ {max(valid_dates).isoformat()}"
+        lines.append(f"評価対象: {days}日 / {period}")
+        blocks.append(f'<div style="font-size:12px">評価対象: {days}日 / {html.escape(period)}</div>')
+        blocks.append('<table width="100%" role="presentation" style="width:100%;border-collapse:collapse;font-size:13px">'
+                      '<tr><th style="text-align:left">対象</th><th>勝率</th><th>平均差枚</th><th>累計差枚</th></tr>')
+        for n in (3,5,10):
+            total = totals[n]
+            mean = total/(days*n)
+            rate = 100*wins[n]/(days*n)
+            line = f"Top{n}: 勝率 {rate:.1f}%｜平均 {mean:+,.1f}枚｜累計 {_signed_medals(str(total))}枚"
+            lines.append(line)
+            blocks.append('<tr>' + f'<td style="padding:6px 2px;border-bottom:1px solid #ddd">Top{n}</td>'
+                          f'<td style="text-align:right;white-space:nowrap">{rate:.1f}%</td>'
+                          f'<td style="text-align:right;white-space:nowrap">{mean:+,.1f}</td>'
+                          f'<td style="text-align:right;white-space:nowrap">{html.escape(_signed_medals(str(total)))}</td>'
+                          '</tr>')
+        blocks.append('</table>')
+    if excluded:
+        lines.append(f"未採用（欠損・不整合）: {excluded}日")
+        blocks.append(f'<div style="font-size:12px;color:#a33">未採用（欠損・不整合）: {excluded}日</div>')
+    blocks.append('</section>')
+    return "\n".join(lines), "".join(blocks)
+
+
 def _bic_tsubame_section(
-    state: dict, root: Path, operation_date: date
-) -> tuple[list[str], list[str]]:
+    state: dict, root: Path, operation_date: date, *, structured: bool = False
+) -> tuple[list[str], list[str]] | tuple[StoreSection, list[str]]:
+    """Keep legacy plain output, or return a shared-design ranking section.
+
+    The structured path uses only Top10 rows that passed the existing artifact,
+    metadata, date, and SHA-256 checks. It never promotes REFERENCE to formal.
+    """
+    import csv
+    import hashlib
+
     item = _store_state(state, STORE_BICTSUBAME)
     verification = verify_bic_tsubame_completion(root, operation_date)
     expected = verification.details.get(
         "expected_data_date", (operation_date - timedelta(days=1)).isoformat()
     )
-    latest = verification.details.get("latest_data_date", item.get("latest_data_date", ""))
+    latest = verification.details.get(
+        "latest_data_date", item.get("latest_data_date", "")
+    )
     records = verification.details.get("rows", 0)
-    warnings = [] if verification.ok else [
-        f"Bic Tsubame: Freshness/quality失敗 ({verification.status})"
+    guard = item.get("inventory_guard") or {}
+    blocked = bool(guard.get("blocked"))
+
+    warnings = [] if verification.ok and not blocked else [
+        "Bic Tsubame: Inventory変更を検知したためMANUAL_REVIEW"
+        if blocked
+        else f"Bic Tsubame: Freshness/quality失敗 ({verification.status})"
     ]
+
     lines = [
         "【Bic Tsubame 高崎】",
         f"status: {item.get('status', 'UNKNOWN')}",
         f"expected/latest data date: {expected} / {latest or '-'}",
         f"records: {records}",
         f"Freshness/quality: {'OK' if verification.ok else 'FAILED: ' + verification.status}",
-        "ランキング機能: 未実装",
     ]
+
     skipped = verification.details.get("skipped_closures") or []
     if skipped:
         lines.append(f"known closure skipped: {len(skipped)} day(s)")
+
+    ranking_dir = (
+        root
+        / "data"
+        / "bic_tsubame_takasaki"
+        / "machine_number"
+        / "analysis_challenger_v1_reference_future_top10"
+    )
+    ymd = operation_date.strftime("%Y%m%d")
+    all_path = ranking_dir / f"64_prediction_{ymd}_all517.csv"
+    top10_path = ranking_dir / f"64_prediction_{ymd}_top10.csv"
+    metadata_path = ranking_dir / f"64_prediction_{ymd}_metadata.csv"
+
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    ranking_ready = False
+    ranking_error = ""
+
+    if verification.ok and not blocked:
+        paths = (all_path, top10_path, metadata_path)
+        existing = [path.exists() and path.stat().st_size > 0 for path in paths]
+
+        if all(existing):
+            try:
+                all_rows = _read_csv_rows(all_path)
+                top10_rows = _read_csv_rows(top10_path)
+                metadata_rows = _read_csv_rows(metadata_path)
+
+                if len(all_rows) != 517:
+                    raise RuntimeError(
+                        f"all517 row count mismatch: {len(all_rows)} != 517"
+                    )
+                if len(top10_rows) != 10:
+                    raise RuntimeError(
+                        f"top10 row count mismatch: {len(top10_rows)} != 10"
+                    )
+                if len(metadata_rows) != 1:
+                    raise RuntimeError(
+                        f"metadata row count mismatch: {len(metadata_rows)} != 1"
+                    )
+
+                meta = metadata_rows[0]
+
+                expected_meta = {
+                    "target_date": operation_date.isoformat(),
+                    "latest_data_date": expected,
+                    "model": "BIC_TSUBAME_CHALLENGER_V1_DROP_PLUS2000_REFERENCE",
+                    "weight_fingerprint": "a3b7ecbead34995a",
+                    "forward_valid": "True",
+                    "target_actual_absent_at_generation": "True",
+                    "target_actual_used": "False",
+                    "challenger_used": "True",
+                    "reference_only": "True",
+                    "formal_evaluation": "False",
+                    "production_ranking": "False",
+                    "dropped_feature": "plus2000_rate",
+                    "machines_ranked": "517",
+                    "top_n": "10",
+                }
+
+                mismatches = [
+                    f"{key}={meta.get(key)!r} expected={value!r}"
+                    for key, value in expected_meta.items()
+                    if str(meta.get(key, "")).strip() != value
+                ]
+                if mismatches:
+                    raise RuntimeError(
+                        "metadata mismatch: " + "; ".join(mismatches)
+                    )
+
+                if _sha256(all_path) != str(meta.get("all517_sha256", "")).strip():
+                    raise RuntimeError("all517 SHA256 mismatch")
+
+                if _sha256(top10_path) != str(meta.get("top10_sha256", "")).strip():
+                    raise RuntimeError("top10 SHA256 mismatch")
+
+                target_dates = {
+                    str(row.get("target_date", "")).strip()
+                    for row in top10_rows
+                    if "target_date" in row
+                }
+                if target_dates and target_dates != {operation_date.isoformat()}:
+                    raise RuntimeError(
+                        f"top10 target_date mismatch: {sorted(target_dates)}"
+                    )
+
+                ranking_ready = True
+
+            except Exception as exc:
+                ranking_error = f"{type(exc).__name__}: {exc}"
+
+        elif any(existing):
+            ranking_error = (
+                "PARTIAL_OUTPUT: all517/top10/metadataの一部だけが存在"
+            )
+
+    if ranking_ready:
+        lines.extend([
+            "ランキング: REFERENCE_ONLY（正式評価には含めない参考扱い）",
+            "モデル: Challenger V1（plus2000_rateを除外）",
+            "正式Forward: 対象外",
+            "本番ランキング: False",
+            "REFERENCE Top10:",
+        ])
+
+        top10_rows = _read_csv_rows(top10_path)
+
+        def _rank_value(row: dict[str, str]) -> int:
+            raw = str(row.get("prediction_rank", "")).strip()
+            try:
+                return int(float(raw))
+            except ValueError:
+                return 999999
+
+        top10_rows.sort(key=_rank_value)
+
+        for row in top10_rows:
+            rank = str(row.get("prediction_rank", "")).strip()
+            tier = str(row.get("tier", "")).strip()
+            machine_no = str(row.get("machine_no", "")).strip()
+            machine_name = str(row.get("machine_name", "")).strip()
+            score_raw = str(row.get("score", "")).strip()
+            try:
+                score_text = f"{float(score_raw):.3f}"
+            except ValueError:
+                score_text = score_raw or "-"
+
+            lines.append(
+                f"{rank}位 台{machine_no} {machine_name} "
+                f"score={score_text}"
+            )
+
+    else:
+        lines.append(
+            "ランキング: REFERENCE未生成"
+            if not ranking_error
+            else "ランキング: REFERENCE検証失敗"
+        )
+        if ranking_error:
+            lines.append(f"REFERENCE reason: {ranking_error}")
+            warnings.append(
+                f"Bic Tsubame: REFERENCEランキング検証失敗 ({ranking_error})"
+            )
+
+    lines.extend(_auto_triage_lines(item))
+
+    if blocked:
+        comparison = guard.get("comparison") or {}
+        lines.extend([
+            "⚠ Inventory変更を検知したため安全停止",
+            "Morning status: MANUAL_REVIEW",
+            f"reason: {guard.get('reason', 'INVENTORY_GUARD_BLOCKED')}",
+        ])
+        if comparison:
+            lines.extend([
+                f"previous/current: {comparison.get('previous_machine_count', '-')} / {comparison.get('current_machine_count', '-')}",
+                f"added: {comparison.get('added_machine_numbers', [])}",
+                f"removed: {comparison.get('removed_machine_numbers', [])}",
+                f"renamed: {len(comparison.get('renamed_machine_numbers', []))}",
+            ])
+
+    if structured:
+        blocks: list[RankingBlock] = []
+        if ranking_ready:
+            # Remove the legacy inline Top10 text only from the structured view.
+            # The plain legacy function still returns its original output.
+            marker = lines.index("REFERENCE Top10:")
+            del lines[marker:marker + 1 + len(top10_rows)]
+            display_rows = _bic_tsubame_recent3_actuals(
+                root, operation_date, top10_rows
+            )
+            blocks.append(RankingBlock(
+                "REFERENCE Top10（参考ランキング・正式評価対象外）",
+                display_rows,
+                ("prediction_rank",),
+                limit=10,
+            ))
+        return StoreSection(lines[0], lines[1:], blocks, []), warnings
+
     return lines, warnings
 
 MARUHAN_FLOOR_MAP_CATEGORIES = {
     "NORMAL Top15": "NORMAL",
     "A-TYPE Top15": "A-TYPE",
     "JUGGLER Top15": "JUGGLER",
+    # PRACTICAL_REFERENCE is display-only and never promoted to Formal Forward.
+    "PRACTICAL NORMAL Top15": "NORMAL",
+    "PRACTICAL A-TYPE Top15": "A-TYPE",
+    "PRACTICAL JUGGLER Top15": "JUGGLER",
 }
 
 
@@ -1407,10 +2049,16 @@ def _maruhan_floor_map_display(
     operation_date: date,
 ) -> tuple[dict[str, str], tuple[InlineImage, ...]]:
     """Build display-only floor maps without changing ranking or notification status."""
+    # Map badges represent positions within each Top15 category. PRACTICAL
+    # A-TYPE/JUGGLER files may carry GLOBAL prediction_rank (e.g. 19, 28).
+    # Normalize display-only map ranks without touching source ranking rows.
     eligible = {
-        MARUHAN_FLOOR_MAP_CATEGORIES[block.label]: (block.rows, block.rank_keys)
+        MARUHAN_FLOOR_MAP_CATEGORIES[block.label]: (
+            [dict(row, _floor_rank=str(i)) for i, row in enumerate(block.rows, 1)],
+            ("_floor_rank",),
+        )
         for block in section.rankings
-        if block.label in MARUHAN_FLOOR_MAP_CATEGORIES and block.rows
+        if block.label in MARUHAN_FLOOR_MAP_CATEGORIES and len(block.rows) == 15
     }
     if not eligible:
         return {}, ()
@@ -1435,6 +2083,8 @@ def _maruhan_floor_map_display(
         return extras, ()
 
     for label, category in MARUHAN_FLOOR_MAP_CATEGORIES.items():
+        if label not in {block.label for block in section.rankings}:
+            continue
         if category not in eligible:
             continue
         result = results.get(category)
@@ -1452,7 +2102,8 @@ def _maruhan_floor_map_display(
         extras[label] = (
             '<div style="margin:8px 0 20px">'
             f'<div style="font-size:12px;color:#666;margin-bottom:5px">'
-            f'{html.escape(category)} Top15 Floor Map</div>'
+            f'{html.escape(category)} Top15 Floor Map'
+            f'{"（PRACTICAL_REFERENCE・正式評価対象外）" if section.summary_lines and any("PRACTICAL_REFERENCE" in line for line in section.summary_lines) else ""}</div>'
             f'<img src="cid:{html.escape(artifact.cid)}" '
             f'alt="{html.escape(category)} Top15 Floor Map" '
             'style="display:block;width:100%;max-width:900px;height:auto;'
@@ -1471,6 +2122,273 @@ def _maruhan_floor_map_display(
     return extras, tuple(inline_images)
 
 
+def _maruhan_formal_rank_cumulative(
+    project_root: Path,
+) -> tuple[str, str]:
+    """Refresh and render cumulative formal Forward rank-position analysis."""
+
+    try:
+        from slotanalyzer_formal_rank_email_refresh import run_refresh
+
+        ok, message = run_refresh(project_root)
+    except Exception as exc:
+        ok = False
+        message = f"{type(exc).__name__}: {exc}"
+
+    if not ok:
+        plain = (
+            "【正式Forward累積成績】\n"
+            "更新失敗のため表示できません\n"
+            f"reason: {message}"
+        )
+        html_block = (
+            '<div style="margin:16px 0;padding:10px;'
+            'background:#fff4f4;border-left:4px solid #a33">'
+            '<div style="font-weight:bold">正式Forward累積成績</div>'
+            '<div>更新失敗のため表示できません</div>'
+            f'<div style="font-size:12px;color:#666">'
+            f'{html.escape(str(message))}</div>'
+            '</div>'
+        )
+        return plain, html_block
+
+    output_dir = (
+        Path(project_root)
+        / "data"
+        / "maruhan_maebashi"
+        / "machine_number"
+        / "formal_rank_position_analysis_v1"
+    )
+
+    topn_rows = _read_rows(output_dir / "02_topn_summary.csv")
+    metadata_rows = _read_rows(output_dir / "05_analysis_metadata.csv")
+
+    if len(metadata_rows) != 1:
+        return (
+            "【正式Forward累積成績】\nmetadata不正のため表示できません",
+            (
+                '<div style="margin:16px 0;padding:10px;'
+                'background:#fff4f4;border-left:4px solid #a33">'
+                '<b>正式Forward累積成績</b><br>'
+                'metadata不正のため表示できません'
+                '</div>'
+            ),
+        )
+
+    metadata = metadata_rows[0]
+
+    try:
+        formal_days = int(float(metadata["formal_valid_days"]))
+        last_target = str(metadata["last_target_date"])
+        qa_status = str(metadata.get("qa_status", "")).strip()
+
+        required = ("TOP1", "TOP3", "TOP5", "TOP10")
+        by_topn = {
+            str(row.get("topn", "")).upper(): row
+            for row in topn_rows
+        }
+
+        if any(key not in by_topn for key in required):
+            raise ValueError("TOP1/TOP3/TOP5/TOP10 row missing")
+
+        def number(row: dict[str, str], key: str) -> float:
+            return float(row[key])
+
+        def signed(value: float, digits: int = 0) -> str:
+            if digits == 0:
+                return f"{value:+,.0f}"
+            return f"{value:+,.{digits}f}"
+
+        plain_lines = [
+            f"【正式Forward累積成績 {formal_days}日】",
+            f"最終評価日: {last_target}",
+        ]
+
+        html_rows = []
+
+        for key in required:
+            row = by_topn[key]
+
+            mean_diff = number(row, "mean_diff")
+            total_diff = number(row, "total_diff")
+            ci_low = number(row, "mean_diff_ci_low")
+            ci_high = number(row, "mean_diff_ci_high")
+
+            plain_lines.append(
+                f"{key}: "
+                f"平均 {signed(mean_diff)}枚 / "
+                f"累計 {signed(total_diff)}枚 / "
+                f"95%CI {signed(ci_low)}～{signed(ci_high)}枚"
+            )
+
+            html_rows.append(
+                "<tr>"
+                f"<td style='padding:5px 8px;border-bottom:1px solid #ddd'>"
+                f"{html.escape(key)}</td>"
+                f"<td style='padding:5px 8px;border-bottom:1px solid #ddd;text-align:right'>"
+                f"{signed(mean_diff)}枚</td>"
+                f"<td style='padding:5px 8px;border-bottom:1px solid #ddd;text-align:right'>"
+                f"{signed(total_diff)}枚</td>"
+                f"<td style='padding:5px 8px;border-bottom:1px solid #ddd;text-align:right'>"
+                f"{signed(ci_low)}～{signed(ci_high)}枚</td>"
+                "</tr>"
+            )
+
+        plain_lines.extend([
+            "※昨日1日分ではなく、正式Forwardだけを累積した長期成績です",
+            "※REFERENCE / PROVISIONAL は正式評価に含みません",
+        ])
+
+        if qa_status:
+            plain_lines.append(f"QA: {qa_status}")
+
+        html_block = (
+            '<div style="margin:16px 0;padding:12px;'
+            'background:#f7f7f7;border-left:4px solid #555">'
+            f'<div style="font-size:16px;font-weight:bold;margin-bottom:4px">'
+            f'正式Forward累積成績 {formal_days}日</div>'
+            f'<div style="font-size:12px;color:#666;margin-bottom:8px">'
+            f'最終評価日: {html.escape(last_target)}</div>'
+            '<table style="border-collapse:collapse;width:100%;max-width:760px">'
+            '<tr>'
+            '<th style="text-align:left;padding:5px 8px;border-bottom:2px solid #aaa">対象</th>'
+            '<th style="text-align:right;padding:5px 8px;border-bottom:2px solid #aaa">平均差枚</th>'
+            '<th style="text-align:right;padding:5px 8px;border-bottom:2px solid #aaa">累計差枚</th>'
+            '<th style="text-align:right;padding:5px 8px;border-bottom:2px solid #aaa">95%CI</th>'
+            '</tr>'
+            + "".join(html_rows)
+            + '</table>'
+            '<div style="font-size:12px;color:#666;margin-top:8px">'
+            '昨日1日分ではなく、正式Forwardだけを累積した長期成績です。'
+            'REFERENCE / PROVISIONAL は正式評価に含みません。'
+            '</div>'
+            + (
+                f'<div style="font-size:12px;color:#666">QA: '
+                f'{html.escape(qa_status)}</div>'
+                if qa_status else ""
+            )
+            + '</div>'
+        )
+
+        return "\n".join(plain_lines), html_block
+
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return (
+            (
+                "【正式Forward累積成績】\n"
+                "出力検証失敗のため表示できません\n"
+                f"reason: {error}"
+            ),
+            (
+                '<div style="margin:16px 0;padding:10px;'
+                'background:#fff4f4;border-left:4px solid #a33">'
+                '<b>正式Forward累積成績</b><br>'
+                '出力検証失敗のため表示できません<br>'
+                f'<span style="font-size:12px;color:#666">'
+                f'{html.escape(error)}</span>'
+                '</div>'
+            ),
+        )
+
+    
+    def _maruhan_isolated_yesterday_receipt(root: Path, operation_date: date) -> tuple[str, str]:
+        """Display-only sealed reference evaluation; never recalculate an unfrozen pick."""
+        import json
+        import math
+    
+        target = operation_date - timedelta(days=1)
+        title = f"【前日 履歴分離・参考Top10勝敗 {target.isoformat()}】"
+        folder = (root / "data/maruhan_maebashi/machine_number"
+                  / "analysis_isolated_prospective_reference_v1" / f"{target:%Y%m%d}")
+        manifest_path = folder / "freeze_manifest.json"
+        receipt_path = folder / "evaluation_receipt_v1.json"
+        picks_path = folder / "top10.csv"
+    
+        def unavailable(reason: str) -> tuple[str, str]:
+            note = "REFERENCE_ONLY（事前固定の参考予測。正式Forward成績に含めない）"
+            lines = [title, note, "未評価: " + reason]
+            markup = ('<section style="margin:18px 0">'
+                      f'<h3>{html.escape(title)}</h3><div>{html.escape(note)}</div>'
+                      f'<div style="color:#a33">未評価: {html.escape(reason)}</div></section>')
+            return "\n".join(lines), markup
+    
+        if not manifest_path.is_file():
+            return unavailable("当日の事前固定記録なし（後追い計算しません）")
+        if not receipt_path.is_file():
+            return unavailable("事前固定あり・実績照合記録は未作成")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
+            if manifest.get("kind") != "ISOLATED_PROSPECTIVE_REFERENCE_NOT_FORMAL":
+                raise ValueError("unexpected frozen prediction class")
+            if receipt.get("classification") != "ISOLATED_PROSPECTIVE_REFERENCE_NOT_FORMAL":
+                raise ValueError("unexpected evaluation classification")
+            if manifest.get("formal_forward") is not False or receipt.get("formal_forward") is not False:
+                raise ValueError("formal class mismatch")
+            if manifest.get("target_date") != target.isoformat() or receipt.get("target_date") != target.isoformat():
+                raise ValueError("target date mismatch")
+            if manifest.get("data_through") != (target - timedelta(days=1)).isoformat():
+                raise ValueError("source cutoff mismatch")
+            frozen = datetime.fromisoformat(manifest["frozen_at_jst"])
+            if frozen.tzinfo is None or frozen.astimezone(JST).date() != target or frozen.astimezone(JST).hour >= 9:
+                raise ValueError("frozen timestamp invalid")
+            if sha256_file(manifest_path) != receipt.get("freeze_manifest_sha256"):
+                raise ValueError("manifest checksum mismatch")
+            if sha256_file(picks_path) != receipt.get("prediction_csv_sha256") or sha256_file(picks_path) != manifest.get("prediction_sha256"):
+                raise ValueError("prediction checksum mismatch")
+            actual_path = root / "data/maruhan_maebashi/machine_number" / f"ana_slo_{target:%Y%m%d}.csv"
+            if sha256_file(actual_path) != receipt.get("actual_csv_sha256"):
+                raise ValueError("actual checksum mismatch")
+            rows = receipt.get("ranked_actual")
+            if not isinstance(rows, list) or len(rows) != 10:
+                raise ValueError("detail count invalid")
+            frozen_rows = _read_rows(picks_path)
+            if len(frozen_rows) != 10:
+                raise ValueError("frozen Top10 count invalid")
+            values = []
+            for rank, (row, pick) in enumerate(zip(rows, frozen_rows), 1):
+                if int(row["rank"]) != rank or int(pick["rank"]) != rank:
+                    raise ValueError("rank order invalid")
+                if int(row["machine_no"]) != int(pick["machine_no"]) or row["machine_name"] != pick["machine_name"]:
+                    raise ValueError("machine identity mismatch")
+                diff = float(row["actual_diff"])
+                if not math.isfinite(diff):
+                    raise ValueError("nonfinite actual diff")
+                values.append(diff)
+            if len({int(r["machine_no"]) for r in rows}) != 10:
+                raise ValueError("duplicate machine")
+            metrics = receipt.get("metrics", {})
+            total = sum(values)
+            wins = sum(v > 0 for v in values)
+            if (not math.isclose(float(metrics["top10_sum_diff"]), total, abs_tol=0.01)
+                    or not math.isclose(float(metrics["top10_mean_diff"]), total / 10, abs_tol=0.01)
+                    or int(metrics["top10_wins"]) != wins
+                    or not math.isclose(float(metrics["top10_win_rate"]), wins / 10, abs_tol=0.00001)):
+                raise ValueError("evaluation metrics inconsistent")
+        except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+            return unavailable("評価記録の検証失敗（" + type(exc).__name__ + ": " + str(exc)[:140] + "）")
+    
+        note = "REFERENCE_ONLY（事前固定参考・正式Forwardとは別集計）"
+        summary = f"Top10 {wins}/10勝（{wins * 10:.1f}%）｜平均 {_signed_medals(str(total / 10))}枚｜合計 {_signed_medals(str(total))}枚"
+        lines = [title, note, summary]
+        blocks = ['<section style="margin:20px 0">', f'<h3>{html.escape(title)}</h3>',
+                  f'<div style="color:#555;font-size:12px">{html.escape(note)}</div>',
+                  f'<div style="padding:8px 0;font-weight:bold">{html.escape(summary)}</div>']
+        for row, diff in zip(rows, values):
+            win = diff > 0
+            outcome = "WIN" if win else "LOSE"
+            detail = (f'{row["rank"]}位　{row["machine_no"]}番台　{row["machine_name"]}'
+                      f'｜{_signed_medals(str(diff))}枚｜{outcome}')
+            lines.append(detail)
+            color = "#176b32" if win else "#a33"
+            blocks.append('<div style="padding:7px 4px;border-bottom:1px solid #ddd;font-size:13px">'
+                          + html.escape(f'{row["rank"]}位　{row["machine_no"]}番台　{row["machine_name"]}')
+                          + '<div>' + html.escape(f'{_signed_medals(str(diff))}枚')
+                          + f' <b style="color:{color}">{outcome}</b></div></div>')
+        blocks.append('</section>')
+        return "\n".join(lines), "".join(blocks)
+    
 def build_notification_message(state: dict, project_root: Path, *, store: str | None = None) -> NotificationMessage:
     if store is not None:
         return build_store_notification_message(state, project_root, store)
@@ -1485,9 +2403,13 @@ def build_notification_message(state: dict, project_root: Path, *, store: str | 
         (STORE_YASUDA, "Yasuda", _yasuda_section),
         (STORE_BICTSUBAME, "Bic Tsubame", _bic_tsubame_section),
     ]:
-        if builder in {_yasuda_section, _bic_tsubame_section}:
+        if builder is _yasuda_section:
             lines, store_warnings = builder(state, project_root, operation_date)
             section = StoreSection(lines[0], lines[1:], [], [])
+        elif builder is _bic_tsubame_section:
+            section, store_warnings = builder(
+                state, project_root, operation_date, structured=True
+            )
         else:
             section, store_warnings = builder(state, project_root, operation_date)
         sections.append(section)
@@ -1511,11 +2433,17 @@ def build_notification_message(state: dict, project_root: Path, *, store: str | 
         _render_section_plain(section, include_details=False) for section in sections
     )
     detail_plain = _render_details_plain(sections)
+    bic_yesterday_plain, bic_yesterday_html = _bic_tsubame_yesterday_reference_summary(
+        project_root, operation_date
+    )
+    isolated_plain, isolated_html = _maruhan_isolated_yesterday_receipt(project_root, operation_date)
     plain = (
         f"SlotAnalyzer 朝結果\n日付: {operation_date.isoformat()}\n"
         f"overall status: {overall}\n" + "\n".join(summaries) + "\n\n" + warning_text
         + "\n\n" + today_plain
+        + "\n\n" + bic_yesterday_plain
         + "\n\n" + _render_yesterday_plain(yesterday)
+        + "\n\n" + isolated_plain
         + "\n\n" + _render_yesterday_derived_plain(yesterday_atype)
         + "\n\n" + _render_yesterday_derived_plain(yesterday_juggler)
         + (("\n\n" + detail_plain) if detail_plain else "")
@@ -1550,6 +2478,10 @@ def build_notification_message(state: dict, project_root: Path, *, store: str | 
         )
         for section in sections
     )
+    bic_cumulative_plain, bic_cumulative_html = _bic_tsubame_cumulative_reference(
+        project_root, operation_date
+    )
+    plain += "\n\n" + bic_cumulative_plain
     yesterday_html = _render_yesterday_html(yesterday)
     yesterday_atype_html = _render_yesterday_derived_html(yesterday_atype)
     yesterday_juggler_html = _render_yesterday_derived_html(yesterday_juggler)
@@ -1562,7 +2494,10 @@ def build_notification_message(state: dict, project_root: Path, *, store: str | 
         f'{summary_html}'
         f'<div style="margin:12px 0;padding:9px;background:#fff4e5;border-left:4px solid #e67e22">{warnings_html}</div>'
         f'{sections_html}'
+        f'{bic_yesterday_html}'
+        f'{bic_cumulative_html}'
         f'{yesterday_html}'
+        f'{isolated_html}'
         f'{yesterday_atype_html}'
         f'{yesterday_juggler_html}'
         f'{details_html}'
@@ -1586,6 +2521,7 @@ def build_store_notification_message(state: dict, project_root: Path, store: str
     overall = (
         "SUCCESS" if status in {"SUCCESS", "ALREADY_COMPLETE"}
         else "MANUAL_REVIEW" if status in {"NEEDS_MANUAL_REVIEW", "MANUAL_REVIEW"}
+        else "REFERENCE" if store == STORE_BIGMARCH and status == "PROVISIONAL"
         else "PROVISIONAL" if status == "PROVISIONAL"
         else "STALE_REFERENCE" if status == "STALE_REFERENCE"
         else "FAILED"
@@ -1594,12 +2530,22 @@ def build_store_notification_message(state: dict, project_root: Path, store: str
         lines, warnings = _yasuda_section(state, project_root, operation_date)
         section = StoreSection(lines[0], lines[1:], [], [])
     elif store == STORE_BICTSUBAME:
-        lines, warnings = _bic_tsubame_section(state, project_root, operation_date)
-        section = StoreSection(lines[0], lines[1:], [], [])
+        section, warnings = _bic_tsubame_section(
+            state, project_root, operation_date, structured=True
+        )
     else:
         builder = _maruhan_content if store == STORE_MARUHAN else _bigmarch_content
         section, warnings = builder(state, project_root, operation_date)
     yesterday_plain = yesterday_html = ""
+    cumulative_plain = cumulative_html = ""
+    isolated_plain = isolated_html = ""
+    if store == STORE_BICTSUBAME:
+        yesterday_plain, yesterday_html = _bic_tsubame_yesterday_reference_summary(
+            project_root, operation_date
+        )
+        cumulative_plain, cumulative_html = _bic_tsubame_cumulative_reference(
+            project_root, operation_date
+        )
     if store == STORE_MARUHAN:
         normal = _load_yesterday_normal_evaluation(state, project_root, operation_date)
         derived = [_load_yesterday_derived_evaluation(project_root, operation_date, category)
@@ -1608,13 +2554,23 @@ def build_store_notification_message(state: dict, project_root: Path, store: str
             _render_yesterday_derived_plain(result) for result in derived])
         yesterday_html = _render_yesterday_html(normal) + "".join(
             _render_yesterday_derived_html(result) for result in derived)
+        cumulative_plain, cumulative_html = _maruhan_formal_rank_cumulative(
+            project_root
+        )
+        isolated_plain, isolated_html = _maruhan_isolated_yesterday_receipt(project_root, operation_date)
     if status not in {"SUCCESS", "ALREADY_COMPLETE"}:
         warnings.append(f"{status} {item.get('error_category', '')} {item.get('error', '')}".strip())
     warning_text = "\n".join(dict.fromkeys(warnings)) or "異常警告: なし"
     heading = f"SlotAnalyzer {store.upper()} 朝結果 {operation_date.isoformat()}"
-    plain = "\n\n".join(filter(None, [heading, yesterday_plain,
-        _render_section_plain(section, include_details=False), warning_text,
-        _render_details_plain([section])]))
+    plain = "\n\n".join(filter(None, [
+        heading,
+        yesterday_plain,
+        isolated_plain,
+        cumulative_plain,
+        _render_section_plain(section, include_details=False),
+        warning_text,
+        _render_details_plain([section]),
+    ]))
     floor_extras: dict[str, str] = {}
     inline_images: tuple[InlineImage, ...] = ()
     if store == STORE_MARUHAN:
@@ -1622,9 +2578,11 @@ def build_store_notification_message(state: dict, project_root: Path, store: str
             section, project_root, operation_date
         )
     body = (
-        '<html><body style="margin:0;padding:12px;font-family:sans-serif;line-height:1.45;color:#222">'
+        ('<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>'
+         if store == STORE_BICTSUBAME else '<html>')
+        + '<body style="margin:0;padding:12px;font-family:sans-serif;line-height:1.45;color:#222">'
         f'<h2 style="margin:0 0 8px">{html.escape(heading)}</h2>'
-        f'{yesterday_html}{_render_section_html(section, include_details=False, ranking_extras=floor_extras)}'
+        f'{yesterday_html}{isolated_html}{cumulative_html}{_render_section_html(section, include_details=False, ranking_extras=floor_extras)}'
         '<div style="margin:12px 0;padding:9px;background:#fff4e5;border-left:4px solid #e67e22">'
         + "".join(f'<div>{html.escape(line)}</div>' for line in warning_text.splitlines())
         + f'</div>{_render_details_html([section])}</body></html>'
@@ -1663,7 +2621,7 @@ def _already_sent(history_path: Path, state: dict, notification_type: str = NOTI
         if (
             row.get("operation_date") == state.get("operation_date")
             and row.get("automation_run_id") == state.get("automation_run_id")
-            and row.get("notification_type") in {NOTIFICATION_TYPE, notification_type}
+            and row.get("notification_type") == notification_type
             and row.get("status") == "SENT"
         ):
             return True
